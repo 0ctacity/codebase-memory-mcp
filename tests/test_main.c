@@ -75,10 +75,18 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
                 (void)fclose(rf);
             }
         }
-        free(result);
     }
-    cbm_mcp_server_free(srv);
-    return 0;
+    /* Faithful worker exit: mirror run_cli's supervised-worker fast path.
+     * The worker-role pipeline deliberately skips its teardown (the OS
+     * reclaims everything wholesale on process death), so a normal return
+     * through main() lets LeakSanitizer run at exit, report the
+     * intentionally-unfreed pipeline, and force exit code 1 — the
+     * supervisor then reads a HEALTHY index as worker_failed (the
+     * Linux-only IDX832 red: LSan is active in Linux gcc ASan builds,
+     * absent on macOS/Windows). _Exit skips atexit/LSan by design,
+     * exactly like the production worker in run_cli. */
+    fflush(NULL);
+    _Exit(result ? 0 : 1);
 }
 
 /* #798 follow-up: socket-isolation probe. The parent test
