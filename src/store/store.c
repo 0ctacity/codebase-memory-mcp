@@ -104,6 +104,12 @@ struct cbm_store {
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
 
+    /* Read-only Zova sidecar session. One store is single-thread-owned. */
+    cbm_zova_vector_session_t *zova_vector_session;
+    char *zova_vector_session_path;
+    struct stat zova_vector_session_stat;
+    bool zova_vector_session_stat_valid;
+
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
@@ -139,6 +145,8 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_file_hash;
     sqlite3_stmt *stmt_delete_file_hashes;
 };
+
+static void store_close_zova_vector_session(cbm_store_t *s);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -895,6 +903,8 @@ void cbm_store_close(cbm_store_t *s) {
     if (!s) {
         return;
     }
+
+    store_close_zova_vector_session(s);
 
     /* Checkpoint WAL before close to prevent orphan WAL accumulation.
      * Best-effort — silently skips if concurrent reader holds a lock. */
@@ -6346,9 +6356,65 @@ static void vs_sort_and_trim(cbm_vector_result_t *results, int *count, int limit
     }
 }
 
+static double vs_elapsed_ms(const struct timespec *start, const struct timespec *end) {
+    return ((double)(end->tv_sec - start->tv_sec) * 1000.0) +
+           ((double)(end->tv_nsec - start->tv_nsec) / 1000000.0);
+}
+
+static void vs_record_elapsed(const struct timespec *start, double *out_ms) {
+    struct timespec end;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &end);
+    *out_ms = vs_elapsed_ms(start, &end);
+}
+
+static void store_close_zova_vector_session(cbm_store_t *s) {
+    if (!s) {
+        return;
+    }
+    cbm_zova_vector_session_close(s->zova_vector_session);
+    s->zova_vector_session = NULL;
+    free(s->zova_vector_session_path);
+    s->zova_vector_session_path = NULL;
+    s->zova_vector_session_stat_valid = false;
+}
+
+static bool vs_zova_session_matches(const cbm_store_t *s, const char *zova_path,
+                                    const struct stat *st) {
+    return s && s->zova_vector_session && s->zova_vector_session_path &&
+           s->zova_vector_session_stat_valid && strcmp(s->zova_vector_session_path, zova_path) == 0 &&
+           s->zova_vector_session_stat.st_dev == st->st_dev &&
+           s->zova_vector_session_stat.st_ino == st->st_ino &&
+           s->zova_vector_session_stat.st_size == st->st_size &&
+           s->zova_vector_session_stat.st_mtime == st->st_mtime;
+}
+
+static cbm_zova_vector_session_t *vs_get_zova_vector_session(cbm_store_t *s,
+                                                              const char *zova_path) {
+    struct stat st;
+    if (!s || !zova_path || stat(zova_path, &st) != 0) {
+        return NULL;
+    }
+    if (vs_zova_session_matches(s, zova_path, &st)) {
+        return s->zova_vector_session;
+    }
+    store_close_zova_vector_session(s);
+    cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(zova_path);
+    char *path_copy = session ? heap_strdup(zova_path) : NULL;
+    if (!session || !path_copy) {
+        cbm_zova_vector_session_close(session);
+        return NULL;
+    }
+    s->zova_vector_session = session;
+    s->zova_vector_session_path = path_copy;
+    s->zova_vector_session_stat = st;
+    s->zova_vector_session_stat_valid = true;
+    return session;
+}
+
 static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
                                      const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw,
-                                     int limit, cbm_vector_result_t **out, int *out_count) {
+                                     int limit, cbm_vector_result_t **out, int *out_count,
+                                     cbm_vector_search_metrics_t *metrics) {
     if (cbm_zova_mode_from_env() < CBM_ZOVA_MODE_I8_VECTORS || !cbm_zova_build_enabled() ||
         !s || !s->db_path) {
         return CBM_STORE_NOT_FOUND;
@@ -6360,12 +6426,31 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
         return CBM_STORE_NOT_FOUND;
     }
 
-    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
+    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
+    int fetch_limit = actual_kw == 1 ? requested_limit : requested_limit * ST_COL_5;
     cbm_zova_node_candidate_t *candidates = NULL;
     int candidate_count = 0;
-    if (cbm_zova_vector_prefetch_nodes(zova_path, project, kw_vecs[0], VS_VEC_DIM, fetch_limit,
-                                       &candidates, &candidate_count) != 0) {
+    cbm_zova_vector_session_t *session = vs_get_zova_vector_session(s, zova_path);
+    if (!session) {
         return CBM_STORE_NOT_FOUND;
+    }
+    struct timespec stage_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &stage_start);
+    int prefetch_rc = actual_kw == 1
+                          ? cbm_zova_vector_session_prefetch_nodes_ex(
+                                session, project, kw_vecs[0], VS_VEC_DIM, fetch_limit, false,
+                                &candidates, &candidate_count, NULL)
+                          : cbm_zova_vector_session_prefetch_multi_i8_ex(
+                                session, project, &kw_vecs[0][0], actual_kw, VS_VEC_DIM,
+                                fetch_limit, requested_limit, &candidates, &candidate_count, NULL);
+    if (prefetch_rc != 0) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (metrics) {
+        metrics->used_zova = true;
+        metrics->zova_native_multi_query = actual_kw > 1;
+        metrics->zova_fetch_limit = fetch_limit;
+        vs_record_elapsed(&stage_start, &metrics->zova_prefetch_ms);
     }
     if (candidate_count == 0) {
         cbm_zova_node_candidates_free(candidates, candidate_count);
@@ -6380,6 +6465,7 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
         cbm_zova_node_candidates_free(candidates, candidate_count);
         return CBM_STORE_ERR;
     }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &stage_start);
     for (int i = 0; i < candidate_count; i++) {
         results[i].node_id = candidates[i].node_id;
         results[i].name = candidates[i].name;
@@ -6390,13 +6476,21 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
         candidates[i].qualified_name = NULL;
         candidates[i].file_path = NULL;
         candidates[i].label = NULL;
-        results[i].score =
-            vs_min_cosine_score(candidates[i].vector, candidates[i].vector_len, kw_vecs, actual_kw);
+        /* Zova now supplies the exact single-query or CBM-compatible
+         * multi-query score. No vector blob or C cosine rerank is needed. */
+        results[i].score = candidates[i].first_score;
+    }
+    if (metrics) {
+        vs_record_elapsed(&stage_start, &metrics->rescore_ms);
     }
     cbm_zova_node_candidates_free(candidates, candidate_count);
 
     int count = candidate_count;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &stage_start);
     vs_sort_and_trim(results, &count, limit);
+    if (metrics) {
+        vs_record_elapsed(&stage_start, &metrics->sort_trim_ms);
+    }
     *out = results;
     *out_count = count;
     char count_buf[VS_STR_BUF];
@@ -6405,22 +6499,31 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
-int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                            int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count) {
+int cbm_store_vector_search_ex(cbm_store_t *s, const char *project, const char **keywords,
+                               int keyword_count, int limit, cbm_vector_result_t **out,
+                               int *out_count, cbm_vector_search_metrics_t *metrics) {
+    if (metrics) {
+        memset(metrics, 0, sizeof(*metrics));
+    }
     *out = NULL;
     *out_count = 0;
     if (!s || !project || !keywords || keyword_count <= 0) {
         return CBM_STORE_ERR;
     }
 
+    struct timespec stage_start;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &stage_start);
     int8_t kw_vecs[VS_MAX_KW][VS_VEC_DIM];
     int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
+    if (metrics) {
+        vs_record_elapsed(&stage_start, &metrics->query_vector_build_ms);
+    }
     if (actual_kw == 0) {
         return CBM_STORE_OK;
     }
 
-    int zova_rc = vs_try_zova_vector_search(s, project, kw_vecs, actual_kw, limit, out, out_count);
+    int zova_rc =
+        vs_try_zova_vector_search(s, project, kw_vecs, actual_kw, limit, out, out_count, metrics);
     if (zova_rc == CBM_STORE_OK) {
         return CBM_STORE_OK;
     }
@@ -6492,4 +6595,11 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     *out = results;
     *out_count = count;
     return CBM_STORE_OK;
+}
+
+int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
+                            int keyword_count, int limit, cbm_vector_result_t **out,
+                            int *out_count) {
+    return cbm_store_vector_search_ex(s, project, keywords, keyword_count, limit, out, out_count,
+                                      NULL);
 }

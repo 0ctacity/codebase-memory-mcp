@@ -5,6 +5,7 @@
 #include "../src/foundation/platform.h"
 #include "store/store.h"
 #include "zova/cbm_zova.h"
+#include "../internal/cbm/sqlite_writer.h"
 
 #ifndef CBM_WITH_ZOVA
 #define CBM_WITH_ZOVA 0
@@ -282,6 +283,47 @@ TEST(zova_mode_parser) {
     PASS();
 }
 
+TEST(zova_workspace_scoped_names_and_node_ids_are_deterministic) {
+    const char *workspace_id = "w1_0123456789abcdef0123456789abcdef";
+    char graph_name[128] = {0};
+    char collection_name[192] = {0};
+    char node_id[128] = {0};
+    char changed_node_id[128] = {0};
+
+    ASSERT_EQ(cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)), 0);
+    ASSERT_STR_EQ(graph_name, "cbm_graph_w1_0123456789abcdef0123456789abcdef");
+    ASSERT_EQ(cbm_zova_workspace_node_vector_collection_name(
+                  workspace_id, "nomic_embed_code_v1", TZ_VEC_DIM, collection_name,
+                  sizeof(collection_name)),
+              0);
+    ASSERT_STR_EQ(collection_name,
+                  "cbm_nodes_i8_w1_0123456789abcdef0123456789abcdef_nomic_embed_code_v1_d768");
+
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "src/main.c", "main.run",
+                                             "named", node_id, sizeof(node_id)),
+              0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "src/main.c", "main.run",
+                                             "named", changed_node_id, sizeof(changed_node_id)),
+              0);
+    ASSERT_STR_EQ(node_id, changed_node_id);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "src/main.c", "main.run",
+                                             "lambda:1:8", changed_node_id,
+                                             sizeof(changed_node_id)),
+              0);
+    ASSERT_NEQ(strcmp(node_id, changed_node_id), 0);
+    ASSERT_TRUE(strncmp(node_id, "n:v1:w1_0123456789abcdef0123456789abcdef:", 40) == 0);
+    PASS();
+}
+
+TEST(zova_workspace_registry_path_uses_cache_dir) {
+    char path[TZ_PATH_MAX] = {0};
+    cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-zova-workspace-cache", 1);
+    ASSERT_EQ(cbm_zova_workspace_registry_path(path, sizeof(path)), 0);
+    ASSERT_STR_EQ(path, "/tmp/cbm-zova-workspace-cache/cbm.zova");
+    cbm_unsetenv("CBM_CACHE_DIR");
+    PASS();
+}
+
 #if !CBM_WITH_ZOVA
 
 TEST(zova_disabled_request_fails_clearly) {
@@ -327,10 +369,12 @@ TEST(zova_i8_vector_mirror_and_prefetch) {
 
     cbm_zova_node_candidate_t *candidates = NULL;
     int count = 0;
-    ASSERT_EQ(cbm_zova_vector_prefetch_nodes(fx.zova_path, "proj", fx.alpha_vec, TZ_VEC_DIM, 2,
-                                             &candidates, &count),
+    cbm_zova_vector_prefetch_metrics_t prefetch_metrics = {0};
+    ASSERT_EQ(cbm_zova_vector_prefetch_nodes_ex(fx.zova_path, "proj", fx.alpha_vec, TZ_VEC_DIM,
+                                                2, &candidates, &count, &prefetch_metrics),
               0);
     ASSERT_EQ(count, 2);
+    ASSERT_FALSE(prefetch_metrics.used_full_search);
     ASSERT_EQ(candidates[0].node_id, fx.alpha_id);
     for (int i = 0; i < count; i++) {
         ASSERT_NEQ(candidates[i].node_id, fx.other_id);
@@ -354,6 +398,110 @@ TEST(zova_i8_vector_mirror_and_prefetch) {
 
     cleanup_fixture(&fx);
     cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_i8_direct_vectors_do_not_read_sqlite_vector_rows) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
+
+    cbm_store_t *store = cbm_store_open_path(fx.db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_exec(store, "DELETE FROM node_vectors;"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(store, "DELETE FROM token_vectors;"), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    CBMDumpVector node_vectors[] = {
+        {.node_id = fx.beta_id, .project = "proj", .vector = (const uint8_t *)fx.beta_vec,
+         .vector_len = TZ_VEC_DIM},
+    };
+    CBMDumpTokenVec token_vectors[] = {
+        {.id = 1, .project = "proj", .token = "direct", .vector = (const uint8_t *)fx.alpha_vec,
+         .vector_len = TZ_VEC_DIM, .idf = 1.0f},
+    };
+    ASSERT_EQ(cbm_zova_after_sqlite_dump_with_i8_vectors(
+                  fx.db_path, node_vectors, 1, token_vectors, 1, TZ_VEC_DIM),
+              0);
+
+    cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(fx.zova_path);
+    ASSERT_NOT_NULL(session);
+    cbm_zova_node_candidate_t *candidates = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_zova_vector_session_prefetch_nodes_ex(
+                  session, "proj", fx.beta_vec, TZ_VEC_DIM, 2, false, &candidates, &count, NULL),
+              0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(candidates[0].node_id, fx.beta_id);
+    cbm_zova_node_candidates_free(candidates, count);
+    cbm_zova_vector_session_close(session);
+
+    zova_database *db = NULL;
+    zova_message err = {0};
+    zova_database_open_request open_req = {
+        .path = fx.zova_path,
+        .out_db = &db,
+        .out_error_message = &err,
+    };
+    ASSERT_EQ(zova_database_open(&open_req), ZOVA_OK);
+    zova_message_free(&err);
+    zova_vector_collection_info token_info = {0};
+    zova_vector_collection_info_get_request info_req = {
+        .db = db,
+        .name = CBM_ZOVA_TOKEN_COLLECTION,
+        .out_info = &token_info,
+    };
+    ASSERT_EQ(zova_vector_collection_info_get(&info_req), ZOVA_OK);
+    ASSERT_EQ(token_info.vector_count, 1);
+    zova_vector_collection_info_free(&token_info);
+    ASSERT_EQ(zova_database_close(db), ZOVA_OK);
+
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_workspace_registry_preserves_ready_generation) {
+    char registry_path[TZ_PATH_MAX];
+    snprintf(registry_path, sizeof(registry_path), "%s/cbm_workspace_registry_%d_%p.zova",
+             cbm_tmpdir(), (int)getpid(), (void *)&registry_path);
+    cbm_unlink(registry_path);
+
+    char workspace_id[96] = {0};
+    char repeated_id[96] = {0};
+    ASSERT_EQ(cbm_zova_workspace_get_or_create_at(registry_path, "/tmp/cbm-registry-root",
+                                                  workspace_id, sizeof(workspace_id)),
+              0);
+    ASSERT_TRUE(strncmp(workspace_id, "w1_", 3) == 0);
+    ASSERT_EQ(cbm_zova_workspace_get_or_create_at(registry_path, "/tmp/cbm-registry-root",
+                                                  repeated_id, sizeof(repeated_id)),
+              0);
+    ASSERT_STR_EQ(workspace_id, repeated_id);
+
+    int64_t active_generation = -1;
+    ASSERT_EQ(cbm_zova_workspace_active_generation_at(registry_path, workspace_id,
+                                                       &active_generation),
+              0);
+    ASSERT_EQ(active_generation, 0);
+
+    ASSERT_EQ(cbm_zova_workspace_generation_begin_at(registry_path, workspace_id, 1), 0);
+    ASSERT_EQ(cbm_zova_workspace_generation_finish_at(registry_path, workspace_id, 1, true), 0);
+    ASSERT_EQ(cbm_zova_workspace_active_generation_at(registry_path, workspace_id,
+                                                       &active_generation),
+              0);
+    ASSERT_EQ(active_generation, 1);
+
+    ASSERT_EQ(cbm_zova_workspace_generation_begin_at(registry_path, workspace_id, 2), 0);
+    ASSERT_EQ(cbm_zova_workspace_generation_finish_at(registry_path, workspace_id, 2, false), 0);
+    ASSERT_EQ(cbm_zova_workspace_active_generation_at(registry_path, workspace_id,
+                                                       &active_generation),
+              0);
+    ASSERT_EQ(active_generation, 1);
+
+    ASSERT_EQ(cbm_zova_workspace_get_or_create_at(registry_path, "", repeated_id,
+                                                  sizeof(repeated_id)),
+              -1);
+    cbm_unlink(registry_path);
     PASS();
 }
 
@@ -409,6 +557,79 @@ TEST(zova_i8_vector_search_in_uses_candidate_ids) {
     PASS();
 }
 
+TEST(zova_i8_vector_prefetch_uses_full_search_only_for_complete_candidate_sets) {
+    ASSERT_FALSE(cbm_zova_should_use_full_vector_search(0, 0));
+    ASSERT_FALSE(cbm_zova_should_use_full_vector_search(0, 10));
+    ASSERT_FALSE(cbm_zova_should_use_full_vector_search(9, 10));
+    ASSERT_FALSE(cbm_zova_should_use_full_vector_search(75, 100));
+    ASSERT_TRUE(cbm_zova_should_use_full_vector_search(10, 10));
+    PASS();
+}
+
+TEST(zova_i8_vector_prefetch_reports_full_search_stage_metrics) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
+    cbm_store_t *store = cbm_store_open_path(fx.db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_exec(store, "DELETE FROM node_vectors WHERE project = 'other';"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump(fx.db_path), 0);
+
+    cbm_zova_node_candidate_t *candidates = NULL;
+    int count = 0;
+    cbm_zova_vector_prefetch_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_zova_vector_prefetch_nodes_ex(fx.zova_path, "proj", fx.alpha_vec, TZ_VEC_DIM, 2,
+                                                 &candidates, &count, &metrics),
+              0);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(metrics.used_full_search);
+    ASSERT_FLOAT_EQ(metrics.candidate_id_collection_ms, 0.0, 0.000001);
+    ASSERT_FLOAT_EQ(metrics.candidate_count_ms, 0.0, 0.000001);
+    ASSERT_TRUE(metrics.open_ms >= 0.0);
+    ASSERT_TRUE(metrics.vector_search_ms >= 0.0);
+    ASSERT_TRUE(metrics.hydration_ms >= 0.0);
+
+    cbm_zova_node_candidates_free(candidates, count);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_i8_vector_session_reuses_open_database) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump(fx.db_path), 0);
+
+    cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(fx.zova_path);
+    ASSERT_NOT_NULL(session);
+    cbm_zova_node_candidate_t *first = NULL;
+    cbm_zova_node_candidate_t *second = NULL;
+    int first_count = 0;
+    int second_count = 0;
+    cbm_zova_vector_prefetch_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_zova_vector_session_prefetch_nodes_ex(session, "proj", fx.alpha_vec, TZ_VEC_DIM,
+                                                         2, false, &first, &first_count, &metrics),
+              0);
+    ASSERT_EQ(first_count, 2);
+    ASSERT_FLOAT_EQ(metrics.open_ms, 0.0, 0.000001);
+    ASSERT_EQ(cbm_zova_vector_session_prefetch_nodes_ex(session, "proj", fx.alpha_vec, TZ_VEC_DIM,
+                                                         2, false, &second, &second_count, NULL),
+              0);
+    ASSERT_EQ(second_count, first_count);
+    ASSERT_EQ(second[0].node_id, first[0].node_id);
+    ASSERT_FLOAT_EQ(second[0].first_score, first[0].first_score, 0.000001);
+
+    cbm_zova_node_candidates_free(first, first_count);
+    cbm_zova_node_candidates_free(second, second_count);
+    cbm_zova_vector_session_close(session);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
 TEST(zova_i8_vector_search_matches_current_topk) {
     zova_fixture_t fx;
     ASSERT_EQ(create_fixture(&fx), 0);
@@ -420,11 +641,58 @@ TEST(zova_i8_vector_search_matches_current_topk) {
     const char *keywords[] = {"alpha"};
     cbm_vector_result_t *results = NULL;
     int count = 0;
-    ASSERT_EQ(cbm_store_vector_search(store, "proj", keywords, 1, 2, &results, &count),
+    cbm_vector_search_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_store_vector_search_ex(store, "proj", keywords, 1, 2, &results, &count,
+                                         &metrics),
               CBM_STORE_OK);
     ASSERT_EQ(count, 2);
     ASSERT_STR_EQ(results[0].name, "Alpha");
+    ASSERT_TRUE(metrics.used_zova);
+    ASSERT_TRUE(metrics.query_vector_build_ms >= 0.0);
+    ASSERT_TRUE(metrics.zova_prefetch_ms >= 0.0);
+    ASSERT_EQ(metrics.zova_fetch_limit, 2);
+    ASSERT_TRUE(metrics.rescore_ms >= 0.0);
+    ASSERT_TRUE(metrics.sort_trim_ms >= 0.0);
     cbm_store_free_vector_results(results, count);
+    cbm_store_close(store);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_i8_native_multi_query_matches_sqlite_topk) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump(fx.db_path), 0);
+
+    cbm_store_t *store = cbm_store_open_path(fx.db_path);
+    ASSERT_NOT_NULL(store);
+    const char *keywords[] = {"alpha", "beta"};
+    cbm_vector_result_t *sqlite_results = NULL;
+    cbm_vector_result_t *zova_results = NULL;
+    int sqlite_count = 0;
+    int zova_count = 0;
+
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+    ASSERT_EQ(cbm_store_vector_search(store, "proj", keywords, 2, 2, &sqlite_results,
+                                      &sqlite_count),
+              CBM_STORE_OK);
+    cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
+    cbm_vector_search_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_store_vector_search_ex(store, "proj", keywords, 2, 2, &zova_results,
+                                         &zova_count, &metrics),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(sqlite_count, zova_count);
+    ASSERT_EQ(result_overlap(sqlite_results, sqlite_count, zova_results, zova_count), sqlite_count);
+    ASSERT_EQ(ordering_diffs(sqlite_results, sqlite_count, zova_results, zova_count), 0);
+    ASSERT_FLOAT_EQ(score_correlation(sqlite_results, sqlite_count, zova_results, zova_count), 1.0,
+                    0.000001);
+    ASSERT_TRUE(metrics.zova_native_multi_query);
+
+    cbm_store_free_vector_results(sqlite_results, sqlite_count);
+    cbm_store_free_vector_results(zova_results, zova_count);
     cbm_store_close(store);
     cleanup_fixture(&fx);
     cbm_unsetenv("CBM_ZOVA_MODE");
@@ -441,6 +709,101 @@ TEST(zova_graph_mirror_neighbors) {
     int count = 0;
     ASSERT_EQ(cbm_zova_graph_neighbor_count(fx.zova_path, id_buf, &count), 0);
     ASSERT_EQ(count, 1);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_workspace_graph_mirror_is_project_scoped_and_matches_callers) {
+    zova_fixture_t fx;
+    const char *workspace_id = "w1_0123456789abcdef0123456789abcdef";
+    char graph_name[128] = {0};
+    char alpha_node_id[128] = {0};
+    char beta_node_id[128] = {0};
+    char other_node_id[128] = {0};
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "container", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump(fx.db_path), 0);
+    ASSERT_EQ(cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)), 0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "alpha.c", "proj.Alpha",
+                                             "named", alpha_node_id, sizeof(alpha_node_id)),
+              0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "beta.c", "proj.Beta",
+                                             "named", beta_node_id, sizeof(beta_node_id)),
+              0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "other.c", "other.Alpha",
+                                             "named", other_node_id, sizeof(other_node_id)),
+              0);
+
+    ASSERT_EQ(cbm_zova_mirror_workspace_graph(fx.zova_path, workspace_id, "proj"), 0);
+
+    zova_database *db = NULL;
+    zova_message err = {0};
+    zova_database_open_request open_req = {
+        .path = fx.zova_path,
+        .out_db = &db,
+        .out_error_message = &err,
+    };
+    ASSERT_EQ(zova_database_open(&open_req), ZOVA_OK);
+    zova_message_free(&err);
+
+    zova_graph_neighbor_results neighbors = {0};
+    zova_graph_neighbors_request neighbors_req = {
+        .db = db,
+        .graph_name = graph_name,
+        .node_id = alpha_node_id,
+        .direction = ZOVA_GRAPH_NEIGHBOR_OUTGOING,
+        .edge_type = "CALLS",
+        .limit = 10,
+        .out_results = &neighbors,
+    };
+    ASSERT_EQ(zova_graph_neighbors(&neighbors_req), ZOVA_OK);
+    ASSERT_EQ(neighbors.len, 1);
+    ASSERT_STR_EQ(neighbors.items[0].node_id, beta_node_id);
+    ASSERT_STR_EQ(neighbors.items[0].edge_type, "CALLS");
+    zova_graph_neighbor_results_free(&neighbors);
+
+    uint64_t degree = 0;
+    zova_graph_degree_request degree_req = {
+        .db = db,
+        .graph_name = graph_name,
+        .node_id = alpha_node_id,
+        .direction = ZOVA_GRAPH_NEIGHBOR_OUTGOING,
+        .edge_type = "CALLS",
+        .out_degree = &degree,
+    };
+    ASSERT_EQ(zova_graph_degree(&degree_req), ZOVA_OK);
+    ASSERT_EQ(degree, 1);
+
+    zova_graph_walk_results walk = {0};
+    zova_graph_walk_request walk_req = {
+        .db = db,
+        .graph_name = graph_name,
+        .start_node_id = alpha_node_id,
+        .edge_type = "CALLS",
+        .max_depth = 1,
+        .limit = 2,
+        .out_results = &walk,
+    };
+    ASSERT_EQ(zova_graph_walk(&walk_req), ZOVA_OK);
+    ASSERT_EQ(walk.len, 2);
+    ASSERT_STR_EQ(walk.items[0].node_id, alpha_node_id);
+    ASSERT_EQ(walk.items[0].depth, 0);
+    ASSERT_STR_EQ(walk.items[1].node_id, beta_node_id);
+    ASSERT_EQ(walk.items[1].depth, 1);
+    zova_graph_walk_results_free(&walk);
+
+    uint8_t other_exists = 1;
+    zova_graph_node_exists_request exists_req = {
+        .db = db,
+        .graph_name = graph_name,
+        .node_id = other_node_id,
+        .out_exists = &other_exists,
+    };
+    ASSERT_EQ(zova_graph_node_exists(&exists_req), ZOVA_OK);
+    ASSERT_FALSE(other_exists);
+    ASSERT_EQ(zova_database_close(db), ZOVA_OK);
+
     cleanup_fixture(&fx);
     cbm_unsetenv("CBM_ZOVA_MODE");
     PASS();
@@ -528,14 +891,23 @@ TEST(zova_i8_vector_benchmark_smoke_report) {
 
 SUITE(zova) {
     RUN_TEST(zova_mode_parser);
+    RUN_TEST(zova_workspace_scoped_names_and_node_ids_are_deterministic);
+    RUN_TEST(zova_workspace_registry_path_uses_cache_dir);
 #if !CBM_WITH_ZOVA
     RUN_TEST(zova_disabled_request_fails_clearly);
 #else
     RUN_TEST(zova_container_sidecar_preserves_app_sql);
     RUN_TEST(zova_i8_vector_mirror_and_prefetch);
+    RUN_TEST(zova_i8_direct_vectors_do_not_read_sqlite_vector_rows);
+    RUN_TEST(zova_workspace_registry_preserves_ready_generation);
     RUN_TEST(zova_i8_vector_search_in_uses_candidate_ids);
+    RUN_TEST(zova_i8_vector_prefetch_uses_full_search_only_for_complete_candidate_sets);
+    RUN_TEST(zova_i8_vector_prefetch_reports_full_search_stage_metrics);
+    RUN_TEST(zova_i8_vector_session_reuses_open_database);
     RUN_TEST(zova_i8_vector_search_matches_current_topk);
+    RUN_TEST(zova_i8_native_multi_query_matches_sqlite_topk);
     RUN_TEST(zova_i8_vector_benchmark_smoke_report);
     RUN_TEST(zova_graph_mirror_neighbors);
+    RUN_TEST(zova_workspace_graph_mirror_is_project_scoped_and_matches_callers);
 #endif
 }

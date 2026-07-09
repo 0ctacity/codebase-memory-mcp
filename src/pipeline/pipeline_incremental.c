@@ -669,7 +669,7 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_store_close(hash_store);
     }
 
-    if (cbm_zova_after_sqlite_dump(db_path) != 0) {
+    if (cbm_gbuf_finalize_zova_sidecar(gbuf, db_path) != 0) {
         cbm_log_error("incremental.err", "phase", "zova_sidecar", "path", db_path);
         return CBM_NOT_FOUND;
     }

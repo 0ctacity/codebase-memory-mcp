@@ -166,6 +166,11 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
+/* Create the optional Zova sidecar after the SQLite dump has completed.
+ * In i8-vector mode it writes typed collections from the finalized in-memory
+ * vector arrays, while SQLite remains the paired writer. */
+int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path);
+
 /* Flush the buffer to an existing store via the store API.
  * Deletes existing project data first. Returns 0 on success. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);

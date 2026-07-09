@@ -9,6 +9,8 @@
  * The buffer frees everything in cbm_gbuf_free().
  */
 #include "foundation/constants.h"
+#include "semantic/semantic.h"
+#include "zova/cbm_zova.h"
 
 enum {
     GB_ERR = -1,
@@ -1707,6 +1709,15 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
     return rc;
+}
+
+int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path) {
+    if (!gb || !path) {
+        return CBM_NOT_FOUND;
+    }
+    return cbm_zova_after_sqlite_dump_with_i8_vectors(
+        path, gb->dump_vectors, gb->dump_vector_count, gb->dump_token_vecs,
+        gb->dump_token_vec_count, CBM_SEM_DIM);
 }
 
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {

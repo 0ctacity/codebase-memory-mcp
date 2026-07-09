@@ -677,6 +677,18 @@ typedef struct {
     double score;
 } cbm_vector_result_t;
 
+/* Optional stage timings for one vector-search call. Timings are populated
+ * only for the Zova fast path; the compatibility API remains unchanged. */
+typedef struct {
+    bool used_zova;
+    bool zova_native_multi_query;
+    double query_vector_build_ms;
+    double zova_prefetch_ms;
+    int zova_fetch_limit;
+    double rescore_ms;
+    double sort_trim_ms;
+} cbm_vector_search_metrics_t;
+
 /* Search for nodes similar to the given query keywords using stored RI vectors.
  * Builds a merged query vector from the keywords, then does cosine scan via
  * the cbm_cosine_i8 SQL function joined with the nodes table.
@@ -684,6 +696,12 @@ typedef struct {
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count);
+
+/* Extended vector search with optional timings for the actual CBM path.
+ * Passing NULL for metrics is valid. */
+int cbm_store_vector_search_ex(cbm_store_t *s, const char *project, const char **keywords,
+                               int keyword_count, int limit, cbm_vector_result_t **out,
+                               int *out_count, cbm_vector_search_metrics_t *metrics);
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);

@@ -412,7 +412,7 @@ TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 
-TEST_ZOVA_SRCS = tests/test_zova.c
+TEST_ZOVA_SRCS = tests/test_zova.c tests/test_zova_real_repo.c tests/test_zova_graph_real_repo.c
 TEST_ZOVA_C_SQL_FUNCTIONS_SRCS = tests/test_zova_c_sql_functions.c
 TEST_ZOVA_BRIDGE_SRCS = tests/test_zova_bridge.c
 
@@ -532,7 +532,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-cli test-mcp test-ui test-ui-build test-focused-cli-ui test-install-ui-success test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed check-bun check-zova test-zova-link test-zova-container test-zova-i8 test-zova-vector-parity test-zova-benchmark-smoke test-zova-c-sql-functions test-zova-bridge test-zova-graph-mirror zova-test-runner clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-cli test-mcp test-ui test-ui-build test-focused-cli-ui test-install-ui-success test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed check-bun check-zova test-zova-link test-zova-container test-zova-i8 test-zova-vector-parity test-zova-benchmark-smoke test-zova-c-sql-functions test-zova-bridge test-zova-graph-mirror test-zova-real-repo zova-test-runner clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -731,6 +731,9 @@ test-zova-bridge:
 
 test-zova-graph-mirror:
 	$(ZIG) build test-zova-graph-mirror -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-real-repo:
+	$(ZIG) build test-zova-real-repo -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)

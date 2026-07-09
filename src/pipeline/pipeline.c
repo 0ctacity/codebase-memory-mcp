@@ -1138,7 +1138,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     free(p->saved_adr);
     p->saved_adr = NULL;
 
-    rc = cbm_zova_after_sqlite_dump(db_path);
+    rc = cbm_gbuf_finalize_zova_sidecar(p->gbuf, db_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "zova_sidecar", "path", db_path);
         return rc;

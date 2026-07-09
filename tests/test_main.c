@@ -143,6 +143,13 @@ static bool suite_requested(const char *name) {
         }                             \
     } while (0)
 
+#define RUN_EXPLICIT_SUITE(name)                         \
+    do {                                                  \
+        if (g_suite_argc > 1 && suite_requested(#name)) { \
+            RUN_SUITE(name);                             \
+        }                                                 \
+    } while (0)
+
 /* Forward declarations of suite functions */
 extern void suite_arena(void);
 extern void suite_hash_table(void);
@@ -241,6 +248,8 @@ extern void suite_dump_verify_io(void);
 extern void suite_zova(void);
 extern void suite_zova_c_sql_functions(void);
 extern void suite_zova_bridge(void);
+extern void suite_zova_real_repo(void);
+extern void suite_zova_graph_real_repo(void);
 
 /* Free the main thread's thread-local node-type bitset cache before exit so
  * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
@@ -407,6 +416,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(zova);
     RUN_SELECTED_SUITE(zova_c_sql_functions);
     RUN_SELECTED_SUITE(zova_bridge);
+    RUN_EXPLICIT_SUITE(zova_real_repo);
+    RUN_EXPLICIT_SUITE(zova_graph_real_repo);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);

@@ -117,7 +117,7 @@ This checklist tracks CLI and installer problems encountered while using `codeba
 
 - [x] Add Zova `i8` vector parity tests for the vector mirror prototype.
   - Fixed by: added focused Zova targets and deterministic C tests covering `.zova` conversion, canonical raw `i8` collection mirroring, candidate-filtered `zova_vector_search_in` using `zova_vector_values`, and top-k parity against the existing `cbm_cosine_i8` search path under project/label prefilters.
-  - Follow-up: real-repo benchmark coverage is still tracked under the Zova migration checkpoints.
+  - Extended by: `test-zova-real-repo` now validates the same path against a fresh index of this repository.
 
 ## Zova Migration Checkpoints
 
@@ -150,7 +150,13 @@ This checklist tracks CLI and installer problems encountered while using `codeba
   - Track ranking parity, SQL prefilter ergonomics, ingestion speed, storage size, and query latency.
   - Go/no-go question: do existing codebase-memory int8 embeddings produce equivalent top-k ranking through Zova `i8 + cosine` under realistic filters?
   - Fixed by: added `test-zova-benchmark-smoke`, which emits a JSON benchmark report with top-k overlap, ordering differences, score correlation, ingestion/query timing, `.db`/`.zova` sizes, mirrored vector count, skipped zero-vector count, and fallback count.
-  - Follow-up: run the same reporting shape against one or more real indexed repositories before promoting Zova vectors beyond experimental/cache status.
+  - Extended by: `test-zova-real-repo` runs the same validation shape against a fresh isolated index of this repository, which is the only real repo in scope right now.
+
+- [x] Validate Zova `i8` vectors and Zova-owned SQL on a fresh real index of this repository.
+  - Fixed by: added `scripts/zova-real-repo-validation.sh`, `test-zova-real-repo`, and a Make wrapper.
+  - Coverage: the harness indexes only the current `codebase-memory-mcp` checkout, produces `.db` plus sibling `.zova`, compares SQLite `cbm_cosine_i8` vector search with Zova `i8` search, verifies Zova-owned SQL callbacks, verifies FTS/BM25, and writes `build/zova-real-repo/latest/report.json`.
+  - Extended by: the report now includes persistent-handle pure `zova_vector_search_in`, full `zova_vector_search`, prefilter candidate count/ratio, candidate-threshold probes, open time, candidate collection time, and top-result hydration timing.
+  - Boundary: ranking quality is report-only; broken artifacts, empty data, callback failures, and FTS/BM25 failures are hard failures.
 
 - [x] Add Zig Zova extension bridge smoke test for CBM custom SQL functions.
   - Fixed by: added a narrow Zig bridge that registers `cbm_cosine_i8`, `cbm_camel_split`, `regexp`, and `iregexp` through a `codebase_memory` Zova extension on a Zova-owned SQLite connection.
