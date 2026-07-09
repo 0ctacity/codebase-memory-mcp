@@ -130,7 +130,7 @@ int cbm_install_vscode_mcp(const char *binary_path, const char *config_path);
 int cbm_remove_vscode_mcp(const char *config_path);
 
 /* Install MCP server entry in Zed settings.json.
- * Format: { "context_servers": { "codebase-memory-mcp": { "command": path, "args": [""] } } }
+ * Format: { "context_servers": { "codebase-memory-mcp": { "command": path } } }
  * Returns 0 on success. */
 int cbm_install_zed_mcp(const char *binary_path, const char *config_path);
 
@@ -323,6 +323,10 @@ int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
 int cbm_cmd_config(int argc, char **argv);
+
+/* doctor/where: report install, cache, UI, and config paths without mutating. */
+int cbm_cmd_doctor(int argc, char **argv);
+int cbm_cmd_where(int argc, char **argv);
 
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext

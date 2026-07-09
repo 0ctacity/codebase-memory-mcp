@@ -910,7 +910,7 @@ TEST(cli_zed_mcp_install) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "\"context_servers\"") != NULL);
     ASSERT(strstr(data, "\"command\"") != NULL);
-    ASSERT(strstr(data, "\"args\"") != NULL);
+    ASSERT(strstr(data, "\"args\"") == NULL);
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
     ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
 
@@ -1758,6 +1758,9 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
     ASSERT(strstr(json, "writes_started") != NULL);
     ASSERT(strstr(json, "next_safe_command") != NULL);
+    ASSERT(strstr(json, "binary_target_planned") != NULL);
+    ASSERT(strstr(json, "shell_rc_planned") != NULL);
+    ASSERT(strstr(json, "human_summary") != NULL);
     ASSERT(strstr(json, "cursor") != NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
     ASSERT(strstr(json, ".codex/config.toml") != NULL);
@@ -1771,6 +1774,80 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
     ASSERT(stat(cfg, &st) != 0); /* must not exist */
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_help_no_mutation) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-help-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *old_home = getenv("HOME");
+    char *old_home_copy = old_home ? strdup(old_home) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char *args[] = {"--help"};
+    ASSERT_EQ(cbm_cmd_install(1, args), 0);
+
+    char path[512];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/.codex/config.toml", tmpdir);
+    ASSERT(stat(path, &st) != 0);
+    snprintf(path, sizeof(path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    ASSERT(stat(path, &st) != 0);
+
+    if (old_home_copy) {
+        cbm_setenv("HOME", old_home_copy, 1);
+        free(old_home_copy);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_ui_rejects_non_ui_binary) {
+    char *args[] = {"--ui", "--dry-run"};
+    ASSERT_EQ(cbm_cmd_install(2, args), 1);
+    PASS();
+}
+
+TEST(cli_doctor_where_reports_paths) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-doctor-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    test_mkdirp(cache);
+    char db[512];
+    snprintf(db, sizeof(db), "%s/example.db", cache);
+    write_test_file(db, "");
+
+    const char *old_home = getenv("HOME");
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *old_home_copy = old_home ? strdup(old_home) : NULL;
+    char *old_cache_copy = old_cache ? strdup(old_cache) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    ASSERT_EQ(cbm_cmd_doctor(0, NULL), 0);
+    ASSERT_EQ(cbm_cmd_where(0, NULL), 0);
+
+    if (old_home_copy) {
+        cbm_setenv("HOME", old_home_copy, 1);
+        free(old_home_copy);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", old_cache_copy, 1);
+        free(old_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -1805,6 +1882,19 @@ TEST(cli_codex_session_hook_issue330) {
     d = read_test_file(cfg);
     ASSERT_NULL(strstr(d, "hooks.SessionStart"));
     ASSERT(strstr(d, "[mcp_servers.other]") != NULL); /* still preserved after removal */
+
+    write_test_file(cfg, "[mcp_servers.other]\ncommand = \"x\"\n"
+                         "# >>> codebase-memory-mcp SessionStart >>>\n"
+                         "[[hooks.SessionStart]]\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n"
+                         "# <<< codebase-memory-mcp SessionStart <<<\n"
+                         "# >>> codebase-memory-mcp SessionStart >>>\n");
+    ASSERT_EQ(cbm_upsert_codex_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    first = strstr(d, "[[hooks.SessionStart]]");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NULL(strstr(first + 1, "[[hooks.SessionStart]]"));
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2135,7 +2225,7 @@ TEST(cli_upsert_codex_mcp_replace) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 TEST(cli_zed_mcp_uses_args_format) {
-    /* Verify Zed uses args:[""] NOT source:"custom" */
+    /* Verify Zed omits empty args and does not use source:"custom" */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-zed-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -2148,7 +2238,7 @@ TEST(cli_zed_mcp_uses_args_format) {
 
     const char *data = read_test_file(configpath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "\"args\"") != NULL);
+    ASSERT(strstr(data, "\"args\"") == NULL);
     /* Must NOT have source:"custom" */
     ASSERT(strstr(data, "\"source\"") == NULL);
 
@@ -3156,6 +3246,9 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
+    RUN_TEST(cli_install_help_no_mutation);
+    RUN_TEST(cli_install_ui_rejects_non_ui_binary);
+    RUN_TEST(cli_doctor_where_reports_paths);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);

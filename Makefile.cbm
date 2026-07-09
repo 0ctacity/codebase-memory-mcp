@@ -169,6 +169,10 @@ SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 # Store module (new)
 STORE_SRCS = src/store/store.c
 
+# Optional Zova migration adapter. Compiles to no-op stubs unless
+# CBM_WITH_ZOVA=1 is set for the build.
+ZOVA_SRCS = src/zova/cbm_zova.c src/zova/cbm_zova_bridge_stub.c
+
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
 
@@ -295,7 +299,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(ZOVA_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -408,6 +412,10 @@ TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 
+TEST_ZOVA_SRCS = tests/test_zova.c
+TEST_ZOVA_C_SQL_FUNCTIONS_SRCS = tests/test_zova_c_sql_functions.c
+TEST_ZOVA_BRIDGE_SRCS = tests/test_zova_bridge.c
+
 # Cumulative BUG-REPRODUCTION suite (separate runner, NOT in ALL_TEST_SRCS).
 # These cases are RED by design (one open bug each) — see tests/repro/repro_main.c.
 # Kept out of the gating `make test` so `ci-ok` stays green; run via `make test-repro`.
@@ -469,12 +477,43 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_ZOVA_SRCS) $(TEST_ZOVA_C_SQL_FUNCTIONS_SRCS) $(TEST_ZOVA_BRIDGE_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
 
 BUILD_DIR = build/c
+ZIG ?= zig
+BUN ?= bun
+CBM_WITH_ZOVA ?= 0
+ZOVA_ROOT ?= ../zova
+ZOVA_TEST_BUILD_DIR ?= build/c-zova
+ZOVA_LIB = $(ZOVA_ROOT)/zig-out/lib/libzova_c.a
+ZOVA_LINK_LIBS :=
+ZOVA_CHECK_TARGET :=
+ifeq ($(CBM_WITH_ZOVA),1)
+CFLAGS_COMMON += -DCBM_WITH_ZOVA=1 -I$(ZOVA_ROOT)/include
+ZOVA_LINK_LIBS := $(ZOVA_LIB)
+ZOVA_CHECK_TARGET := check-zova
+else
+CFLAGS_COMMON += -DCBM_WITH_ZOVA=0
+endif
+ZIG_GLOBAL_CACHE_DIR ?= $(CURDIR)/$(BUILD_DIR)/zig-global-cache
+ZIG_LOCAL_CACHE_DIR ?= $(CURDIR)/$(BUILD_DIR)/zig-local-cache
+MACOSX_DEPLOYMENT_TARGET ?= 15.0
+ZIG_WITH_ZOVA := $(if $(filter 1,$(CBM_WITH_ZOVA)),true,false)
+ZIG_CBM_ARGS := -Dwith-zova=$(ZIG_WITH_ZOVA) -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+ZIG_TARGET_FLAGS :=
+ifeq ($(shell uname -s),Darwin)
+ZIG_TARGET_FLAGS := -target native-macos.$(MACOSX_DEPLOYMENT_TARGET)
+endif
+CBM_CLI_ZIG_SRC = src/cli_zig/cbm_cli_zig.zig
+CBM_CLI_ZIG_LIB = $(BUILD_DIR)/libcbm_cli_zig.a
+CBM_ZOVA_BRIDGE_ZIG_SRC = src/zova/cbm_zova_bridge.zig
+CBM_ZOVA_BRIDGE_LIB =
+ifeq ($(CBM_WITH_ZOVA),1)
+CBM_ZOVA_BRIDGE_LIB = $(BUILD_DIR)/cbm_zova_bridge.o
+endif
 
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
@@ -493,10 +532,69 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-cli test-mcp test-ui test-ui-build test-focused-cli-ui test-install-ui-success test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed check-bun check-zova test-zova-link test-zova-container test-zova-i8 test-zova-vector-parity test-zova-benchmark-smoke test-zova-c-sql-functions test-zova-bridge test-zova-graph-mirror zova-test-runner clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+check-bun:
+	@command -v $(BUN) >/dev/null 2>&1 || { \
+		echo "error: bun is required for UI tests/builds (install Bun or set BUN=/path/to/bun)." >&2; \
+		exit 1; \
+	}
+
+check-zova:
+	@command -v $(ZIG) >/dev/null 2>&1 || { \
+		echo "error: zig is required for CBM_WITH_ZOVA=1 builds (install Zig or set ZIG=/path/to/zig)." >&2; \
+		exit 1; \
+	}
+	@test -d "$(ZOVA_ROOT)" || { \
+		echo "error: ZOVA_ROOT not found: $(ZOVA_ROOT)" >&2; \
+		exit 1; \
+	}
+	@test -f "$(ZOVA_LIB)" || { \
+		echo "error: Zova C static library not found: $(ZOVA_LIB)" >&2; \
+		echo "       Build Zova first with: cd $(ZOVA_ROOT) && zig build" >&2; \
+		exit 1; \
+	}
+	@grep -q "Zova C ABI, v0.22.0 pre-1.0" "$(ZOVA_ROOT)/include/zova.h" || { \
+		echo "error: Zova C ABI 0.22.0 is required: $(ZOVA_ROOT)/include/zova.h" >&2; \
+		exit 1; \
+	}
+	@grep -q "zova_database_register_function" "$(ZOVA_ROOT)/include/zova.h" || { \
+		echo "error: Zova C ABI header is missing zova_database_register_function" >&2; \
+		exit 1; \
+	}
+	@grep -q "zova_vector_search_in" "$(ZOVA_ROOT)/include/zova.h" || { \
+		echo "error: Zova C ABI header is missing zova_vector_search_in" >&2; \
+		exit 1; \
+	}
+	@grep -q "zova_vector_search_by_id_in" "$(ZOVA_ROOT)/include/zova.h" || { \
+		echo "error: Zova C ABI header is missing zova_vector_search_by_id_in" >&2; \
+		exit 1; \
+	}
+
+$(CBM_CLI_ZIG_LIB): $(CBM_CLI_ZIG_SRC) src/cli/cli_zig.h | $(BUILD_DIR)
+	@command -v $(ZIG) >/dev/null 2>&1 || { \
+		echo "error: zig is required to build codebase-memory-mcp CLI support (install Zig or set ZIG=/path/to/zig)." >&2; \
+		exit 1; \
+	}
+	mkdir -p $(ZIG_GLOBAL_CACHE_DIR) $(ZIG_LOCAL_CACHE_DIR)
+	ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR) \
+	ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR) \
+		$(ZIG) build-lib -static -O ReleaseFast -lc $(ZIG_TARGET_FLAGS) -femit-bin=$@ $<
+
+$(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bridge.h $(ZOVA_LIB) $(ZOVA_ROOT)/src/root.zig | $(BUILD_DIR)
+	@command -v $(ZIG) >/dev/null 2>&1 || { \
+		echo "error: zig is required to build the Zova bridge (install Zig or set ZIG=/path/to/zig)." >&2; \
+		exit 1; \
+	}
+	mkdir -p $(ZIG_GLOBAL_CACHE_DIR) $(ZIG_LOCAL_CACHE_DIR)
+	ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR) \
+	ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR) \
+		$(ZIG) build-obj -O ReleaseFast -lc $(ZIG_TARGET_FLAGS) \
+			-Ivendored/sqlite3 \
+			-femit-bin=$@ --dep zova -Mroot=$< -Ivendored/sqlite3 -Mzova=$(ZOVA_ROOT)/src/root.zig
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
@@ -535,6 +633,10 @@ $(BUILD_DIR)/prod_mimalloc.o: $(MIMALLOC_SRC) | $(BUILD_DIR)
 # sqlite3 object files (vendored amalgamation)
 SQLITE3_OBJ_TEST = $(BUILD_DIR)/sqlite3.o
 SQLITE3_OBJ_PROD = $(BUILD_DIR)/prod_sqlite3.o
+ifeq ($(CBM_WITH_ZOVA),1)
+SQLITE3_OBJ_TEST :=
+SQLITE3_OBJ_PROD :=
+endif
 
 $(BUILD_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(BUILD_DIR)
 	$(CC) $(SQLITE3_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
@@ -575,25 +677,73 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(CBM_CLI_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
+		$(CBM_CLI_ZIG_LIB) \
+		$(CBM_ZOVA_BRIDGE_LIB) \
+		$(ZOVA_LINK_LIBS) \
 		$(LDFLAGS_TEST)
 
-test: $(BUILD_DIR)/test-runner
-	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+test:
+	$(ZIG) build test $(ZIG_CBM_ARGS)
+
+test-cli:
+	$(ZIG) build test-cli $(ZIG_CBM_ARGS)
+
+test-mcp:
+	$(ZIG) build test-mcp $(ZIG_CBM_ARGS)
+
+test-ui:
+	$(ZIG) build test-ui
+
+test-ui-build:
+	$(ZIG) build test-ui-build
+
+test-focused-cli-ui:
+	$(ZIG) build test-focused-cli-ui $(ZIG_CBM_ARGS)
+
+zova-test-runner:
+	$(MAKE) -f Makefile.cbm CBM_WITH_ZOVA=1 BUILD_DIR=$(ZOVA_TEST_BUILD_DIR) $(ZOVA_TEST_BUILD_DIR)/test-runner
+
+test-zova-link:
+	$(ZIG) build test-zova-link -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-container:
+	$(ZIG) build test-zova-container -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-i8:
+	$(ZIG) build test-zova-i8 -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-vector-parity:
+	$(ZIG) build test-zova-vector-parity -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-benchmark-smoke:
+	$(ZIG) build test-zova-benchmark-smoke -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-c-sql-functions:
+	$(ZIG) build test-zova-c-sql-functions -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-bridge:
+	$(ZIG) build test-zova-bridge -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
+
+test-zova-graph-mirror:
+	$(ZIG) build test-zova-graph-mirror -Dwith-zova=true -Dzova-root=$(ZOVA_ROOT) -Dtarget-macos-version=$(MACOSX_DEPLOYMENT_TARGET)
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(CBM_CLI_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
 		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
+		$(CBM_CLI_ZIG_LIB) \
+		$(CBM_ZOVA_BRIDGE_LIB) \
+		$(ZOVA_LINK_LIBS) \
 		$(LDFLAGS_TEST)
 
 test-repro: $(BUILD_DIR)/test-repro-runner
@@ -640,17 +790,20 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(CBM_CLI_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
+		$(CBM_CLI_ZIG_LIB) \
+		$(CBM_ZOVA_BRIDGE_LIB) \
+		$(ZOVA_LINK_LIBS) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp
-	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+cbm:
+	$(ZIG) build cbm $(ZIG_CBM_ARGS)
 
-# ── Build with embedded UI (requires Node.js) ───────────────────
+# ── Build with embedded UI (requires Bun) ───────────────────────
 
 # Swap embedded_stub.c for the generated embedded_assets.c
 UI_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,$(UI_SRCS))
@@ -659,20 +812,25 @@ PROD_SRCS_WITH_ASSETS = $(subst src/ui/embedded_stub.c,src/ui/embedded_assets.c,
 # Embedded asset object files (generated by embed script)
 EMBED_OBJS = $(wildcard $(BUILD_DIR)/embedded/embed_*.o)
 
-frontend:
-	cd graph-ui && npm ci && npm run build
+frontend: check-bun
+	cd graph-ui && $(BUN) install --frozen-lockfile && $(BUN) run build
 
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(CBM_CLI_ZIG_LIB) $(ZOVA_CHECK_TARGET)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
+		$(CBM_CLI_ZIG_LIB) \
+		$(ZOVA_LINK_LIBS) \
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
+
+test-install-ui-success: cbm-with-ui
+	bash scripts/test-install-ui-success.sh
 
 clean-c:
 	rm -rf $(BUILD_DIR)

@@ -30,8 +30,14 @@ function mockProjectsFetch(extra?: (url: string, init?: RequestInit) => Response
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     if (url === "/api/index") {
-      return new Response(JSON.stringify({ status: "indexing", slot: 0 }), {
+      return new Response(JSON.stringify({ status: "starting", slot: 0, path: "/home/dev" }), {
         status: 202,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/index-status") {
+      return new Response(JSON.stringify([]), {
+        status: 200,
         headers: { "Content-Type": "application/json" },
       });
     }
@@ -52,7 +58,7 @@ describe("StatsTab index modal", () => {
     mockProjectsFetch((url, init) => {
       if (url === "/api/index") {
         submitted = JSON.parse(String(init?.body));
-        return new Response(JSON.stringify({ status: "indexing", slot: 0 }), {
+        return new Response(JSON.stringify({ status: "starting", slot: 0 }), {
           status: 202,
           headers: { "Content-Type": "application/json" },
         });
@@ -77,6 +83,7 @@ describe("StatsTab index modal", () => {
         project_name: "信租风控通后端",
       });
     });
+    expect(await screen.findByText(messages.en.index.starting)).toBeInTheDocument();
   });
 
   it("filters picker rows and exposes quick row indexing", async () => {
@@ -233,9 +240,9 @@ describe("IndexProgress", () => {
     const onDone = vi.fn();
     render(<IndexProgress onDone={onDone} />);
 
-    // Fast-forward initial poll
+    // Initial poll runs immediately.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
     expect(fetchMock).toHaveBeenCalledWith("/api/index-status");
@@ -261,9 +268,9 @@ describe("IndexProgress", () => {
     const onDone = vi.fn();
     render(<IndexProgress onDone={onDone} />);
 
-    // First poll returns active
+    // First poll returns active immediately.
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(0);
     });
     expect(onDone).not.toHaveBeenCalled();
 
@@ -301,7 +308,7 @@ describe("IndexProgress", () => {
       await vi.advanceTimersByTimeAsync(2000);
     });
     expect(onDone).not.toHaveBeenCalled();
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
 
     // Job becomes visible and finishes — now completion fires
     mockData = [{ slot: 1, status: "done", path: "/path/to/project" }];
@@ -325,7 +332,7 @@ describe("IndexProgress", () => {
     render(<IndexProgress onDone={onDone} />);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(0);
     });
 
     // Error banner should show up

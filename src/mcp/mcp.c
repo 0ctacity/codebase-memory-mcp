@@ -319,6 +319,8 @@ static const tool_def_t TOOLS[] = {
      "Requires target_projects param. Ensure target projects have fresh indexes first.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Path to the repository\"},"
+     "\"path\":{\"type\":\"string\",\"description\":"
+     "\"Alias for repo_path\"},"
      "\"mode\":{\"type\":\"string\","
      "\"enum\":[\"full\",\"moderate\",\"fast\",\"cross-repo-intelligence\"],"
      "\"default\":\"full\",\"description\":\"All modes run type-aware LSP call/usage "
@@ -3856,15 +3858,20 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    if (!repo_path) {
+        repo_path = cbm_mcp_get_string_arg(args, "path");
+    }
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
-    cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
         free(mode_str);
         free(name_override);
-        return cbm_mcp_text_result("repo_path is required", true);
+        return cbm_mcp_text_result("required field: repo_path; alias accepted: path; example: "
+                                   "{\"repo_path\":\"/absolute/path/to/repo\"}",
+                                   true);
     }
+    cbm_normalize_path_sep(repo_path);
 
     repo_path = canonicalize_repo_path_if_exists(repo_path);
 

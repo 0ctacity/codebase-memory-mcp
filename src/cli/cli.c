@@ -9,7 +9,10 @@
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/sha256.h"
+#include "cli/cli_zig.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+#include "ui/config.h"
+#include "ui/embedded_assets.h"
 
 /* CLI buffer size constants. */
 enum {
@@ -82,6 +85,7 @@ enum {
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
 #include <limits.h> // UINT_MAX
+#include <stdarg.h>
 #include <stdint.h> // uintptr_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -1068,9 +1072,6 @@ int cbm_install_zed_mcp(const char *binary_path, const char *config_path) {
 
     yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
     yyjson_mut_obj_add_str(mdoc, entry, "command", binary_path);
-    yyjson_mut_val *args = yyjson_mut_arr(mdoc);
-    yyjson_mut_arr_add_str(mdoc, args, "");
-    yyjson_mut_obj_add_val(mdoc, entry, "args", args);
     yyjson_mut_obj_add_val(mdoc, servers, "codebase-memory-mcp", entry);
 
     int rc = write_json_file(config_path, mdoc);
@@ -1593,36 +1594,47 @@ int cbm_remove_codex_mcp(const char *config_path) {
 #define CODEX_HOOK_BEGIN "# >>> codebase-memory-mcp SessionStart >>>"
 #define CODEX_HOOK_END "# <<< codebase-memory-mcp SessionStart <<<"
 
-/* Splice out an existing [CODEX_HOOK_BEGIN .. CODEX_HOOK_END] block (inclusive,
- * plus a leading newline). Returns a newly-malloc'd string the caller frees, or
- * NULL if no block was present (content is left untouched). */
+/* Strip every managed Codex SessionStart block and any stray marker lines.
+ * Returns a newly-malloc'd string the caller frees, or NULL when unchanged. */
 static char *codex_hook_strip(const char *content) {
-    const char *begin = strstr(content, CODEX_HOOK_BEGIN);
-    if (!begin) {
-        return NULL;
-    }
-    const char *end = strstr(begin, CODEX_HOOK_END);
-    if (!end) {
-        return NULL;
-    }
-    end += strlen(CODEX_HOOK_END);
-    if (*end == '\n') {
-        end++;
-    }
-    /* Drop one leading newline before the block, if any. */
-    const char *cut = begin;
-    if (cut > content && *(cut - CLI_SKIP_ONE) == '\n') {
-        cut--;
-    }
-    size_t prefix_len = (size_t)(cut - content);
-    size_t suffix_len = strlen(end);
-    char *out = malloc(prefix_len + suffix_len + CLI_SKIP_ONE);
+    size_t content_len = strlen(content);
+    char *out = malloc(content_len + CLI_SKIP_ONE);
     if (!out) {
         return NULL;
     }
-    memcpy(out, content, prefix_len);
-    memcpy(out + prefix_len, end, suffix_len);
-    out[prefix_len + suffix_len] = '\0';
+    size_t out_len = 0;
+    bool changed = false;
+    bool in_block = false;
+    const char *line = content;
+    while (*line) {
+        const char *next = strchr(line, '\n');
+        size_t line_len = next ? (size_t)(next - line + CLI_SKIP_ONE) : strlen(line);
+        if (strstr(line, CODEX_HOOK_BEGIN) && (strstr(line, CODEX_HOOK_BEGIN) < line + line_len)) {
+            in_block = true;
+            changed = true;
+            line += line_len;
+            continue;
+        }
+        if (strstr(line, CODEX_HOOK_END) && (strstr(line, CODEX_HOOK_END) < line + line_len)) {
+            in_block = false;
+            changed = true;
+            line += line_len;
+            continue;
+        }
+        if (in_block) {
+            changed = true;
+            line += line_len;
+            continue;
+        }
+        memcpy(out + out_len, line, line_len);
+        out_len += line_len;
+        line += line_len;
+    }
+    out[out_len] = '\0';
+    if (!changed) {
+        free(out);
+        return NULL;
+    }
     return out;
 }
 
@@ -3666,6 +3678,179 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     }
 }
 
+static void cbm_install_target_path(const char *home, char *buf, size_t buf_sz) {
+#ifdef _WIN32
+    snprintf(buf, buf_sz, "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+    snprintf(buf, buf_sz, "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+}
+
+static int cbm_sb_append(char **buf, size_t *len, size_t *cap, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) {
+        va_end(ap2);
+        return CLI_ERR;
+    }
+    size_t add = (size_t)need;
+    size_t required = *len + add + CLI_SKIP_ONE;
+    if (required > *cap) {
+        size_t ncap = *cap ? *cap : CLI_BUF_1K;
+        while (ncap < required) {
+            ncap *= GROWTH_FACTOR;
+        }
+        char *nbuf = realloc(*buf, ncap);
+        if (!nbuf) {
+            va_end(ap2);
+            return CLI_ERR;
+        }
+        *buf = nbuf;
+        *cap = ncap;
+    }
+    vsnprintf(*buf + *len, *cap - *len, fmt, ap2);
+    va_end(ap2);
+    *len += add;
+    return 0;
+}
+
+static bool cbm_project_dbish_name(const char *name) {
+    size_t len = strlen(name);
+    if (name[0] == '_') {
+        return false;
+    }
+    return (len > DB_EXT_LEN && strcmp(name + len - DB_EXT_LEN, ".db") == 0) ||
+           (len > 5 && strcmp(name + len - 5, ".zova") == 0);
+}
+
+static char *cbm_collect_project_db_paths(const char *cache_dir) {
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    if (cbm_sb_append(&out, &len, &cap, "%s", "") != 0) {
+        return NULL;
+    }
+    if (!cache_dir || !cache_dir[0]) {
+        return out;
+    }
+    cbm_dir_t *d = cbm_opendir(cache_dir);
+    if (!d) {
+        return out;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (cbm_project_dbish_name(ent->name)) {
+            if (cbm_sb_append(&out, &len, &cap, "%s/%s\n", cache_dir, ent->name) != 0) {
+                break;
+            }
+        }
+    }
+    cbm_closedir(d);
+    return out;
+}
+
+static void cbm_detected_agents_csv(const cbm_detected_agents_t *det, char *buf, size_t buf_sz) {
+    buf[0] = '\0';
+    struct {
+        bool flag;
+        const char *name;
+    } names[] = {
+        {det->claude_code, "Claude Code"}, {det->codex, "Codex CLI"},
+        {det->gemini, "Gemini CLI"},       {det->zed, "Zed"},
+        {det->opencode, "OpenCode"},       {det->antigravity, "Antigravity"},
+        {det->aider, "Aider"},             {det->kilocode, "KiloCode"},
+        {det->vscode, "VS Code"},          {det->cursor, "Cursor"},
+        {det->openclaw, "OpenClaw"},       {det->kiro, "Kiro"},
+        {det->junie, "Junie"},
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (!names[i].flag) {
+            continue;
+        }
+        if (buf[0]) {
+            strncat(buf, ", ", buf_sz - strlen(buf) - CLI_SKIP_ONE);
+        }
+        strncat(buf, names[i].name, buf_sz - strlen(buf) - CLI_SKIP_ONE);
+    }
+    if (!buf[0]) {
+        snprintf(buf, buf_sz, "%s", "none");
+    }
+}
+
+static bool cbm_path_contains_dir(const char *dir) {
+    char path_copy[CLI_BUF_4K];
+    if (!dir || !dir[0] || !cbm_safe_getenv("PATH", path_copy, sizeof(path_copy), NULL)) {
+        return false;
+    }
+#ifdef _WIN32
+    const char sep = ';';
+#else
+    const char sep = ':';
+#endif
+    const char *p = path_copy;
+    size_t dir_len = strlen(dir);
+    while (*p) {
+        const char *end = strchr(p, sep);
+        size_t part_len = end ? (size_t)(end - p) : strlen(p);
+        if (part_len == dir_len && strncmp(p, dir, dir_len) == 0) {
+            return true;
+        }
+        if (!end) {
+            break;
+        }
+        p = end + CLI_SKIP_ONE;
+    }
+    return false;
+}
+
+static char *cbm_collect_report_config_paths(const char *home) {
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    if (cbm_sb_append(&out, &len, &cap, "%s", "") != 0) {
+        return NULL;
+    }
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.codex/config.toml", home);
+    cbm_sb_append(&out, &len, &cap, "%s\n", path);
+    snprintf(path, sizeof(path), "%s/.codex/AGENTS.md", home);
+    cbm_sb_append(&out, &len, &cap, "%s\n", path);
+#ifdef __APPLE__
+    snprintf(path, sizeof(path), "%s/Library/Application Support/Zed/settings.json", home);
+#elif defined(_WIN32)
+    snprintf(path, sizeof(path), "%s/Zed/settings.json", cbm_app_local_dir());
+#else
+    snprintf(path, sizeof(path), "%s/zed/settings.json", cbm_app_config_dir());
+#endif
+    cbm_sb_append(&out, &len, &cap, "%s\n", path);
+    const char *rc = cbm_detect_shell_rc(home);
+    if (rc && rc[0]) {
+        cbm_sb_append(&out, &len, &cap, "%s\n", rc);
+    }
+    cbm_ui_config_path(path, (int)sizeof(path));
+    cbm_sb_append(&out, &len, &cap, "%s\n", path);
+    return out;
+}
+
+static char *cbm_collect_plan_paths(const cbm_install_plan_t *plan) {
+    char *out = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    if (cbm_sb_append(&out, &len, &cap, "%s", "") != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < plan->count; i++) {
+        if (cbm_sb_append(&out, &len, &cap, "%s\n", plan->items[i].path) != 0) {
+            break;
+        }
+    }
+    return out;
+}
+
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
  * the config / instruction / hook files `install` WOULD write, produced by
  * running the real install dispatch in record-only mode (no mutation, no
@@ -3707,6 +3892,12 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
 
+    char binary_target[CLI_BUF_1K];
+    cbm_install_target_path(home, binary_target, sizeof(binary_target));
+    const char *shell_rc = cbm_detect_shell_rc(home);
+    yyjson_mut_obj_add_strcpy(doc, root, "binary_target_planned", binary_target);
+    yyjson_mut_obj_add_strcpy(doc, root, "shell_rc_planned", shell_rc && shell_rc[0] ? shell_rc : "");
+
     yyjson_mut_val *agents = yyjson_mut_arr(doc);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         if (names[i].flag) {
@@ -3734,6 +3925,17 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
     yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    char *planned_paths = cbm_collect_plan_paths(&plan);
+    if (planned_paths) {
+        char *overview = cbm_cli_zig_install_plan_overview(binary_target,
+                                                           shell_rc && shell_rc[0] ? shell_rc : "",
+                                                           planned_paths);
+        if (overview) {
+            yyjson_mut_obj_add_strcpy(doc, root, "human_summary", overview);
+            cbm_cli_zig_free(overview);
+        }
+        free(planned_paths);
+    }
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
     yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
@@ -3744,12 +3946,35 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return json; /* malloc'd; caller frees */
 }
 
+static void cbm_print_install_help(void) {
+    printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
+    printf("Usage:\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
+    printf("  codebase-memory-mcp install --ui [-y|-n] [--force] [--dry-run]\n\n");
+    printf("Options:\n");
+    printf("  --help           Print this help and make no changes\n");
+    printf("  --plan           Print the files install would touch as JSON and make no changes\n");
+    printf("  --dry-run        Show install actions without writing files\n");
+    printf("  --force          Replace an existing installed binary without prompting\n");
+    printf("  --reset-indexes  Prompt to delete existing project indexes before install\n");
+    printf("  --ui             Install/configure UI mode; requires a binary with embedded UI assets\n");
+    printf("  -y, --yes        Answer yes to prompts\n");
+    printf("  -n, --no         Answer no to prompts\n");
+}
+
 int cbm_cmd_install(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            cbm_print_install_help();
+            return 0;
+        }
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
     bool plan = false;
     bool reset_indexes = false;
+    bool install_ui = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -3759,6 +3984,15 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
+        }
+        if (strcmp(argv[i], "--ui") == 0) {
+            install_ui = true;
+        }
+        if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
+            (void)fprintf(stderr,
+                          "error: install uses --ui to select the UI-capable install path; "
+                          "runtime UI toggles use --ui=true or --ui=false.\n");
+            return CLI_TRUE;
         }
         /* Opt-in: delete existing indexes during install. Default preserves
          * the indexed graph (#607). Only this flag triggers deletion. */
@@ -3773,13 +4007,21 @@ int cbm_cmd_install(int argc, char **argv) {
         return CLI_TRUE;
     }
 
+    if (install_ui && CBM_EMBEDDED_FILE_COUNT == 0) {
+        (void)fprintf(stderr,
+                      "error: install --ui requires a binary built with embedded UI assets.\n"
+                      "Use the UI release asset or rebuild with: make -f Makefile.cbm cbm-with-ui\n"
+                      "For the shell installer path, use: install.sh --ui --skip-config\n");
+        return CLI_TRUE;
+    }
+
     /* --plan: emit the machine-readable install receipt and exit WITHOUT
      * mutating anything (no config writes, no index deletion, no network) so
      * an agent can inspect exactly what install would touch first (#388). */
     if (plan) {
-        char self_path[CLI_BUF_1K] = {0};
-        cbm_detect_self_path(self_path, sizeof(self_path), home);
-        char *json = cbm_build_install_plan_json(home, self_path);
+        char bin_target[CLI_BUF_1K];
+        cbm_install_target_path(home, bin_target, sizeof(bin_target));
+        char *json = cbm_build_install_plan_json(home, bin_target);
         if (!json) {
             (void)fprintf(stderr, "error: failed to build install plan\n");
             return CLI_TRUE;
@@ -3815,11 +4057,7 @@ int cbm_cmd_install(int argc, char **argv) {
     cbm_detect_self_path(self_path, sizeof(self_path), home);
 
     char bin_target[CLI_BUF_1K];
-#ifdef _WIN32
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
-#else
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
-#endif
+    cbm_install_target_path(home, bin_target, sizeof(bin_target));
 
     if (!cbm_same_file(self_path, bin_target)) {
         struct stat tgt_st;
@@ -3882,12 +4120,108 @@ int cbm_cmd_install(int argc, char **argv) {
         }
     }
 
+    if (install_ui) {
+        cbm_ui_config_t ui_cfg;
+        cbm_ui_config_load(&ui_cfg);
+        ui_cfg.ui_enabled = true;
+        if (dry_run) {
+            printf("\nWould enable UI mode on port %d\n", ui_cfg.ui_port);
+        } else {
+            cbm_ui_config_save(&ui_cfg);
+            printf("\nUI mode enabled on port %d\n", ui_cfg.ui_port);
+        }
+    }
+
     printf("\nInstall complete. Restart your shell or run:\n");
     printf("  source %s\n", rc);
     if (dry_run) {
         printf("\n(dry-run — no files were modified)\n");
     }
     return 0;
+}
+
+static void cbm_print_doctor_help(void) {
+    printf("Usage: codebase-memory-mcp doctor\n\n");
+    printf("Reports binary path, cache directory, project DB files, detected agents,\n");
+    printf("config paths, UI capability, UI config, and PATH status. Makes no changes.\n");
+}
+
+static void cbm_print_where_help(void) {
+    printf("Usage: codebase-memory-mcp where\n\n");
+    printf("Prints cache, binary, project DB, and config paths. Makes no changes.\n");
+}
+
+static int cbm_report_paths_common(bool terse) {
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        (void)fprintf(stderr, "error: HOME not set (use USERPROFILE on Windows)\n");
+        return CLI_TRUE;
+    }
+    char running[CLI_BUF_1K] = {0};
+    cbm_detect_self_path(running, sizeof(running), home);
+
+    char installed[CLI_BUF_1K];
+    cbm_install_target_path(home, installed, sizeof(installed));
+
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        cache_dir = "";
+    }
+    char *project_dbs = cbm_collect_project_db_paths(cache_dir);
+    char *config_paths = cbm_collect_report_config_paths(home);
+    if (!project_dbs || !config_paths) {
+        free(project_dbs);
+        free(config_paths);
+        (void)fprintf(stderr, "error: failed to build report\n");
+        return CLI_TRUE;
+    }
+
+    char *report = NULL;
+    if (terse) {
+        report = cbm_cli_zig_where_report(running, installed, cache_dir, project_dbs, config_paths);
+    } else {
+        cbm_detected_agents_t det = cbm_detect_agents(home);
+        char agents[CLI_BUF_512];
+        cbm_detected_agents_csv(&det, agents, sizeof(agents));
+        char bin_dir[CLI_BUF_1K];
+        snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+        cbm_ui_config_t ui_cfg;
+        cbm_ui_config_load(&ui_cfg);
+        report = cbm_cli_zig_doctor_report(home, running, installed, cache_dir, project_dbs,
+                                           config_paths, agents, cbm_path_contains_dir(bin_dir),
+                                           CBM_EMBEDDED_FILE_COUNT > 0, ui_cfg.ui_enabled,
+                                           ui_cfg.ui_port);
+    }
+
+    free(project_dbs);
+    free(config_paths);
+    if (!report) {
+        (void)fprintf(stderr, "error: failed to build report\n");
+        return CLI_TRUE;
+    }
+    printf("%s", report);
+    cbm_cli_zig_free(report);
+    return 0;
+}
+
+int cbm_cmd_doctor(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            cbm_print_doctor_help();
+            return 0;
+        }
+    }
+    return cbm_report_paths_common(false);
+}
+
+int cbm_cmd_where(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            cbm_print_where_help();
+            return 0;
+        }
+    }
+    return cbm_report_paths_common(true);
 }
 
 /* ── Subcommand: uninstall ────────────────────────────────────── */

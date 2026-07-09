@@ -507,16 +507,20 @@ static void print_help(void) {
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
+    printf("  codebase-memory-mcp install --ui [-y|-n] [--force]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp doctor      Show install/cache/UI/agent status\n");
+    printf("  codebase-memory-mcp where       Show storage and config paths\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
-    printf("\nUI options:\n");
+    printf("\nRuntime UI options:\n");
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  install --ui Installs/configures UI mode when this binary has embedded UI assets\n");
     printf("\nSupported agents (auto-detected):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, Kiro\n");
@@ -565,6 +569,12 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "config") == 0) {
             return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "doctor") == 0) {
+            return cbm_cmd_doctor(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "where") == 0) {
+            return cbm_cmd_where(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
     }
     return CBM_NOT_FOUND;

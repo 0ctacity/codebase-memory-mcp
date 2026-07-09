@@ -137,7 +137,7 @@ struct cbm_http_server {
 typedef struct {
     char root_path[1024];
     char project_name[256];
-    atomic_int status; /* 0=idle, 1=running, 2=done, 3=error */
+    atomic_int status; /* 0=idle, 1=running, 2=done, 3=error, 4=starting */
     char error_msg[256];
 #ifndef _WIN32
     pid_t child_pid; /* tracked for process-kill validation */
@@ -973,6 +973,7 @@ void cbm_http_server_set_binary_path(const char *path) {
 /* Index via subprocess — isolates crashes from the main process. */
 static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
+    atomic_store(&job->status, 1);
     cbm_log_info("ui.index.start", "path", job->root_path);
 
     /* Use stored binary path, or try to find it */
@@ -1193,7 +1194,7 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
     snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
     job->error_msg[0] = '\0';
-    atomic_store(&job->status, 1);
+    atomic_store(&job->status, 4);
     yyjson_doc_free(doc);
 
     /* Spawn background thread */
@@ -1206,7 +1207,7 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
     cbm_thread_detach(&tid); /* Don't leak thread handle */
 
-    cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
+    cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"starting\",\"slot\":%d,\"path\":\"%s\"}",
                     slot, job->root_path);
 }
 
@@ -1220,7 +1221,7 @@ static void handle_index_status(cbm_http_conn_t *c) {
             continue;
         if (pos > 1)
             buf[pos++] = ',';
-        const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
+        const char *ss = st == 4 ? "starting" : st == 1 ? "indexing" : st == 2 ? "done" : "error";
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
                      g_index_jobs[i].root_path, st == 3 ? g_index_jobs[i].error_msg : "");

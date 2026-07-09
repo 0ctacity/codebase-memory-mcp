@@ -431,42 +431,53 @@ export function IndexProgress({ onDone }: { onDone: () => void }) {
   const t = useUiMessages();
   const [jobs, setJobs] = useState<{ slot: number; status: string; path: string; error?: string }[]>([]);
   const [hasActive, setHasActive] = useState(true);
+  const load = useCallback(async () => {
+    try {
+      const data = await (await fetch("/api/index-status")).json();
+      setJobs(data);
+      const stillActive = data.some((j: { status: string }) => j.status === "starting" || j.status === "indexing");
+      if (data.length > 0 && !stillActive) {
+        setHasActive(false);
+        const hasErrors = data.some((j: { status: string }) => j.status === "error");
+        if (!hasErrors) {
+          onDone();
+        }
+      }
+    } catch (error) {
+      console.error("[IndexProgress] Poll failed:", error);
+    }
+  }, [onDone]);
+
   useEffect(() => {
     if (!hasActive) return;
-    const poll = setInterval(async () => {
-      try {
-        const data = await (await fetch("/api/index-status")).json();
-        setJobs(data);
-        const stillIndexing = data.some((j: { status: string }) => j.status === "indexing");
-        /* Empty list = job not visible: the backend keeps finished jobs listed
-           as "done"/"error", so [] mid-index only happens on transient state
-           loss (e.g. server restart) — keep polling, don't treat as done. */
-        if (data.length > 0 && !stillIndexing) {
-          setHasActive(false);
-          const hasErrors = data.some((j: { status: string }) => j.status === "error");
-          if (!hasErrors) {
-            onDone();
-          }
-        }
-      } catch (error) {
-        console.error("[IndexProgress] Poll failed:", error);
-      }
-    }, 2000);
+    void load();
+    const poll = setInterval(() => { void load(); }, 2000);
     return () => clearInterval(poll);
-  }, [onDone, hasActive]);
+  }, [load, hasActive]);
 
-  const active = jobs.filter((j) => j.status === "indexing");
+  const active = jobs.filter((j) => j.status === "starting" || j.status === "indexing");
   const errors = jobs.filter((j) => j.status === "error");
 
-  if (active.length === 0 && errors.length === 0) return null;
+  if (active.length === 0 && errors.length === 0 && !hasActive) return null;
 
   return (
     <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 mb-6">
+      {active.length === 0 && errors.length === 0 && hasActive && (
+        <div className="flex items-center gap-3">
+          <div className="w-4 h-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
+          <div>
+            <p className="text-[12px] text-primary font-medium">{t.index.starting}</p>
+            <p className="text-[11px] text-foreground/30">{t.projects.indexingInProgress}</p>
+          </div>
+        </div>
+      )}
       {active.map((j) => (
         <div key={j.slot} className="flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
           <div>
-            <p className="text-[12px] text-primary font-medium">{t.projects.indexingInProgress}</p>
+            <p className="text-[12px] text-primary font-medium">
+              {j.status === "starting" ? t.index.starting : t.projects.indexingInProgress}
+            </p>
             <p className="text-[11px] text-foreground/30 font-mono">{j.path}</p>
           </div>
         </div>

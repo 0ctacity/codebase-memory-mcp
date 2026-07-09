@@ -22,6 +22,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
+#include "zova/cbm_zova.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "foundation/platform.h"
@@ -1136,6 +1137,12 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
     }
     free(p->saved_adr);
     p->saved_adr = NULL;
+
+    rc = cbm_zova_after_sqlite_dump(db_path);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "zova_sidecar", "path", db_path);
+        return rc;
+    }
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {

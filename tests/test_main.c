@@ -238,6 +238,9 @@ extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
+extern void suite_zova(void);
+extern void suite_zova_c_sql_functions(void);
+extern void suite_zova_bridge(void);
 
 /* Free the main thread's thread-local node-type bitset cache before exit so
  * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
@@ -399,6 +402,11 @@ int main(int argc, char **argv) {
 
     /* Stack overflow regression (GitHub #199) */
     RUN_SELECTED_SUITE(stack_overflow);
+
+    /* Optional Zova migration adapter */
+    RUN_SELECTED_SUITE(zova);
+    RUN_SELECTED_SUITE(zova_c_sql_functions);
+    RUN_SELECTED_SUITE(zova_bridge);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);

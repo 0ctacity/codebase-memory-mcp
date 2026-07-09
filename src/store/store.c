@@ -61,6 +61,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "zova/cbm_zova.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
@@ -6319,6 +6320,91 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
     return results;
 }
 
+static void vs_sort_and_trim(cbm_vector_result_t *results, int *count, int limit) {
+    if (!results || !count) {
+        return;
+    }
+    for (int i = 0; i < *count - SKIP_ONE; i++) {
+        for (int j = i + SKIP_ONE; j < *count; j++) {
+            if (results[j].score > results[i].score) {
+                cbm_vector_result_t tmp = results[i];
+                results[i] = results[j];
+                results[j] = tmp;
+            }
+        }
+    }
+
+    int final_limit = limit > 0 ? limit : CBM_SZ_16;
+    if (*count > final_limit) {
+        for (int i = final_limit; i < *count; i++) {
+            free(results[i].name);
+            free(results[i].qualified_name);
+            free(results[i].file_path);
+            free(results[i].label);
+        }
+        *count = final_limit;
+    }
+}
+
+static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
+                                     const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw,
+                                     int limit, cbm_vector_result_t **out, int *out_count) {
+    if (cbm_zova_mode_from_env() < CBM_ZOVA_MODE_I8_VECTORS || !cbm_zova_build_enabled() ||
+        !s || !s->db_path) {
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    char zova_path[ST_QUERY_URI_MAX];
+    if (cbm_zova_sidecar_path(s->db_path, zova_path, sizeof(zova_path)) != 0 ||
+        !cbm_file_exists(zova_path)) {
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
+    cbm_zova_node_candidate_t *candidates = NULL;
+    int candidate_count = 0;
+    if (cbm_zova_vector_prefetch_nodes(zova_path, project, kw_vecs[0], VS_VEC_DIM, fetch_limit,
+                                       &candidates, &candidate_count) != 0) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (candidate_count == 0) {
+        cbm_zova_node_candidates_free(candidates, candidate_count);
+        *out = NULL;
+        *out_count = 0;
+        return CBM_STORE_OK;
+    }
+
+    cbm_vector_result_t *results =
+        (cbm_vector_result_t *)calloc((size_t)candidate_count, sizeof(cbm_vector_result_t));
+    if (!results) {
+        cbm_zova_node_candidates_free(candidates, candidate_count);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < candidate_count; i++) {
+        results[i].node_id = candidates[i].node_id;
+        results[i].name = candidates[i].name;
+        results[i].qualified_name = candidates[i].qualified_name;
+        results[i].file_path = candidates[i].file_path;
+        results[i].label = candidates[i].label;
+        candidates[i].name = NULL;
+        candidates[i].qualified_name = NULL;
+        candidates[i].file_path = NULL;
+        candidates[i].label = NULL;
+        results[i].score =
+            vs_min_cosine_score(candidates[i].vector, candidates[i].vector_len, kw_vecs, actual_kw);
+    }
+    cbm_zova_node_candidates_free(candidates, candidate_count);
+
+    int count = candidate_count;
+    vs_sort_and_trim(results, &count, limit);
+    *out = results;
+    *out_count = count;
+    char count_buf[VS_STR_BUF];
+    snprintf(count_buf, sizeof(count_buf), "%d", count);
+    cbm_log_info("vector_search.zova", "project", project, "candidates", count_buf);
+    return CBM_STORE_OK;
+}
+
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count) {
@@ -6332,6 +6418,14 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
     if (actual_kw == 0) {
         return CBM_STORE_OK;
+    }
+
+    int zova_rc = vs_try_zova_vector_search(s, project, kw_vecs, actual_kw, limit, out, out_count);
+    if (zova_rc == CBM_STORE_OK) {
+        return CBM_STORE_OK;
+    }
+    if (zova_rc == CBM_STORE_ERR) {
+        return CBM_STORE_ERR;
     }
 
     /* Scan all node vectors, compute per-keyword cosine, take min.
@@ -6393,28 +6487,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     }
     sqlite3_finalize(stmt);
 
-    /* Re-sort by min-score (SQL sorted by first keyword only) */
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = i + SKIP_ONE; j < count; j++) {
-            if (results[j].score > results[i].score) {
-                cbm_vector_result_t tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
-    }
-
-    /* Trim to requested limit */
-    int final_limit = limit > 0 ? limit : CBM_SZ_16;
-    if (count > final_limit) {
-        for (int i = final_limit; i < count; i++) {
-            free(results[i].name);
-            free(results[i].qualified_name);
-            free(results[i].file_path);
-            free(results[i].label);
-        }
-        count = final_limit;
-    }
+    vs_sort_and_trim(results, &count, limit);
 
     *out = results;
     *out_count = count;
