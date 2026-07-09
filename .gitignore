@@ -48,6 +48,8 @@ private/
 build/
 node_modules/
 graph-ui/dist/
+.zig-cache/
+
 
 # Generated reports
 BENCHMARK_REPORT.md
