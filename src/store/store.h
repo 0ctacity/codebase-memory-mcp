@@ -14,6 +14,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "zova/cbm_zova.h"
+
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_store cbm_store_t;
@@ -409,6 +411,18 @@ void cbm_store_search_free(cbm_search_output_t *out);
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
+
+/* Experimental graph-read sidecar route. Returns NOT_FOUND when the sidecar is
+ * unavailable or cannot be used, so callers can atomically use SQLite instead. */
+int cbm_store_zova_walk_calls(cbm_store_t *s, const char *project, const cbm_node_t *start,
+                              const char *direction, int max_depth, int max_results,
+                              cbm_zova_graph_visit_t **out_visits, int *out_count,
+                              cbm_zova_graph_metrics_t *out_metrics);
+/* Most recent experimental graph-read attempt on this store. */
+void cbm_store_zova_graph_last_metrics(const cbm_store_t *s, cbm_zova_graph_metrics_t *out_metrics);
+/* Store MCP's aggregate metrics for a complete experimental trace request. */
+void cbm_store_zova_graph_set_request_metrics(cbm_store_t *s,
+                                              const cbm_zova_graph_metrics_t *metrics);
 
 /* Free a traverse result's allocated memory. */
 void cbm_store_traverse_free(cbm_traverse_result_t *out);

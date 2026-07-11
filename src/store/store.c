@@ -110,6 +110,16 @@ struct cbm_store {
     struct stat zova_vector_session_stat;
     bool zova_vector_session_stat_valid;
 
+    /* Read-only Zova graph session. Separate from vectors so either sidecar
+     * capability can be unavailable without disturbing the other. */
+    cbm_zova_graph_session_t *zova_graph_session;
+    char *zova_graph_session_path;
+    struct stat zova_graph_session_stat;
+    bool zova_graph_session_stat_valid;
+    char *zova_graph_workspace_root;
+    char zova_graph_workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    cbm_zova_graph_metrics_t zova_graph_last_metrics;
+
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
     sqlite3_stmt *stmt_find_node_by_id;
@@ -147,6 +157,8 @@ struct cbm_store {
 };
 
 static void store_close_zova_vector_session(cbm_store_t *s);
+static void store_close_zova_graph_session(cbm_store_t *s);
+static void store_clear_zova_graph_workspace(cbm_store_t *s);
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -905,6 +917,8 @@ void cbm_store_close(cbm_store_t *s) {
     }
 
     store_close_zova_vector_session(s);
+    store_close_zova_graph_session(s);
+    store_clear_zova_graph_workspace(s);
 
     /* Checkpoint WAL before close to prevent orphan WAL accumulation.
      * Best-effort — silently skips if concurrent reader holds a lock. */
@@ -2861,15 +2875,19 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  FROM bfs"
              "  JOIN edges e ON %s"
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
+             "), shortest AS ("
+             "  SELECT node_id, MIN(hop) AS hop FROM bfs "
+             "  WHERE hop > 0 AND node_id != %lld GROUP BY node_id"
              ")"
              "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop "
-             "FROM bfs "
-             "JOIN nodes n ON n.id = bfs.node_id "
-             "WHERE bfs.hop > 0 " /* exclude root */
-             "ORDER BY bfs.hop "
+             "n.file_path, n.start_line, n.end_line, n.properties, shortest.hop "
+             "FROM shortest "
+             "JOIN nodes n ON n.id = shortest.node_id "
+             "ORDER BY shortest.hop, n.file_path, n.qualified_name, n.label, n.start_line, "
+             "n.end_line, n.id "
              "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+             (long long)start_id, next_id, join_cond, types_clause, max_depth,
+             (long long)start_id, max_results);
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
@@ -6411,6 +6429,249 @@ static cbm_zova_vector_session_t *vs_get_zova_vector_session(cbm_store_t *s,
     return session;
 }
 
+static void store_close_zova_graph_session(cbm_store_t *s) {
+    if (!s) {
+        return;
+    }
+    cbm_zova_graph_session_close(s->zova_graph_session);
+    s->zova_graph_session = NULL;
+    free(s->zova_graph_session_path);
+    s->zova_graph_session_path = NULL;
+    s->zova_graph_session_stat_valid = false;
+}
+
+static void store_clear_zova_graph_workspace(cbm_store_t *s) {
+    if (!s) {
+        return;
+    }
+    free(s->zova_graph_workspace_root);
+    s->zova_graph_workspace_root = NULL;
+    s->zova_graph_workspace_id[0] = '\0';
+}
+
+static bool graph_zova_session_matches(const cbm_store_t *s, const char *zova_path,
+                                       const struct stat *st) {
+    return s && s->zova_graph_session && s->zova_graph_session_path &&
+           s->zova_graph_session_stat_valid && strcmp(s->zova_graph_session_path, zova_path) == 0 &&
+           s->zova_graph_session_stat.st_dev == st->st_dev &&
+           s->zova_graph_session_stat.st_ino == st->st_ino &&
+           s->zova_graph_session_stat.st_size == st->st_size &&
+           s->zova_graph_session_stat.st_mtime == st->st_mtime;
+}
+
+static cbm_zova_graph_session_t *store_get_zova_graph_session(cbm_store_t *s,
+                                                               const char *zova_path) {
+    struct stat st;
+    if (!s || !zova_path || stat(zova_path, &st) != 0) {
+        return NULL;
+    }
+    if (graph_zova_session_matches(s, zova_path, &st)) {
+        return s->zova_graph_session;
+    }
+    store_close_zova_graph_session(s);
+    cbm_zova_graph_session_t *session = cbm_zova_graph_session_open(zova_path);
+    char *path_copy = session ? heap_strdup(zova_path) : NULL;
+    if (!session || !path_copy) {
+        cbm_zova_graph_session_close(session);
+        return NULL;
+    }
+    s->zova_graph_session = session;
+    s->zova_graph_session_path = path_copy;
+    s->zova_graph_session_stat = st;
+    s->zova_graph_session_stat_valid = true;
+    return session;
+}
+
+static const char *store_get_zova_graph_workspace_id(cbm_store_t *s, const char *root_path) {
+    if (!s || !root_path || !root_path[0]) {
+        return NULL;
+    }
+    if (s->zova_graph_workspace_root && strcmp(s->zova_graph_workspace_root, root_path) == 0 &&
+        s->zova_graph_workspace_id[0]) {
+        return s->zova_graph_workspace_id;
+    }
+    char registry_path[ST_QUERY_URI_MAX];
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    if (cbm_zova_workspace_registry_path(registry_path, sizeof(registry_path)) != 0 ||
+        cbm_zova_workspace_lookup_at(registry_path, root_path, workspace_id,
+                                     sizeof(workspace_id)) != 0) {
+        return NULL;
+    }
+    char *root_copy = heap_strdup(root_path);
+    if (!root_copy) {
+        return NULL;
+    }
+    free(s->zova_graph_workspace_root);
+    s->zova_graph_workspace_root = root_copy;
+    snprintf(s->zova_graph_workspace_id, sizeof(s->zova_graph_workspace_id), "%s", workspace_id);
+    return s->zova_graph_workspace_id;
+}
+
+static int store_source_sidecar_generation(const cbm_store_t *s, int64_t *out_generation) {
+    if (!s || !s->db || !out_generation) {
+        return -1;
+    }
+    *out_generation = 0;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT generation FROM cbm_zova_sidecar_generation_v1 WHERE id = 1",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        *out_generation = sqlite3_column_int64(stmt, 0);
+        rc = *out_generation > 0 ? 0 : -1;
+    }
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    return rc;
+}
+
+static bool store_zova_generation_is_ready(cbm_store_t *s, const char *root_path,
+                                            const char *workspace_id,
+                                            int64_t sidecar_generation) {
+    int64_t source_generation = 0;
+    int64_t active_generation = 0;
+    char registry_path[ST_QUERY_URI_MAX];
+    return sidecar_generation > 0 && root_path && workspace_id &&
+           store_source_sidecar_generation(s, &source_generation) == 0 &&
+           source_generation == sidecar_generation &&
+           cbm_zova_workspace_registry_path(registry_path, sizeof(registry_path)) == 0 &&
+           cbm_zova_workspace_active_generation_at(registry_path, workspace_id,
+                                                    &active_generation) == 0 &&
+           active_generation == sidecar_generation;
+}
+
+int cbm_store_zova_walk_calls(cbm_store_t *s, const char *project, const cbm_node_t *start,
+                              const char *direction, int max_depth, int max_results,
+                              cbm_zova_graph_visit_t **out_visits, int *out_count,
+                              cbm_zova_graph_metrics_t *out_metrics) {
+    if (out_visits) {
+        *out_visits = NULL;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    cbm_zova_graph_metrics_t metrics = {0};
+    metrics.fallback = true;
+    if (out_metrics) {
+        *out_metrics = metrics;
+    }
+    if (s) {
+        s->zova_graph_last_metrics = metrics;
+    }
+    if (!cbm_zova_graph_read_is_enabled() || !cbm_zova_build_enabled() ||
+        !s || !s->db_path || !project || !start || !direction || !out_visits || !out_count) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    cbm_project_t project_row = {0};
+    if (cbm_store_get_project(s, project, &project_row) != CBM_STORE_OK || !project_row.root_path) {
+        cbm_project_free_fields(&project_row);
+        return CBM_STORE_NOT_FOUND;
+    }
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    char node_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
+    char sidecar_path[ST_QUERY_URI_MAX];
+    char discriminator[64];
+    int rc = CBM_STORE_NOT_FOUND;
+    const char *workspace_id = store_get_zova_graph_workspace_id(s, project_row.root_path);
+    if (!workspace_id || cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)) != 0 ||
+        cbm_zova_sidecar_path(s->db_path, sidecar_path, sizeof(sidecar_path)) != 0 ||
+        !cbm_file_exists(sidecar_path) || !start->label || !start->file_path ||
+        !start->qualified_name) {
+        goto done;
+    }
+    if (start->qualified_name[0]) {
+        snprintf(discriminator, sizeof(discriminator), "named");
+    } else if (snprintf(discriminator, sizeof(discriminator), "anon:%d:%d", start->start_line,
+                        start->end_line) >= (int)sizeof(discriminator)) {
+        goto done;
+    }
+    if (cbm_zova_workspace_node_id_v1(workspace_id, start->label, start->file_path,
+                                      start->qualified_name, discriminator, node_id,
+                                      sizeof(node_id)) != 0) {
+        goto done;
+    }
+    cbm_zova_graph_session_t *session = store_get_zova_graph_session(s, sidecar_path);
+    int64_t sidecar_generation = 0;
+    if (!session || cbm_zova_graph_session_generation(session, &sidecar_generation) != 0 ||
+        !store_zova_generation_is_ready(s, project_row.root_path, workspace_id,
+                                        sidecar_generation) ||
+        cbm_zova_graph_session_walk_calls(session, workspace_id, graph_name, node_id,
+                                          direction, max_depth, max_results, out_visits, out_count,
+                                          &metrics) != 0) {
+        if (session) {
+            store_close_zova_graph_session(s);
+        }
+        cbm_zova_graph_visits_free(*out_visits, *out_count);
+        *out_visits = NULL;
+        *out_count = 0;
+        goto done;
+    }
+    rc = CBM_STORE_OK;
+done:
+    if (s) {
+        s->zova_graph_last_metrics = metrics;
+    }
+    if (out_metrics) {
+        *out_metrics = metrics;
+    }
+    cbm_project_free_fields(&project_row);
+    return rc;
+}
+
+void cbm_store_zova_graph_last_metrics(const cbm_store_t *s,
+                                       cbm_zova_graph_metrics_t *out_metrics) {
+    if (!out_metrics) {
+        return;
+    }
+    if (s) {
+        *out_metrics = s->zova_graph_last_metrics;
+    } else {
+        memset(out_metrics, 0, sizeof(*out_metrics));
+        out_metrics->fallback = true;
+    }
+}
+
+void cbm_store_zova_graph_set_request_metrics(cbm_store_t *s,
+                                              const cbm_zova_graph_metrics_t *metrics) {
+    if (s && metrics) {
+        s->zova_graph_last_metrics = *metrics;
+    }
+}
+
+static bool store_zova_vector_generation_is_ready(cbm_store_t *s, const char *project,
+                                                   const cbm_zova_vector_session_t *session,
+                                                   int64_t sidecar_generation) {
+    cbm_project_t project_row = {0};
+    int64_t source_generation = 0;
+    bool ready = sidecar_generation > 0 &&
+                 store_source_sidecar_generation(s, &source_generation) == 0 &&
+                 source_generation == sidecar_generation;
+    if (ready && cbm_store_get_project(s, project, &project_row) == CBM_STORE_OK &&
+        project_row.root_path) {
+        char registry_path[ST_QUERY_URI_MAX];
+        char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+        int64_t active_generation = 0;
+        if (cbm_zova_workspace_registry_path(registry_path, sizeof(registry_path)) != 0) {
+            ready = false;
+        } else if (cbm_zova_workspace_lookup_at(registry_path, project_row.root_path, workspace_id,
+                                                  sizeof(workspace_id)) == 0) {
+            bool projected_workspace = false;
+            if (cbm_zova_vector_session_has_workspace(session, workspace_id,
+                                                       &projected_workspace) != 0) {
+                ready = false;
+            } else if (projected_workspace) {
+                ready = cbm_zova_workspace_active_generation_at(registry_path, workspace_id,
+                                                                  &active_generation) == 0 &&
+                        active_generation == sidecar_generation;
+            }
+        }
+    }
+    cbm_project_free_fields(&project_row);
+    return ready;
+}
+
 static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
                                      const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw,
                                      int limit, cbm_vector_result_t **out, int *out_count,
@@ -6431,7 +6692,12 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
     cbm_zova_node_candidate_t *candidates = NULL;
     int candidate_count = 0;
     cbm_zova_vector_session_t *session = vs_get_zova_vector_session(s, zova_path);
-    if (!session) {
+    int64_t sidecar_generation = 0;
+    if (!session || cbm_zova_vector_session_generation(session, &sidecar_generation) != 0 ||
+        !store_zova_vector_generation_is_ready(s, project, session, sidecar_generation)) {
+        if (session) {
+            store_close_zova_vector_session(s);
+        }
         return CBM_STORE_NOT_FOUND;
     }
     struct timespec stage_start;

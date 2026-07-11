@@ -2713,6 +2713,28 @@ static bool is_test_file(const char *path) {
            strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL;
 }
 
+static yyjson_mut_val *trace_json_append(yyjson_mut_doc *doc, yyjson_mut_val *arr,
+                                         const char *name, const char *qualified_name,
+                                         const char *file_path, int hop, bool risk_labels,
+                                         bool include_tests) {
+    bool test = is_test_file(file_path);
+    if (!include_tests && test) {
+        return NULL;
+    }
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "name", name ? name : "");
+    yyjson_mut_obj_add_str(doc, item, "qualified_name", qualified_name ? qualified_name : "");
+    yyjson_mut_obj_add_int(doc, item, "hop", hop);
+    if (risk_labels) {
+        yyjson_mut_obj_add_str(doc, item, "risk", cbm_risk_label(cbm_hop_to_risk(hop)));
+    }
+    if (test) {
+        yyjson_mut_obj_add_bool(doc, item, "is_test", true);
+    }
+    yyjson_mut_arr_add_val(arr, item);
+    return item;
+}
+
 /* Convert BFS traversal results into a yyjson_mut array. */
 /* Find the CALLS-edge "args" JSON (the serialized arg expressions) on the edge
  * that leads to the given hop node, so data_flow mode can surface argument
@@ -2763,23 +2785,11 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < tr->visited_count; i++) {
         const char *fp = tr->visited[i].node.file_path;
-        bool test = is_test_file(fp);
-        if (!include_tests && test) {
+        yyjson_mut_val *item =
+            trace_json_append(doc, arr, tr->visited[i].node.name, tr->visited[i].node.qualified_name,
+                              fp, tr->visited[i].hop, risk_labels, include_tests);
+        if (!item) {
             continue;
-        }
-        yyjson_mut_val *item = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_str(doc, item, "name",
-                               tr->visited[i].node.name ? tr->visited[i].node.name : "");
-        yyjson_mut_obj_add_str(
-            doc, item, "qualified_name",
-            tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "");
-        yyjson_mut_obj_add_int(doc, item, "hop", tr->visited[i].hop);
-        if (risk_labels) {
-            yyjson_mut_obj_add_str(doc, item, "risk",
-                                   cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
-        }
-        if (test) {
-            yyjson_mut_obj_add_bool(doc, item, "is_test", true);
         }
         /* data_flow mode promises argument expressions at each call site; surface
          * the CALLS edge's serialized args array as a raw JSON value (#514). */
@@ -2789,11 +2799,21 @@ static yyjson_mut_val *bfs_to_json_array(yyjson_mut_doc *doc, cbm_traverse_resul
             if (args && alen > 0) {
                 yyjson_mut_val *av = yyjson_mut_rawn(doc, args, alen);
                 if (av) {
-                    yyjson_mut_obj_add_val(doc, item, "args", av);
+                yyjson_mut_obj_add_val(doc, item, "args", av);
                 }
             }
         }
-        yyjson_mut_arr_add_val(arr, item);
+    }
+    return arr;
+}
+
+static yyjson_mut_val *zova_visits_to_json_array(yyjson_mut_doc *doc,
+                                                  const cbm_zova_graph_visit_t *visits, int count,
+                                                  bool risk_labels, bool include_tests) {
+    yyjson_mut_val *arr = yyjson_mut_arr(doc);
+    for (int i = 0; i < count; i++) {
+        trace_json_append(doc, arr, visits[i].name, visits[i].qualified_name, visits[i].file_path,
+                          visits[i].hop, risk_labels, include_tests);
     }
     return arr;
 }
@@ -2889,6 +2909,40 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     return best;
 }
 
+static int bfs_visit_text_compare(const char *left, const char *right) {
+    return strcmp(left ? left : "", right ? right : "");
+}
+
+static int bfs_visit_compare(const void *left, const void *right) {
+    const cbm_node_hop_t *a = left;
+    const cbm_node_hop_t *b = right;
+    if (a->hop != b->hop) {
+        return a->hop < b->hop ? -1 : 1;
+    }
+    int cmp = bfs_visit_text_compare(a->node.file_path, b->node.file_path);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = bfs_visit_text_compare(a->node.qualified_name, b->node.qualified_name);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = bfs_visit_text_compare(a->node.label, b->node.label);
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (a->node.start_line != b->node.start_line) {
+        return a->node.start_line < b->node.start_line ? -1 : 1;
+    }
+    if (a->node.end_line != b->node.end_line) {
+        return a->node.end_line < b->node.end_line ? -1 : 1;
+    }
+    if (a->node.id == b->node.id) {
+        return 0;
+    }
+    return a->node.id < b->node.id ? -1 : 1;
+}
+
 /* BFS from EVERY node sharing the resolved name and merge the results, so the
  * caller/callee set is complete even when one logical symbol is represented by
  * more than one graph node — e.g. a real .ts implementation plus an ambient
@@ -2906,14 +2960,19 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
         cbm_store_bfs(store, nodes[k].id, direction, edge_types, edge_type_count, depth,
                       MCP_BFS_LIMIT, &tr);
         for (int i = 0; i < tr.visited_count; i++) {
-            bool dup = false;
+            int duplicate_index = -1;
             for (int j = 0; j < out->visited_count; j++) {
                 if (out->visited[j].node.id == tr.visited[i].node.id) {
-                    dup = true;
+                    duplicate_index = j;
                     break;
                 }
             }
-            if (dup) {
+            if (duplicate_index >= 0) {
+                if (tr.visited[i].hop < out->visited[duplicate_index].hop) {
+                    cbm_node_free_fields(&out->visited[duplicate_index].node);
+                    out->visited[duplicate_index] = tr.visited[i];
+                    memset(&tr.visited[i], 0, sizeof(tr.visited[i]));
+                }
                 continue;
             }
             if (out->visited_count >= vcap) {
@@ -2933,6 +2992,143 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
         }
         cbm_store_traverse_free(&tr); /* frees only the un-moved (root + dup) fields */
     }
+    if (out->visited_count > 1) {
+        qsort(out->visited, (size_t)out->visited_count, sizeof(*out->visited), bfs_visit_compare);
+    }
+}
+
+static int zova_visit_compare(const void *left, const void *right) {
+    const cbm_zova_graph_visit_t *a = left;
+    const cbm_zova_graph_visit_t *b = right;
+    if (a->hop != b->hop) {
+        return a->hop < b->hop ? -1 : 1;
+    }
+    int cmp = bfs_visit_text_compare(a->file_path, b->file_path);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = bfs_visit_text_compare(a->qualified_name, b->qualified_name);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = bfs_visit_text_compare(a->label, b->label);
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (a->start_line != b->start_line) {
+        return a->start_line < b->start_line ? -1 : 1;
+    }
+    if (a->end_line != b->end_line) {
+        return a->end_line < b->end_line ? -1 : 1;
+    }
+    return bfs_visit_text_compare(a->node_id, b->node_id);
+}
+
+static void zova_metrics_add(cbm_zova_graph_metrics_t *total,
+                             const cbm_zova_graph_metrics_t *part) {
+    total->walk_count += part->walk_count;
+    total->walk_ms += part->walk_ms;
+    total->hydrate_prepare_ms += part->hydrate_prepare_ms;
+    total->hydrate_step_ms += part->hydrate_step_ms;
+    total->result_build_ms += part->result_build_ms;
+    total->native_profiled = total->native_profiled || part->native_profiled;
+    total->native_mutex_wait_ms += part->native_mutex_wait_ms;
+    total->native_root_lookup_ms += part->native_root_lookup_ms;
+    total->native_adjacency_prepare_ms += part->native_adjacency_prepare_ms;
+    total->native_adjacency_execute_ms += part->native_adjacency_execute_ms;
+    total->native_bfs_bookkeeping_allocation_ms += part->native_bfs_bookkeeping_allocation_ms;
+    total->native_c_abi_result_export_ms += part->native_c_abi_result_export_ms;
+    total->native_total_profiled_ms += part->native_total_profiled_ms;
+    total->frontier_expansions += part->frontier_expansions;
+    total->adjacency_query_binds += part->adjacency_query_binds;
+    total->adjacency_rows_stepped += part->adjacency_rows_stepped;
+    total->native_result_count += part->native_result_count;
+    total->fallback = total->fallback || part->fallback;
+}
+
+static int zova_union_same_name(cbm_store_t *store, const char *project, const cbm_node_t *nodes,
+                                int node_count, const char *direction, int depth,
+                                cbm_zova_graph_visit_t **out_visits, int *out_count,
+                                cbm_zova_graph_metrics_t *metrics) {
+    *out_visits = NULL;
+    *out_count = 0;
+    int capacity = 0;
+    for (int root_index = 0; root_index < node_count; root_index++) {
+        cbm_zova_graph_visit_t *current = NULL;
+        int current_count = 0;
+        cbm_zova_graph_metrics_t call_metrics = {0};
+        if (cbm_store_zova_walk_calls(store, project, &nodes[root_index], direction, depth,
+                                      MCP_BFS_LIMIT, &current, &current_count,
+                                      &call_metrics) != CBM_STORE_OK) {
+            if (metrics) {
+                metrics->fallback = true;
+            }
+            cbm_zova_graph_visits_free(current, current_count);
+            cbm_zova_graph_visits_free(*out_visits, *out_count);
+            *out_visits = NULL;
+            *out_count = 0;
+            return -1;
+        }
+        if (metrics) {
+            zova_metrics_add(metrics, &call_metrics);
+        }
+        struct timespec merge_start;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &merge_start);
+        for (int i = 0; i < current_count; i++) {
+            int existing = -1;
+            for (int j = 0; j < *out_count; j++) {
+                if (strcmp((*out_visits)[j].node_id, current[i].node_id) == 0) {
+                    existing = j;
+                    break;
+                }
+            }
+            if (existing >= 0) {
+                if (current[i].hop < (*out_visits)[existing].hop) {
+                    cbm_zova_graph_visit_t displaced = (*out_visits)[existing];
+                    (*out_visits)[existing] = current[i];
+                    current[i] = displaced;
+                }
+                continue;
+            }
+            if (*out_count == capacity) {
+                int next = capacity ? capacity * 2 : 8;
+                cbm_zova_graph_visit_t *grown =
+                    safe_realloc(*out_visits, (size_t)next * sizeof(**out_visits));
+                *out_visits = grown;
+                capacity = next;
+            }
+            (*out_visits)[(*out_count)++] = current[i];
+            memset(&current[i], 0, sizeof(current[i]));
+        }
+        cbm_zova_graph_visits_free(current, current_count);
+        if (metrics) {
+            struct timespec merge_end;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &merge_end);
+            metrics->result_build_ms +=
+                ((double)(merge_end.tv_sec - merge_start.tv_sec) * 1000.0) +
+                ((double)(merge_end.tv_nsec - merge_start.tv_nsec) / 1000000.0);
+        }
+    }
+    if (*out_count > 1) {
+        struct timespec sort_start;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &sort_start);
+        qsort(*out_visits, (size_t)*out_count, sizeof(**out_visits), zova_visit_compare);
+        if (metrics) {
+            struct timespec sort_end;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &sort_end);
+            metrics->result_build_ms +=
+                ((double)(sort_end.tv_sec - sort_start.tv_sec) * 1000.0) +
+                ((double)(sort_end.tv_nsec - sort_start.tv_nsec) / 1000000.0);
+        }
+    }
+    return 0;
+}
+
+static bool trace_can_use_zova_graph_read(const char *mode, const char **edge_types,
+                                          int edge_type_count) {
+    return cbm_zova_graph_read_is_enabled() &&
+           (!mode || strcmp(mode, "calls") == 0) && edge_type_count == 1 &&
+           strcmp(edge_types[0], "CALLS") == 0;
 }
 
 /* Clamp a client-supplied traversal depth to the MCP ceiling (cbm_mcp_max_depth),
@@ -3075,30 +3271,71 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_traverse_result_t tr_out = {0};
     cbm_traverse_result_t tr_in = {0};
+    cbm_zova_graph_visit_t *zova_out = NULL;
+    cbm_zova_graph_visit_t *zova_in = NULL;
+    int zova_out_count = 0;
+    int zova_in_count = 0;
 
     bool data_flow = mode && strcmp(mode, "data_flow") == 0;
+    bool use_zova_graph_read = trace_can_use_zova_graph_read(mode, edge_types, edge_type_count);
+    bool attempted_zova_graph_read = use_zova_graph_read;
+    cbm_zova_graph_metrics_t zova_request_metrics = {0};
 
     (void)sel; /* union across all same-name nodes — see bfs_union_same_name (#546) */
 
-    if (do_outbound) {
-        bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
-                            depth, &tr_out);
-        yyjson_mut_obj_add_val(
-            doc, root, "callees",
-            bfs_to_json_array(doc, &tr_out, risk_labels, include_tests, data_flow));
+    if (use_zova_graph_read && do_outbound &&
+        zova_union_same_name(store, project, nodes, node_count, "outbound", depth, &zova_out,
+                             &zova_out_count, &zova_request_metrics) != 0) {
+        use_zova_graph_read = false;
     }
-
+    if (use_zova_graph_read && do_inbound &&
+        zova_union_same_name(store, project, nodes, node_count, "inbound", depth, &zova_in,
+                             &zova_in_count, &zova_request_metrics) != 0) {
+        use_zova_graph_read = false;
+    }
+    if (!use_zova_graph_read) {
+        cbm_zova_graph_visits_free(zova_out, zova_out_count);
+        cbm_zova_graph_visits_free(zova_in, zova_in_count);
+        zova_out = NULL;
+        zova_in = NULL;
+        zova_out_count = 0;
+        zova_in_count = 0;
+        if (do_outbound) {
+            bfs_union_same_name(store, nodes, node_count, "outbound", edge_types, edge_type_count,
+                                depth, &tr_out);
+        }
+        if (do_inbound) {
+            bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count,
+                                depth, &tr_in);
+        }
+    }
+    if (do_outbound) {
+        yyjson_mut_obj_add_val(doc, root, "callees",
+                                use_zova_graph_read
+                                    ? zova_visits_to_json_array(doc, zova_out, zova_out_count,
+                                                                 risk_labels, include_tests)
+                                    : bfs_to_json_array(doc, &tr_out, risk_labels, include_tests,
+                                                        data_flow));
+    }
     if (do_inbound) {
-        bfs_union_same_name(store, nodes, node_count, "inbound", edge_types, edge_type_count, depth,
-                            &tr_in);
-        yyjson_mut_obj_add_val(
-            doc, root, "callers",
-            bfs_to_json_array(doc, &tr_in, risk_labels, include_tests, data_flow));
+        yyjson_mut_obj_add_val(doc, root, "callers",
+                                use_zova_graph_read
+                                    ? zova_visits_to_json_array(doc, zova_in, zova_in_count,
+                                                                 risk_labels, include_tests)
+                                    : bfs_to_json_array(doc, &tr_in, risk_labels, include_tests,
+                                                        data_flow));
     }
 
     /* Serialize BEFORE freeing traversal results (yyjson borrows strings) */
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+
+    if (attempted_zova_graph_read) {
+        if (!use_zova_graph_read) {
+            zova_request_metrics.fallback = true;
+        }
+        cbm_store_zova_graph_set_request_metrics(store, &zova_request_metrics);
+    }
 
     /* Now safe to free traversal data */
     if (do_outbound) {
@@ -3107,6 +3344,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     if (do_inbound) {
         cbm_store_traverse_free(&tr_in);
     }
+    cbm_zova_graph_visits_free(zova_out, zova_out_count);
+    cbm_zova_graph_visits_free(zova_in, zova_in_count);
 
     cbm_store_free_nodes(nodes, node_count);
     free(func_name);

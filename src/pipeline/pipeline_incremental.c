@@ -297,6 +297,99 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
     free(ms);
 }
 
+/* Add the structural nodes for a newly discovered path before definition
+ * extraction. This mirrors the relevant part of the full structure pass: a
+ * Folder must exist before a directory-based Module definition arrives, or
+ * the Module wins the shared qualified-name slot and the graph diverges. */
+static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *project,
+                                            const cbm_file_info_t *file) {
+    if (!gbuf || !project || !file || !file->rel_path) {
+        return;
+    }
+    const char *rel_path = file->rel_path;
+    const char *slash = strrchr(rel_path, '/');
+    const char *basename = slash ? slash + 1 : rel_path;
+    const char *extension = strrchr(basename, '.');
+    char properties[CBM_SZ_256];
+    snprintf(properties, sizeof(properties), "{\"extension\":\"%s\"}",
+             extension ? extension : "");
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    if (!file_qn) {
+        return;
+    }
+    cbm_gbuf_upsert_node(gbuf, "File", basename, file_qn, rel_path, 0, 0, properties);
+
+    const cbm_gbuf_node_t **branches = NULL;
+    int branch_count = 0;
+    const char *branch_qn = project;
+    if (cbm_gbuf_find_by_label(gbuf, "Branch", &branches, &branch_count) == 0 &&
+        branch_count > 0 && branches[0]->qualified_name) {
+        branch_qn = branches[0]->qualified_name;
+    }
+
+    char *dir = strdup(rel_path);
+    if (!dir) {
+        free(file_qn);
+        return;
+    }
+    char *last_slash = strrchr(dir, '/');
+    if (last_slash) {
+        *last_slash = '\0';
+    } else {
+        dir[0] = '\0';
+    }
+    char *file_parent_qn = dir[0] ? cbm_pipeline_fqn_folder(project, dir) : NULL;
+
+    for (char *walk = dir; walk[0];) {
+        char *folder_qn = cbm_pipeline_fqn_folder(project, walk);
+        if (!folder_qn) {
+            break;
+        }
+        const char *folder_name = strrchr(walk, '/');
+        folder_name = folder_name ? folder_name + 1 : walk;
+        cbm_gbuf_upsert_node(gbuf, "Folder", folder_name, folder_qn, walk, 0, 0, "{}");
+
+        char *parent_dir = strdup(walk);
+        if (!parent_dir) {
+            free(folder_qn);
+            break;
+        }
+        char *parent_slash = strrchr(parent_dir, '/');
+        if (parent_slash) {
+            *parent_slash = '\0';
+        } else {
+            parent_dir[0] = '\0';
+        }
+        char *parent_qn_heap = parent_dir[0] ? cbm_pipeline_fqn_folder(project, parent_dir) : NULL;
+        const char *parent_qn = parent_qn_heap ? parent_qn_heap : branch_qn;
+        const cbm_gbuf_node_t *folder = cbm_gbuf_find_by_qn(gbuf, folder_qn);
+        const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(gbuf, parent_qn);
+        if (folder && parent) {
+            cbm_gbuf_insert_edge(gbuf, parent->id, folder->id, "CONTAINS_FOLDER", "{}");
+        }
+        free(parent_qn_heap);
+        free(parent_dir);
+        free(folder_qn);
+
+        char *up = strrchr(walk, '/');
+        if (up) {
+            *up = '\0';
+        } else {
+            walk[0] = '\0';
+        }
+    }
+
+    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    const char *parent_qn = file_parent_qn ? file_parent_qn : branch_qn;
+    const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(gbuf, parent_qn);
+    if (file_node && parent) {
+        cbm_gbuf_insert_edge(gbuf, parent->id, file_node->id, "CONTAINS_FILE", "{}");
+    }
+    free(file_parent_qn);
+    free(dir);
+    free(file_qn);
+}
+
 /* ── Inbound cross-file edge preservation (incremental correctness) ──
  *
  * The purge step (cbm_gbuf_delete_by_file) removes a changed file's nodes,
@@ -308,9 +401,9 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  * CONTAINS_FILE / INHERITS / ... edges on every edit and diverges from a
  * clean full reindex (which resolves every file).
  *
- * Fix: snapshot the inbound cross-file edges into changed files BEFORE the
- * purge, keyed by endpoint qualified_name (stable across re-parse), then
- * re-link them AFTER re-resolution + post-passes. Notes:
+ * Fix: snapshot inbound cross-file edges into changed or deleted files BEFORE
+ * the purge. Re-run CALLS resolution for unchanged callers after re-extraction,
+ * then re-link non-CALLS edges by exact qualified-name target. Notes:
  *   - Only edges whose target is in a changed file and whose source is NOT
  *     are snapshotted; edges out of a changed file are regenerated when that
  *     file is re-resolved.
@@ -319,12 +412,15 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  *     add edges a full reindex would not produce.
  *   - cbm_gbuf_insert_edge dedups, so re-linking an edge the resolver already
  *     recreated is a harmless no-op.
- *   - A target whose qualified_name no longer exists (symbol deleted or
- *     renamed by the edit) is dropped — matching full-reindex semantics. */
+ *   - A deleted target is dropped. A renamed CALLS edge is rebuilt from its
+ *     unchanged caller source, preserving the resolver's current confidence
+ *     and strategy rather than copying stale edge properties. */
 
 typedef struct {
     char *source_qn;
     char *target_qn;
+    char *target_name;
+    char *target_label;
     char *type;
     char *props;
 } cbm_saved_edge_t;
@@ -347,15 +443,13 @@ typedef struct {
  *     produced only by full-pipeline post-passes (githistory / route_nodes)
  *     that do NOT run during incremental; they remain a known incremental
  *     limitation rather than something to restore stale.
- * Every other edge type IS safe to re-link, by one of two routes that both
- * match a full reindex: edges re-emitted by the per-file resolution passes that
- * run incrementally (CALLS, USAGE, DEFINES, DEFINES_METHOD, INHERITS,
- * IMPLEMENTS) are deduped on re-link, while structural containment edges
- * (CONTAINS_FILE, CONTAINS_FOLDER) — which the full-only structure pass does
- * NOT regenerate incrementally — are preserved precisely by this snapshot. */
+ * Structural containment edges are regenerated from changed paths before
+ * extraction, so snapshots omit them rather than retaining a pre-rename
+ * parent relationship. */
 static bool incr_edge_type_is_recomputed(const char *type) {
     return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
-                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
+                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0 ||
+                    strcmp(type, "CONTAINS_FILE") == 0 || strcmp(type, "CONTAINS_FOLDER") == 0);
 }
 
 /* cbm_gbuf_foreach_edge visitor: snapshot inbound cross-file edges into
@@ -391,16 +485,99 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
     cbm_saved_edge_t *s = &cap->items[cap->count];
     s->source_qn = strdup(src->qualified_name);
     s->target_qn = strdup(tgt->qualified_name);
+    s->target_name = strdup(tgt->name ? tgt->name : "");
+    s->target_label = strdup(tgt->label ? tgt->label : "");
     s->type = strdup(edge->type);
     s->props = strdup(edge->properties_json ? edge->properties_json : "{}");
-    if (!s->source_qn || !s->target_qn || !s->type || !s->props) {
+    if (!s->source_qn || !s->target_qn || !s->target_name || !s->target_label || !s->type ||
+        !s->props) {
         free(s->source_qn);
         free(s->target_qn);
+        free(s->target_name);
+        free(s->target_label);
         free(s->type);
         free(s->props);
         return;
     }
     cap->count++;
+}
+
+static const cbm_gbuf_node_t *incr_find_unique_renamed_target(const cbm_gbuf_t *gbuf,
+                                                               const cbm_saved_edge_t *saved) {
+    if (!saved->target_name || !saved->target_name[0] || !saved->target_label ||
+        !saved->target_label[0]) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, saved->target_name, &nodes, &count) != 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *candidate = NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *node = nodes[i];
+        if (!node->qualified_name || !node->label || strcmp(node->label, saved->target_label) != 0) {
+            continue;
+        }
+        if (candidate) {
+            return NULL; /* ambiguous: do not guess a rename target */
+        }
+        candidate = node;
+    }
+    return candidate;
+}
+
+/* A path rename changes the callee's qualified name. Re-run the CALLS pass
+ * for only unchanged source files that previously called a purged target, so
+ * the normal resolver recalculates strategy/confidence against the new
+ * registry instead of preserving stale edge properties. */
+static void incr_rebuild_snapshot_callers(cbm_pipeline_ctx_t *ctx, const cbm_edge_capture_t *cap,
+                                          const cbm_file_info_t *files, int file_count) {
+    if (!ctx || !cap || !files || file_count <= 0) {
+        return;
+    }
+    cbm_file_info_t *callers = calloc((size_t)cap->count, sizeof(*callers));
+    if (!callers) {
+        return;
+    }
+    int caller_count = 0;
+    for (int i = 0; i < cap->count; i++) {
+        const cbm_saved_edge_t *saved = &cap->items[i];
+        /* Re-resolve unchanged sources that previously emitted either CALLS
+         * or resolver-owned CONFIGURES. CONFIGURES may be the only derived
+         * edge from a source (for example an environment accessor), so
+         * restricting this list to CALLS leaves those edges missing after a
+         * changed-file purge. */
+        if (!saved->type || (strcmp(saved->type, "CALLS") != 0 &&
+                             strcmp(saved->type, "CONFIGURES") != 0)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(ctx->gbuf, saved->source_qn);
+        if (!source || !source->file_path) {
+            continue;
+        }
+        cbm_gbuf_delete_edges_by_source_type(ctx->gbuf, source->id, "CONFIGURES");
+        for (int f = 0; f < file_count; f++) {
+            if (strcmp(files[f].rel_path, source->file_path) != 0) {
+                continue;
+            }
+            bool already_added = false;
+            for (int existing = 0; existing < caller_count; existing++) {
+                if (strcmp(callers[existing].rel_path, files[f].rel_path) == 0) {
+                    already_added = true;
+                    break;
+                }
+            }
+            if (!already_added) {
+                callers[caller_count++] = files[f];
+            }
+            break;
+        }
+    }
+    if (caller_count > 0) {
+        cbm_pipeline_pass_calls(ctx, callers, caller_count);
+    }
+    free(callers);
 }
 
 /* Re-link snapshotted inbound edges to the freshly re-created target nodes.
@@ -411,6 +588,12 @@ static int incr_restore_inbound_edges(cbm_gbuf_t *gbuf, cbm_edge_capture_t *cap)
         cbm_saved_edge_t *s = &cap->items[i];
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gbuf, s->source_qn);
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gbuf, s->target_qn);
+        if (!tgt && s->type && strcmp(s->type, "CALLS") == 0) {
+            continue; /* rebuilt from source so resolver owns its properties */
+        }
+        if (!tgt) {
+            tgt = incr_find_unique_renamed_target(gbuf, s);
+        }
         if (src && tgt) {
             cbm_gbuf_insert_edge(gbuf, src->id, tgt->id, s->type, s->props);
             restored++;
@@ -423,6 +606,8 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
     for (int i = 0; i < cap->count; i++) {
         free(cap->items[i].source_qn);
         free(cap->items[i].target_qn);
+        free(cap->items[i].target_name);
+        free(cap->items[i].target_label);
         free(cap->items[i].type);
         free(cap->items[i].props);
     }
@@ -614,6 +799,13 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
     if (ctx->mode <= CBM_MODE_MODERATE) {
+        /* These are global derived relations. The old graph was loaded before
+         * this incremental update, so rerunning either pass without first
+         * removing its prior output leaves relationships that a clean full
+         * index would no longer select after the corpus changed. */
+        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SIMILAR_TO");
+        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SEMANTICALLY_RELATED");
+        cbm_gbuf_clear_semantic_vectors(ctx->gbuf);
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         cbm_pipeline_pass_similarity(ctx);
         cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
@@ -624,6 +816,14 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
         cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
     }
+
+    /* Match the full route's final derived-property pass. It runs after
+     * semantic edges so transitive CALLS depth is computed from the complete
+     * mixed graph, not only the edited-file slice. */
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_pipeline_pass_complexity(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_complexity", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
 }
 /* Delete old DB and dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
@@ -785,6 +985,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         for (int i = 0; i < ci; i++) {
             cbm_ht_set(changed_paths, changed_files[i].rel_path, &changed_files[i]);
         }
+        for (int i = 0; i < deleted_count; i++) {
+            cbm_ht_set(changed_paths, deleted[i], deleted[i]);
+        }
         edge_cap.changed_paths = changed_paths;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         cbm_gbuf_foreach_edge(existing, incr_capture_inbound_edge, &edge_cap);
@@ -801,6 +1004,28 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
     for (int i = 0; i < deleted_count; i++) {
         cbm_gbuf_delete_by_file(existing, deleted[i]);
+    }
+
+    int affected_count = ci + deleted_count;
+    const char **affected_paths = NULL;
+    if (affected_count > 0) {
+        affected_paths = calloc((size_t)affected_count, sizeof(*affected_paths));
+        if (affected_paths) {
+            for (int i = 0; i < ci; i++) {
+                affected_paths[i] = changed_files[i].rel_path;
+            }
+            for (int i = 0; i < deleted_count; i++) {
+                affected_paths[ci + i] = deleted[i];
+            }
+        }
+    }
+    if (affected_paths) {
+        cbm_gbuf_delete_empty_folders_under(existing, affected_paths, affected_count);
+        free(affected_paths);
+    } else if (affected_count > 0) {
+        cbm_log_warn("incremental.folder_prune_oom", "affected_paths", itoa_buf(affected_count));
+    }
+    for (int i = 0; i < deleted_count; i++) {
         free(deleted[i]);
     }
     free(deleted);
@@ -838,31 +1063,29 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     };
 
     for (int i = 0; i < ci; i++) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
-        if (file_qn) {
-            cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
-                                 changed_files[i].rel_path, 0, 0, "{}");
-            free(file_qn);
-        }
+        incr_add_changed_file_structure(existing, project, &changed_files[i]);
     }
 
     run_extract_resolve(&ctx, changed_files, ci);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
-    run_postpasses(&ctx, changed_files, ci, project);
 
-    free(changed_files);
-    cbm_registry_free(registry);
-    cbm_path_alias_collection_free(path_aliases);
+    incr_rebuild_snapshot_callers(&ctx, &edge_cap, files, file_count);
 
-    /* Re-link inbound cross-file edges that the purge orphaned. Runs after
-     * re-resolution AND post-passes so the freshly re-created target nodes
-     * exist and nothing downstream clobbers the restored edges; insert_edge
-     * dedups, so any edge the resolver already recreated is a no-op. */
+    /* Restore inbound cross-file edges before any derived pass reads the
+     * mixed graph. Semantic vectors and complexity both consume CALLS
+     * topology, so restoring only after those passes made their output differ
+     * from a clean full index even though the final SQLite edges matched. */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     int relinked = incr_restore_inbound_edges(existing, &edge_cap);
     cbm_log_info("incremental.edge_relink", "relinked", itoa_buf(relinked), "captured",
                  itoa_buf(edge_cap.count), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     incr_free_edge_capture(&edge_cap);
+
+    run_postpasses(&ctx, changed_files, ci, project);
+
+    free(changed_files);
+    cbm_registry_free(registry);
+    cbm_path_alias_collection_free(path_aliases);
 
     /* Step 7: Dump to disk (preserves mode-skipped hash rows so the next
      * reindex can correctly classify those files instead of seeing them

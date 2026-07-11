@@ -103,6 +103,9 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
 /* Delete all nodes for a given file path. Cascade-deletes referencing edges.
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
+int cbm_gbuf_delete_empty_folders(cbm_gbuf_t *gb);
+int cbm_gbuf_delete_empty_folders_under(cbm_gbuf_t *gb, const char *const *affected_paths,
+                                        int affected_count);
 
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
@@ -145,6 +148,7 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
+int cbm_gbuf_delete_edges_by_source_type(cbm_gbuf_t *gb, int64_t source_id, const char *type);
 
 /* ── Vector storage (for semantic embeddings) ───────────────────── */
 
@@ -158,6 +162,10 @@ int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector
  * Token string and vector data are copied. */
 int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t *vector,
                                 int vector_len, float idf);
+
+/* Discard semantic vector payloads loaded from a prior incremental graph
+ * before the global semantic pass recomputes the complete corpus. */
+void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb);
 
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 

@@ -1135,6 +1135,31 @@ TEST(swift_chained_call) {
     PASS();
 }
 
+TEST(swift_force_unwrap) {
+    CBMFileResult *r = extract(
+        "func load() {\n"
+        "    let url = URL(string: \"https://example.com\")!\n"
+        "    let data = \"payload\".data(using: .utf8)!\n"
+        "    print(url, data)\n"
+        "}\n",
+        CBM_LANG_SWIFT, "t", "ForceUnwrap.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(swift_try_bang) {
+    CBMFileResult *r = extract(
+        "func decode() throws -> String { return \"ok\" }\n"
+        "func load() { let value = try! decode(); print(value) }\n",
+        CBM_LANG_SWIFT, "t", "TryBang.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -3594,6 +3619,8 @@ SUITE(extraction) {
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
+    RUN_TEST(swift_force_unwrap);
+    RUN_TEST(swift_try_bang);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);

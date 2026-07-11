@@ -140,6 +140,21 @@ TEST(gbuf_delete_by_label) {
     PASS();
 }
 
+TEST(gbuf_delete_empty_folders_is_scoped) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(gb, "Folder", "keep", "test::keep", "keep", 0, 0, "{}");
+    cbm_gbuf_upsert_node(gb, "Folder", "nested", "test::drop::nested", "drop/nested", 0, 0,
+                         "{}");
+
+    const char *affected[] = {"drop/nested/helper.go"};
+    ASSERT_EQ(cbm_gbuf_delete_empty_folders_under(gb, affected, 1), 1);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test::keep"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test::drop::nested"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Edge operations ───────────────────────────────────────────── */
 
 TEST(gbuf_insert_edge) {
@@ -1043,6 +1058,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_label_no_matches);
     RUN_TEST(gbuf_find_by_name_multiple);
     RUN_TEST(gbuf_delete_by_label_cascades_edges);
+    RUN_TEST(gbuf_delete_empty_folders_is_scoped);
     RUN_TEST(gbuf_node_count_empty);
     RUN_TEST(gbuf_upsert_100_nodes_stress);
 

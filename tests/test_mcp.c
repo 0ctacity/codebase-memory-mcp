@@ -21,6 +21,9 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
+#ifndef CBM_WITH_ZOVA
+#define CBM_WITH_ZOVA 0
+#endif
 #ifdef _WIN32
 #include <direct.h>
 #define cbm_chdir _chdir
@@ -1001,6 +1004,132 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+TEST(tool_trace_call_path_graph_read_matches_sqlite) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-zova-mcp-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+
+    const char *project = "zova-mcp";
+    char db_path[512];
+    char zova_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    ASSERT_EQ(cbm_zova_sidecar_path(db_path, zova_path, sizeof(zova_path)), 0);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, db_path), CBM_STORE_OK);
+    cbm_node_t root = {.project = project,
+                       .label = "Function",
+                       .name = "Root",
+                       .qualified_name = "zova.Root",
+                       .file_path = "src/root.c",
+                       .start_line = 1,
+                       .end_line = 10};
+    cbm_node_t mid = {.project = project,
+                      .label = "Function",
+                      .name = "Mid",
+                      .qualified_name = "zova.Mid",
+                      .file_path = "src/mid.c",
+                      .start_line = 20,
+                      .end_line = 30};
+    cbm_node_t leaf = {.project = project,
+                       .label = "Function",
+                       .name = "Leaf",
+                       .qualified_name = "zova.Leaf",
+                       .file_path = "src/leaf.c",
+                       .start_line = 40,
+                       .end_line = 50};
+    int64_t root_id = cbm_store_upsert_node(store, &root);
+    int64_t mid_id = cbm_store_upsert_node(store, &mid);
+    int64_t leaf_id = cbm_store_upsert_node(store, &leaf);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(mid_id, 0);
+    ASSERT_GT(leaf_id, 0);
+    cbm_edge_t one = {.project = project, .source_id = root_id, .target_id = mid_id, .type = "CALLS"};
+    cbm_edge_t two = {.project = project, .source_id = mid_id, .target_id = leaf_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &one), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &two), 0);
+    cbm_store_close(store);
+
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
+                  db_path, db_path, project, NULL, 0, NULL, 0, 768),
+              0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(project);
+    ASSERT_NOT_NULL(srv);
+
+    const char *directions[] = {"outbound", "inbound", "both"};
+    for (int i = 0; i < 3; i++) {
+        char args[512];
+        snprintf(args, sizeof(args),
+                 "{\"function_name\":\"zova.Root\",\"project\":\"%s\","
+                 "\"direction\":\"%s\",\"depth\":2,\"risk_labels\":true}",
+                 project, directions[i]);
+        cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+        char *sqlite_result = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(sqlite_result);
+        char *sqlite_text = extract_text_content(sqlite_result);
+        ASSERT_NOT_NULL(sqlite_text);
+        cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+        char *zova_result = cbm_mcp_handle_tool(srv, "trace_path", args);
+        ASSERT_NOT_NULL(zova_result);
+        char *zova_text = extract_text_content(zova_result);
+        ASSERT_NOT_NULL(zova_text);
+        ASSERT_STR_EQ(zova_text, sqlite_text);
+        if (strcmp(directions[i], "both") == 0) {
+            cbm_zova_graph_metrics_t metrics = {0};
+            cbm_store_zova_graph_last_metrics(cbm_mcp_server_store(srv), &metrics);
+            ASSERT_FALSE(metrics.fallback);
+            ASSERT_EQ(metrics.walk_count, 2);
+        }
+        free(zova_text);
+        free(zova_result);
+        free(sqlite_text);
+        free(sqlite_result);
+    }
+
+    /* Graph reads default to Zova when a current sidecar is present. The
+     * parser remains OFF when unset so vector reads retain their own mode. */
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    char *default_result = cbm_mcp_handle_tool(
+        srv, "trace_path",
+        "{\"function_name\":\"zova.Root\",\"project\":\"zova-mcp\","
+        "\"direction\":\"outbound\",\"depth\":2}");
+    ASSERT_NOT_NULL(default_result);
+    cbm_zova_graph_metrics_t default_metrics = {0};
+    cbm_store_zova_graph_last_metrics(cbm_mcp_server_store(srv), &default_metrics);
+    ASSERT_FALSE(default_metrics.fallback);
+    ASSERT_EQ(default_metrics.walk_count, 1);
+    free(default_result);
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(zova_path);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (saved_mode_copy) {
+        cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_ZOVA_MODE");
+    }
+    free(saved_cache_copy);
+    free(saved_mode_copy);
+    PASS();
+#endif
+}
+
 /* Reproduce-first (#887): the client-supplied `depth` on trace_call_path must be
  * clamped to the MCP ceiling (cbm_mcp_max_depth(), default 15). On origin/main
  * an MCP_MAX_DEPTH=15 constant was defined but never applied — `depth` flowed
@@ -1193,6 +1322,79 @@ TEST(tool_trace_call_path_dts_stub_unions_with_impl) {
     /* union across impl + stub: BOTH callers appear (this is the #546 fix) */
     ASSERT_NOT_NULL(strstr(inner, "callerRel"));
     ASSERT_NOT_NULL(strstr(inner, "callerAlias"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Same-name union must preserve the public traversal ordering after it merges
+ * per-root BFS results. The implementation is inserted first and reaches Zeta;
+ * the stub is inserted second and reaches Alpha, so append-order is wrong. */
+TEST(tool_trace_call_path_same_name_union_orders_visits) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "ordered-union";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/ordered-union"), CBM_STORE_OK);
+
+    cbm_node_t impl = {.project = proj,
+                       .label = "Function",
+                       .name = "shared",
+                       .qualified_name = "ordered.impl.shared",
+                       .file_path = "src/shared.ts",
+                       .start_line = 10,
+                       .end_line = 30};
+    cbm_node_t stub = {.project = proj,
+                       .label = "Function",
+                       .name = "shared",
+                       .qualified_name = "ordered.stub.shared",
+                       .file_path = "types/shared.d.ts",
+                       .start_line = 5,
+                       .end_line = 5};
+    cbm_node_t zeta = {.project = proj,
+                       .label = "Function",
+                       .name = "Zeta",
+                       .qualified_name = "ordered.Zeta",
+                       .file_path = "zeta.ts",
+                       .start_line = 1,
+                       .end_line = 4};
+    cbm_node_t alpha = {.project = proj,
+                        .label = "Function",
+                        .name = "Alpha",
+                        .qualified_name = "ordered.Alpha",
+                        .file_path = "alpha.ts",
+                        .start_line = 1,
+                        .end_line = 4};
+    int64_t impl_id = cbm_store_upsert_node(st, &impl);
+    int64_t stub_id = cbm_store_upsert_node(st, &stub);
+    int64_t zeta_id = cbm_store_upsert_node(st, &zeta);
+    int64_t alpha_id = cbm_store_upsert_node(st, &alpha);
+    ASSERT_GT(impl_id, 0);
+    ASSERT_GT(stub_id, 0);
+    ASSERT_GT(zeta_id, 0);
+    ASSERT_GT(alpha_id, 0);
+    cbm_edge_t impl_zeta = {.project = proj, .source_id = impl_id, .target_id = zeta_id,
+                             .type = "CALLS"};
+    cbm_edge_t stub_alpha = {.project = proj, .source_id = stub_id, .target_id = alpha_id,
+                              .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &impl_zeta), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &stub_alpha), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"shared\","
+             "\"project\":\"ordered-union\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *alpha_pos = strstr(inner, "\"name\":\"Alpha\"");
+    const char *zeta_pos = strstr(inner, "\"name\":\"Zeta\"");
+    ASSERT_NOT_NULL(alpha_pos);
+    ASSERT_NOT_NULL(zeta_pos);
+    ASSERT_TRUE(alpha_pos < zeta_pos);
+
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -5099,9 +5301,11 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_graph_read_matches_sqlite);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
+    RUN_TEST(tool_trace_call_path_same_name_union_orders_visits);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);

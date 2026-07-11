@@ -117,6 +117,14 @@ struct cbm_gbuf {
     CBMDumpTokenVec *dump_token_vecs;
     int dump_token_vec_count;
     int dump_token_vec_cap;
+
+    /* Finalized lightweight topology retained after the SQLite writer closes.
+     * Sidecar publication happens after the pipeline persists hashes/FTS, so
+     * it must consume these arrays without re-scanning SQLite graph rows. */
+    CBMDumpNode *zova_dump_nodes;
+    int zova_dump_node_count;
+    CBMDumpEdge *zova_dump_edges;
+    int zova_dump_edge_count;
 };
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
@@ -476,6 +484,9 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
         return;
     }
 
+    free(gb->zova_dump_nodes);
+    free(gb->zova_dump_edges);
+
     /* Free each individually-allocated node */
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
@@ -549,6 +560,21 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
 }
 
 /* ── Vector storage ──────────────────────────────────────────────── */
+
+void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb) {
+    if (!gb) {
+        return;
+    }
+    for (int i = 0; i < gb->dump_vector_count; i++) {
+        free((void *)gb->dump_vectors[i].vector);
+    }
+    gb->dump_vector_count = 0;
+    for (int i = 0; i < gb->dump_token_vec_count; i++) {
+        free((void *)gb->dump_token_vecs[i].token);
+        free((void *)gb->dump_token_vecs[i].vector);
+    }
+    gb->dump_token_vec_count = 0;
+}
 
 int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector, int vector_len) {
     if (!gb || !vector || vector_len <= 0) {
@@ -913,6 +939,79 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
+static bool gbuf_folder_matches_affected_path(const char *folder_path, const char *affected_path) {
+    if (!folder_path || !folder_path[0] || !affected_path) {
+        return false;
+    }
+    size_t folder_len = strlen(folder_path);
+    return strncmp(folder_path, affected_path, folder_len) == 0 &&
+           (affected_path[folder_len] == '\0' || affected_path[folder_len] == '/');
+}
+
+static int gbuf_delete_empty_folders_impl(cbm_gbuf_t *gb, const char *const *affected_paths,
+                                          int affected_count, bool scoped) {
+    if (!gb) {
+        return CBM_NOT_FOUND;
+    }
+    int removed = 0;
+    bool changed;
+    do {
+        changed = false;
+        const cbm_gbuf_node_t **folders = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_label(gb, "Folder", &folders, &count) != 0) {
+            break;
+        }
+        for (int i = 0; i < count; i++) {
+            const cbm_gbuf_node_t *folder = folders[i];
+            if (!folder || !folder->file_path || !folder->qualified_name) {
+                continue;
+            }
+            if (scoped) {
+                bool affected = false;
+                for (int path_i = 0; path_i < affected_count; path_i++) {
+                    if (gbuf_folder_matches_affected_path(folder->file_path, affected_paths[path_i])) {
+                        affected = true;
+                        break;
+                    }
+                }
+                if (!affected) {
+                    continue;
+                }
+            }
+            const cbm_gbuf_edge_t **edges = NULL;
+            int edge_count = 0;
+            cbm_gbuf_find_edges_by_source_type(gb, folder->id, "CONTAINS_FILE", &edges,
+                                               &edge_count);
+            if (edge_count > 0) {
+                continue;
+            }
+            cbm_gbuf_find_edges_by_source_type(gb, folder->id, "CONTAINS_FOLDER", &edges,
+                                               &edge_count);
+            if (edge_count > 0) {
+                continue;
+            }
+            cbm_gbuf_delete_by_file(gb, folder->file_path);
+            removed++;
+            changed = true;
+            break;
+        }
+    } while (changed);
+    return removed;
+}
+
+int cbm_gbuf_delete_empty_folders(cbm_gbuf_t *gb) {
+    return gbuf_delete_empty_folders_impl(gb, NULL, 0, false);
+}
+
+int cbm_gbuf_delete_empty_folders_under(cbm_gbuf_t *gb, const char *const *affected_paths,
+                                        int affected_count) {
+    if (!affected_paths || affected_count <= 0) {
+        return 0;
+    }
+    return gbuf_delete_empty_folders_impl(gb, affected_paths, affected_count, true);
+}
+
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;
@@ -1167,6 +1266,26 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
     /* Rebuild edge secondary indexes */
     rebuild_edge_secondary_indexes(gb);
 
+    return 0;
+}
+
+int cbm_gbuf_delete_edges_by_source_type(cbm_gbuf_t *gb, int64_t source_id, const char *type) {
+    if (!gb || !type) {
+        return CBM_NOT_FOUND;
+    }
+    int write_idx = 0;
+    for (int i = 0; i < gb->edges.count; i++) {
+        cbm_gbuf_edge_t *e = gb->edges.items[i];
+        if (e->source_id == source_id && strcmp(e->type, type) == 0) {
+            unindex_edge(gb, e);
+            free_edge_strings(e);
+            free(e);
+        } else {
+            gb->edges.items[write_idx++] = e;
+        }
+    }
+    gb->edges.count = write_idx;
+    rebuild_edge_secondary_indexes(gb);
     return 0;
 }
 
@@ -1705,6 +1824,17 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         rc = frc;
     }
 
+    if (rc == 0) {
+        free(gb->zova_dump_nodes);
+        free(gb->zova_dump_edges);
+        gb->zova_dump_nodes = dump_nodes;
+        gb->zova_dump_node_count = node_idx;
+        gb->zova_dump_edges = dump_edges;
+        gb->zova_dump_edge_count = edge_idx;
+        dump_nodes = NULL;
+        dump_edges = NULL;
+    }
+
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
@@ -1715,9 +1845,15 @@ int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
-    return cbm_zova_after_sqlite_dump_with_i8_vectors(
-        path, gb->dump_vectors, gb->dump_vector_count, gb->dump_token_vecs,
-        gb->dump_token_vec_count, CBM_SEM_DIM);
+    if (gb->zova_dump_nodes || gb->zova_dump_node_count == 0) {
+        return cbm_zova_after_sqlite_dump_workspace_direct(
+            path, gb->root_path, gb->project, gb->zova_dump_nodes, gb->zova_dump_node_count,
+            gb->zova_dump_edges, gb->zova_dump_edge_count, gb->dump_vectors,
+            gb->dump_vector_count, gb->dump_token_vecs, gb->dump_token_vec_count, CBM_SEM_DIM);
+    }
+    return cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
+        path, gb->root_path, gb->project, gb->dump_vectors, gb->dump_vector_count,
+        gb->dump_token_vecs, gb->dump_token_vec_count, CBM_SEM_DIM);
 }
 
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {

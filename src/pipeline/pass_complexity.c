@@ -75,21 +75,48 @@ static bool json_get_bool(const char *json, const char *key) {
     return *p == 't';
 }
 
-/* Append transitive_loop_depth + recursive to a node's properties JSON object. */
+/* Replace the derived complexity suffix when a graph buffer was loaded from a
+ * prior index, then append the current values.  Full indexing calls this once;
+ * incremental indexing recomputes it over a mixed old/new graph, so blindly
+ * appending would leave duplicate JSON keys and stale values. */
 static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursive) {
     const char *old = node->properties_json ? node->properties_json : "{}";
     size_t olen = strlen(old);
     if (olen < 2 || old[olen - 1] != '}') {
         return; /* not a JSON object — leave untouched */
     }
-    bool empty = (olen == 2); /* "{}" */
-    char *neu = malloc(olen + CBM_SZ_64);
+    static const char derived_first[] = "{\"transitive_loop_depth\":";
+    const char *marker = strstr(old, ",\"transitive_loop_depth\":");
+    size_t prefix_len = olen - 1;
+    if (!marker && strncmp(old, derived_first, sizeof(derived_first) - 1) == 0) {
+        marker = old + 1;
+    }
+    if (marker) {
+        const char *cursor = marker + (marker == old + 1 ? 0 : 1);
+        static const char prefix[] = "\"transitive_loop_depth\":";
+        static const char recursive_key[] = ",\"recursive\":";
+        if (strncmp(cursor, prefix, sizeof(prefix) - 1) == 0) {
+            cursor += sizeof(prefix) - 1;
+            while (*cursor >= '0' && *cursor <= '9') {
+                cursor++;
+            }
+            if (strncmp(cursor, recursive_key, sizeof(recursive_key) - 1) == 0) {
+                cursor += sizeof(recursive_key) - 1;
+                if ((strncmp(cursor, "true}", 5) == 0 && cursor[5] == '\0') ||
+                    (strncmp(cursor, "false}", 6) == 0 && cursor[6] == '\0')) {
+                    prefix_len = (size_t)(marker - old);
+                }
+            }
+        }
+    }
+    bool empty = (prefix_len == 1); /* "{}" or a previous derived-only suffix */
+    char *neu = malloc(prefix_len + CBM_SZ_64);
     if (!neu) {
         return;
     }
-    memcpy(neu, old, olen - 1); /* copy without trailing '}' */
+    memcpy(neu, old, prefix_len); /* copy without the old trailing/suffix fields */
     int w =
-        snprintf(neu + (olen - 1), CBM_SZ_64, "%s\"transitive_loop_depth\":%d,\"recursive\":%s}",
+        snprintf(neu + prefix_len, CBM_SZ_64, "%s\"transitive_loop_depth\":%d,\"recursive\":%s}",
                  empty ? "" : ",", tld, recursive ? "true" : "false");
     if (w < 0) {
         free(neu);

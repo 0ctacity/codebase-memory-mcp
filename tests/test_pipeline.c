@@ -23,8 +23,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
+#include "zova/cbm_zova.h"
 #include "yyjson/yyjson.h"
 #include "sqlite3.h" /* vendored/sqlite3 — PRAGMA integrity_check on dumped DBs */
+
+#ifndef CBM_WITH_ZOVA
+#define CBM_WITH_ZOVA 0
+#endif
+
+#if CBM_WITH_ZOVA
+#include "zova.h"
+#endif
 
 /* ── Helper: create temp test repo with known layout ───────────── */
 
@@ -5409,6 +5418,564 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+/* A canonical digest deliberately excludes SQLite's local ids.  It is used
+ * only by the direct-Zova incremental parity test below: matching rows prove
+ * the two independently written databases contain the same semantic graph. */
+typedef struct {
+    uint64_t hash;
+    int rows;
+} pipeline_sql_digest_t;
+
+static void pipeline_digest_bytes(pipeline_sql_digest_t *digest, const void *bytes, size_t len) {
+    const unsigned char *cursor = bytes;
+    for (size_t i = 0; i < len; i++) {
+        digest->hash ^= cursor[i];
+        digest->hash *= UINT64_C(1099511628211);
+    }
+}
+
+static void pipeline_digest_u64(pipeline_sql_digest_t *digest, uint64_t value) {
+    unsigned char bytes[8];
+    for (size_t i = 0; i < sizeof(bytes); i++) {
+        bytes[i] = (unsigned char)(value >> (i * 8));
+    }
+    pipeline_digest_bytes(digest, bytes, sizeof(bytes));
+}
+
+static int pipeline_digest_project_rows(const char *db_path, const char *project, const char *sql,
+                                        pipeline_sql_digest_t *out) {
+    if (!db_path || !project || !sql || !out) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    *out = (pipeline_sql_digest_t){.hash = UINT64_C(1469598103934665603), .rows = 0};
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK) {
+        goto done;
+    }
+    for (;;) {
+        int step = sqlite3_step(stmt);
+        if (step == SQLITE_DONE) {
+            rc = 0;
+            break;
+        }
+        if (step != SQLITE_ROW) {
+            break;
+        }
+        out->rows++;
+        pipeline_digest_bytes(out, "R", 1);
+        int columns = sqlite3_column_count(stmt);
+        for (int column = 0; column < columns; column++) {
+            int type = sqlite3_column_type(stmt, column);
+            int length = sqlite3_column_bytes(stmt, column);
+            const void *value = sqlite3_column_blob(stmt, column);
+            pipeline_digest_bytes(out, &type, sizeof(type));
+            pipeline_digest_u64(out, (uint64_t)length);
+            if (length > 0 && value) {
+                pipeline_digest_bytes(out, value, (size_t)length);
+            }
+        }
+    }
+done:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return rc;
+}
+
+static int pipeline_project_sql_parity(const char *incremental_db, const char *full_db,
+                                       const char *project) {
+    static const char *nodes_sql =
+        "SELECT label,name,qualified_name,file_path,start_line,end_line,properties "
+        "FROM nodes WHERE project=?1 "
+        "ORDER BY label,name,qualified_name,file_path,start_line,end_line,properties";
+    static const char *edges_sql =
+        "SELECT e.type,e.properties,"
+        "s.label,s.name,s.qualified_name,s.file_path,s.start_line,s.end_line,"
+        "t.label,t.name,t.qualified_name,t.file_path,t.start_line,t.end_line "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1 "
+        "ORDER BY e.type,e.properties,s.label,s.name,s.qualified_name,s.file_path,"
+        "s.start_line,s.end_line,t.label,t.name,t.qualified_name,t.file_path,t.start_line,t.end_line";
+    pipeline_sql_digest_t incremental_nodes;
+    pipeline_sql_digest_t full_nodes;
+    pipeline_sql_digest_t incremental_edges;
+    pipeline_sql_digest_t full_edges;
+    return pipeline_digest_project_rows(incremental_db, project, nodes_sql, &incremental_nodes) == 0 &&
+                   pipeline_digest_project_rows(full_db, project, nodes_sql, &full_nodes) == 0 &&
+                   pipeline_digest_project_rows(incremental_db, project, edges_sql,
+                                                &incremental_edges) == 0 &&
+                   pipeline_digest_project_rows(full_db, project, edges_sql, &full_edges) == 0 &&
+                   incremental_nodes.rows == full_nodes.rows &&
+                   incremental_nodes.hash == full_nodes.hash &&
+                   incremental_edges.rows == full_edges.rows &&
+                   incremental_edges.hash == full_edges.hash
+               ? 0
+               : -1;
+}
+
+#if CBM_WITH_ZOVA
+typedef struct {
+    uint64_t graph_nodes;
+    uint64_t graph_edges;
+    uint64_t node_vectors;
+    uint64_t token_vectors;
+    uint64_t calls_walk_hash;
+    size_t calls_walk_count;
+} pipeline_zova_sidecar_info_t;
+
+static int pipeline_zova_find_main_stable_id(const char *db_path, const char *project,
+                                             const char *workspace_id, char *out,
+                                             size_t out_size) {
+    const char *sql =
+        "SELECT label,file_path,qualified_name,start_line,end_line "
+        "FROM nodes WHERE project=?1 AND label='Function' AND name='main' "
+        "ORDER BY qualified_name,file_path,start_line,end_line LIMIT 1";
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW) {
+        goto done;
+    }
+    const char *label = (const char *)sqlite3_column_text(stmt, 0);
+    const char *file_path = (const char *)sqlite3_column_text(stmt, 1);
+    const char *qualified_name = (const char *)sqlite3_column_text(stmt, 2);
+    int start_line = sqlite3_column_int(stmt, 3);
+    int end_line = sqlite3_column_int(stmt, 4);
+    char discriminator[64];
+    if (!label || !file_path || !qualified_name ||
+        snprintf(discriminator, sizeof(discriminator), "%s", qualified_name[0] ? "named" : "") >=
+            (int)sizeof(discriminator)) {
+        goto done;
+    }
+    if (!qualified_name[0] &&
+        snprintf(discriminator, sizeof(discriminator), "anon:%d:%d", start_line, end_line) >=
+            (int)sizeof(discriminator)) {
+        goto done;
+    }
+    rc = cbm_zova_workspace_node_id_v1(workspace_id, label, file_path, qualified_name,
+                                        discriminator, out, out_size);
+done:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return rc;
+}
+
+static int pipeline_zova_sidecar_workspace_id(const char *sidecar_path, const char *project,
+                                              char *out, size_t out_size) {
+    const char *sql =
+        "SELECT workspace_id FROM cbm_zova_trace_nodes_v1 WHERE project=?1 "
+        "ORDER BY workspace_id LIMIT 1";
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    if (sqlite3_open_v2(sidecar_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_step(stmt) != SQLITE_ROW) {
+        goto done;
+    }
+    const char *workspace_id = (const char *)sqlite3_column_text(stmt, 0);
+    if (workspace_id && snprintf(out, out_size, "%s", workspace_id) < (int)out_size) {
+        rc = 0;
+    }
+done:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return rc;
+}
+
+static int pipeline_zova_sidecar_info(const char *db_path, const char *root_path,
+                                      const char *project, pipeline_zova_sidecar_info_t *out) {
+    char sidecar_path[1024];
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    char main_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
+    zova_database *db = NULL;
+    zova_message error = {0};
+    zova_graph_info graph_info = {0};
+    zova_vector_collection_info node_info = {0};
+    zova_vector_collection_info token_info = {0};
+    zova_graph_walk_results walk = {0};
+    int rc = -1;
+    (void)root_path;
+    if (!db_path || !project || !out ||
+        cbm_zova_sidecar_path(db_path, sidecar_path, sizeof(sidecar_path)) != 0 ||
+        pipeline_zova_sidecar_workspace_id(sidecar_path, project, workspace_id,
+                                           sizeof(workspace_id)) != 0 ||
+        cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)) != 0 ||
+        pipeline_zova_find_main_stable_id(db_path, project, workspace_id, main_id,
+                                          sizeof(main_id)) != 0) {
+        goto done;
+    }
+    zova_database_open_request open = {
+        .path = sidecar_path,
+        .out_db = &db,
+        .out_error_message = &error,
+    };
+    if (zova_database_open(&open) != ZOVA_OK) {
+        rc = -2;
+        goto done;
+    }
+    zova_graph_info_get_request graph_request = {
+        .db = db,
+        .name = graph_name,
+        .out_info = &graph_info,
+    };
+    zova_vector_collection_info_get_request node_request = {
+        .db = db,
+        .name = CBM_ZOVA_NODE_COLLECTION,
+        .out_info = &node_info,
+    };
+    zova_vector_collection_info_get_request token_request = {
+        .db = db,
+        .name = CBM_ZOVA_TOKEN_COLLECTION,
+        .out_info = &token_info,
+    };
+    zova_graph_walk_direction_request walk_request = {
+        .db = db,
+        .graph_name = graph_name,
+        .start_node_id = main_id,
+        .direction = ZOVA_GRAPH_NEIGHBOR_OUTGOING,
+        .edge_type = "CALLS",
+        .max_depth = 4,
+        .limit = 100,
+        .out_results = &walk,
+    };
+    if (zova_graph_info_get(&graph_request) != ZOVA_OK) {
+        rc = -3;
+        goto done;
+    }
+    if (zova_vector_collection_info_get(&node_request) != ZOVA_OK) {
+        rc = -4;
+        goto done;
+    }
+    if (zova_vector_collection_info_get(&token_request) != ZOVA_OK) {
+        rc = -5;
+        goto done;
+    }
+    if (zova_graph_walk_direction(&walk_request) != ZOVA_OK) {
+        rc = -6;
+        goto done;
+    }
+    *out = (pipeline_zova_sidecar_info_t){
+        .graph_nodes = graph_info.node_count,
+        .graph_edges = graph_info.edge_count,
+        .node_vectors = node_info.vector_count,
+        .token_vectors = token_info.vector_count,
+        .calls_walk_hash = UINT64_C(1469598103934665603),
+        .calls_walk_count = walk.len,
+    };
+    pipeline_sql_digest_t walk_digest = {
+        .hash = out->calls_walk_hash,
+        .rows = 0,
+    };
+    for (size_t i = 0; i < walk.len; i++) {
+        pipeline_digest_bytes(&walk_digest, walk.items[i].node_id, strlen(walk.items[i].node_id));
+        pipeline_digest_u64(&walk_digest, walk.items[i].depth);
+    }
+    out->calls_walk_hash = walk_digest.hash;
+    rc = 0;
+done:
+    zova_graph_walk_results_free(&walk);
+    zova_vector_collection_info_free(&token_info);
+    zova_vector_collection_info_free(&node_info);
+    zova_graph_info_free(&graph_info);
+    if (db) {
+        (void)zova_database_close(db);
+    }
+    zova_message_free(&error);
+    return rc;
+}
+
+static int pipeline_zova_trace_node_exists(const char *db_path, const char *project,
+                                           const char *label, const char *file_path,
+                                           const char *qualified_name, bool *out_exists) {
+    char sidecar_path[1024];
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    char node_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = -1;
+    *out_exists = false;
+    if (!db_path || !project || !label || !file_path || !qualified_name || !out_exists ||
+        cbm_zova_sidecar_path(db_path, sidecar_path, sizeof(sidecar_path)) != 0 ||
+        pipeline_zova_sidecar_workspace_id(sidecar_path, project, workspace_id,
+                                           sizeof(workspace_id)) != 0 ||
+        cbm_zova_workspace_node_id_v1(workspace_id, label, file_path, qualified_name, "named",
+                                      node_id, sizeof(node_id)) != 0 ||
+        sqlite3_open_v2(sidecar_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "SELECT 1 FROM cbm_zova_trace_nodes_v1 "
+                           "WHERE workspace_id=?1 AND node_id=?2 LIMIT 1",
+                           -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, node_id, -1, SQLITE_STATIC) != SQLITE_OK) {
+        goto done;
+    }
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        *out_exists = true;
+        rc = 0;
+    } else if (step == SQLITE_DONE) {
+        rc = 0;
+    }
+done:
+    if (stmt) {
+        sqlite3_finalize(stmt);
+    }
+    if (db) {
+        sqlite3_close(db);
+    }
+    return rc;
+}
+#endif
+
+TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char incremental_db[512];
+    char full_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", g_incr_tmpdir);
+    snprintf(full_db, sizeof(full_db), "%s/fresh-full.db", g_incr_tmpdir);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+
+    char helper_path[512];
+    snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    FILE *helper = fopen(helper_path, "w");
+    ASSERT_NOT_NULL(helper);
+    fprintf(helper, "package main\n\n"
+                    "func Helper() string {\n\treturn \"edited\"\n}\n\n"
+                    "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(helper);
+
+    /* Same database path deliberately selects CBM's normal incremental route. */
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    ASSERT_STR_EQ(cbm_pipeline_project_name(incremental), project);
+    cbm_pipeline_free(incremental);
+
+    cbm_pipeline_t *control = cbm_pipeline_new(g_incr_tmpdir, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(control);
+    ASSERT_EQ(cbm_pipeline_run(control), 0);
+    ASSERT_STR_EQ(cbm_pipeline_project_name(control), project);
+    cbm_pipeline_free(control);
+
+    static const char *nodes_sql =
+        "SELECT label,name,qualified_name,file_path,start_line,end_line,properties "
+        "FROM nodes WHERE project=?1 "
+        "ORDER BY label,name,qualified_name,file_path,start_line,end_line,properties";
+    static const char *edges_sql =
+        "SELECT e.type,e.properties,"
+        "s.label,s.name,s.qualified_name,s.file_path,s.start_line,s.end_line,"
+        "t.label,t.name,t.qualified_name,t.file_path,t.start_line,t.end_line "
+        "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON t.id=e.target_id "
+        "WHERE e.project=?1 "
+        "ORDER BY e.type,e.properties,s.label,s.name,s.qualified_name,s.file_path,"
+        "s.start_line,s.end_line,t.label,t.name,t.qualified_name,t.file_path,t.start_line,t.end_line";
+    pipeline_sql_digest_t incremental_nodes;
+    pipeline_sql_digest_t full_nodes;
+    pipeline_sql_digest_t incremental_edges;
+    pipeline_sql_digest_t full_edges;
+    ASSERT_EQ(pipeline_digest_project_rows(incremental_db, project, nodes_sql, &incremental_nodes),
+              0);
+    ASSERT_EQ(pipeline_digest_project_rows(full_db, project, nodes_sql, &full_nodes), 0);
+    ASSERT_EQ(pipeline_digest_project_rows(incremental_db, project, edges_sql, &incremental_edges),
+              0);
+    ASSERT_EQ(pipeline_digest_project_rows(full_db, project, edges_sql, &full_edges), 0);
+    ASSERT_EQ(incremental_nodes.rows, full_nodes.rows);
+    ASSERT_EQ(incremental_nodes.hash, full_nodes.hash);
+    ASSERT_EQ(incremental_edges.rows, full_edges.rows);
+    ASSERT_EQ(incremental_edges.hash, full_edges.hash);
+
+    pipeline_zova_sidecar_info_t incremental_zova;
+    pipeline_zova_sidecar_info_t full_zova;
+    ASSERT_EQ(pipeline_zova_sidecar_info(incremental_db, g_incr_tmpdir, project, &incremental_zova),
+              0);
+    ASSERT_EQ(pipeline_zova_sidecar_info(full_db, g_incr_tmpdir, project, &full_zova), 0);
+    ASSERT_GT(incremental_zova.graph_nodes, 0);
+    ASSERT_GT(incremental_zova.calls_walk_count, 1);
+    ASSERT_EQ(incremental_zova.graph_nodes, full_zova.graph_nodes);
+    ASSERT_EQ(incremental_zova.graph_edges, full_zova.graph_edges);
+    ASSERT_EQ(incremental_zova.calls_walk_count, full_zova.calls_walk_count);
+    ASSERT_EQ(incremental_zova.calls_walk_hash, full_zova.calls_walk_hash);
+    ASSERT_EQ(incremental_zova.node_vectors, full_zova.node_vectors);
+    ASSERT_EQ(incremental_zova.token_vectors, full_zova.token_vectors);
+
+    free(project);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char incremental_db[512];
+    char full_db[512];
+    char helper_path[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/delete-incremental.db", g_incr_tmpdir);
+    snprintf(full_db, sizeof(full_db), "%s/delete-full.db", g_incr_tmpdir);
+    snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+
+    ASSERT_EQ(unlink(helper_path), 0);
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    cbm_pipeline_free(incremental);
+
+    cbm_pipeline_t *control = cbm_pipeline_new(g_incr_tmpdir, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(control);
+    ASSERT_EQ(cbm_pipeline_run(control), 0);
+    cbm_pipeline_free(control);
+
+    ASSERT_EQ(pipeline_project_sql_parity(incremental_db, full_db, project), 0);
+    pipeline_zova_sidecar_info_t incremental_zova;
+    pipeline_zova_sidecar_info_t full_zova;
+    ASSERT_EQ(pipeline_zova_sidecar_info(incremental_db, g_incr_tmpdir, project, &incremental_zova),
+              0);
+    ASSERT_EQ(pipeline_zova_sidecar_info(full_db, g_incr_tmpdir, project, &full_zova), 0);
+    ASSERT_EQ(incremental_zova.graph_nodes, full_zova.graph_nodes);
+    ASSERT_EQ(incremental_zova.graph_edges, full_zova.graph_edges);
+    ASSERT_EQ(incremental_zova.calls_walk_count, 1); /* only depth-0 main remains */
+    ASSERT_EQ(incremental_zova.calls_walk_hash, full_zova.calls_walk_hash);
+    ASSERT_EQ(incremental_zova.node_vectors, full_zova.node_vectors);
+    ASSERT_EQ(incremental_zova.token_vectors, full_zova.token_vectors);
+
+    char helper_qn[512];
+    ASSERT_TRUE(snprintf(helper_qn, sizeof(helper_qn), "%s.Helper", project) <
+                (int)sizeof(helper_qn));
+    bool old_helper_exists = true;
+    ASSERT_EQ(pipeline_zova_trace_node_exists(incremental_db, project, "Function", "helper.go",
+                                              helper_qn, &old_helper_exists),
+              0);
+    ASSERT_FALSE(old_helper_exists);
+
+    free(project);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char incremental_db[512];
+    char full_db[512];
+    char old_helper_path[512];
+    char helpers_dir[512];
+    char new_helper_path[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/rename-incremental.db", g_incr_tmpdir);
+    snprintf(full_db, sizeof(full_db), "%s/rename-full.db", g_incr_tmpdir);
+    snprintf(old_helper_path, sizeof(old_helper_path), "%s/helper.go", g_incr_tmpdir);
+    snprintf(helpers_dir, sizeof(helpers_dir), "%s/helpers", g_incr_tmpdir);
+    snprintf(new_helper_path, sizeof(new_helper_path), "%s/helpers/helper.go", g_incr_tmpdir);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+
+    ASSERT_EQ(cbm_mkdir(helpers_dir), 0);
+    ASSERT_EQ(rename(old_helper_path, new_helper_path), 0);
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    cbm_pipeline_free(incremental);
+
+    cbm_pipeline_t *control = cbm_pipeline_new(g_incr_tmpdir, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(control);
+    ASSERT_EQ(cbm_pipeline_run(control), 0);
+    cbm_pipeline_free(control);
+
+    ASSERT_EQ(pipeline_project_sql_parity(incremental_db, full_db, project), 0);
+    pipeline_zova_sidecar_info_t incremental_zova;
+    pipeline_zova_sidecar_info_t full_zova;
+    ASSERT_EQ(pipeline_zova_sidecar_info(incremental_db, g_incr_tmpdir, project, &incremental_zova),
+              0);
+    ASSERT_EQ(pipeline_zova_sidecar_info(full_db, g_incr_tmpdir, project, &full_zova), 0);
+    ASSERT_EQ(incremental_zova.graph_nodes, full_zova.graph_nodes);
+    ASSERT_EQ(incremental_zova.graph_edges, full_zova.graph_edges);
+    ASSERT_GT(incremental_zova.calls_walk_count, 1);
+    ASSERT_EQ(incremental_zova.calls_walk_hash, full_zova.calls_walk_hash);
+    ASSERT_EQ(incremental_zova.node_vectors, full_zova.node_vectors);
+    ASSERT_EQ(incremental_zova.token_vectors, full_zova.token_vectors);
+
+    char helper_qn[512];
+    char renamed_helper_qn[512];
+    ASSERT_TRUE(snprintf(helper_qn, sizeof(helper_qn), "%s.Helper", project) <
+                (int)sizeof(helper_qn));
+    ASSERT_TRUE(snprintf(renamed_helper_qn, sizeof(renamed_helper_qn), "%s.helpers.Helper",
+                         project) < (int)sizeof(renamed_helper_qn));
+    bool old_helper_exists = true;
+    bool new_helper_exists = false;
+    ASSERT_EQ(pipeline_zova_trace_node_exists(incremental_db, project, "Function", "helper.go",
+                                              helper_qn, &old_helper_exists),
+              0);
+    ASSERT_EQ(pipeline_zova_trace_node_exists(incremental_db, project, "Function",
+                                              "helpers/helper.go", renamed_helper_qn,
+                                              &new_helper_exists),
+              0);
+    ASSERT_FALSE(old_helper_exists);
+    ASSERT_TRUE(new_helper_exists);
+
+    free(project);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -6901,6 +7468,9 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(pipeline_incremental_direct_zova_matches_fresh_full);
+    RUN_TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full);
+    RUN_TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);

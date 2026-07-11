@@ -522,6 +522,71 @@ TEST(store_bfs_inbound) {
     PASS();
 }
 
+/* Canonical traversal emits every reachable node once at its shortest hop.
+ * Within a hop, the public order is stable metadata order rather than SQLite's
+ * incidental recursive-CTE row order. */
+TEST(store_bfs_canonicalizes_cycles_and_orders_visits) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t root = {.project = "test",
+                       .label = "Function",
+                       .name = "Root",
+                       .qualified_name = "test.Root",
+                       .file_path = "root.c",
+                       .start_line = 1,
+                       .end_line = 9};
+    /* Insert beta first so an incidental SQLite-id ordering is observably
+     * different from the declared file-path ordering. */
+    cbm_node_t beta = {.project = "test",
+                       .label = "Function",
+                       .name = "Beta",
+                       .qualified_name = "test.Beta",
+                       .file_path = "zeta.c",
+                       .start_line = 1,
+                       .end_line = 9};
+    cbm_node_t alpha = {.project = "test",
+                        .label = "Function",
+                        .name = "Alpha",
+                        .qualified_name = "test.Alpha",
+                        .file_path = "alpha.c",
+                        .start_line = 1,
+                        .end_line = 9};
+    int64_t root_id = cbm_store_upsert_node(s, &root);
+    int64_t beta_id = cbm_store_upsert_node(s, &beta);
+    int64_t alpha_id = cbm_store_upsert_node(s, &alpha);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(beta_id, 0);
+    ASSERT_GT(alpha_id, 0);
+
+    cbm_edge_t root_beta = {.project = "test", .source_id = root_id, .target_id = beta_id,
+                            .type = "CALLS"};
+    cbm_edge_t root_alpha = {.project = "test", .source_id = root_id, .target_id = alpha_id,
+                             .type = "CALLS"};
+    cbm_edge_t beta_root = {.project = "test", .source_id = beta_id, .target_id = root_id,
+                            .type = "CALLS"};
+    cbm_edge_t alpha_root = {.project = "test", .source_id = alpha_id, .target_id = root_id,
+                             .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &root_beta), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &root_alpha), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &beta_root), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &alpha_root), 0);
+
+    const char *types[] = {"CALLS"};
+    cbm_traverse_result_t result = {0};
+    ASSERT_EQ(cbm_store_bfs(s, root_id, "outbound", types, 1, 2, 100, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.visited_count, 2);
+    ASSERT_STR_EQ(result.visited[0].node.name, "Alpha");
+    ASSERT_EQ(result.visited[0].hop, 1);
+    ASSERT_STR_EQ(result.visited[1].node.name, "Beta");
+    ASSERT_EQ(result.visited[1].hop, 1);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Transaction ────────────────────────────────────────────────── */
 
 TEST(store_transaction_commit) {
@@ -1475,6 +1540,7 @@ SUITE(store_search) {
     RUN_TEST(store_search_case_insensitive);
     RUN_TEST(store_bfs_outbound);
     RUN_TEST(store_bfs_inbound);
+    RUN_TEST(store_bfs_canonicalizes_cycles_and_orders_visits);
     RUN_TEST(store_bfs_cross_service);
     RUN_TEST(store_bfs_depth_chain);
     RUN_TEST(store_transaction_commit);
