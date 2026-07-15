@@ -79,6 +79,10 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
 
+/* Elapsed time of the opt-in user-local Zova publication from the last run,
+ * or 0 when publication was disabled or did not complete. */
+double cbm_pipeline_get_zova_publish_ms(const cbm_pipeline_t *p);
+
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 
 /* One source file that was skipped during indexing. All strings are owned by

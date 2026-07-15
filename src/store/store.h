@@ -127,6 +127,7 @@ typedef struct {
     cbm_node_t node;
     int in_degree;
     int out_degree;
+    double rank; /* BM25 score for full-text results; 0 for regular searches. */
     /* connected_names: allocated array of strings, count in connected_count */
     const char **connected_names;
     int connected_count;
@@ -202,6 +203,10 @@ cbm_store_t *cbm_store_open_memory(void);
 
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
+/* Read-only compatibility view over one workspace in the shared cbm.zova. */
+cbm_store_t *cbm_store_open_zova_workspace_query(const char *db_path,
+                                                 const char *workspace_id);
+int cbm_store_zova_native_topology_ops(const cbm_store_t *store);
 
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
  * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and
@@ -586,9 +591,21 @@ typedef struct {
     const char *updated_at;
 } cbm_adr_t;
 
+/* Exact project_summaries row used by the experimental user-local Zova
+ * publisher. All returned strings are heap-owned by the export object. */
+typedef struct {
+    char *summary;
+    char *source_hash;
+    char *created_at;
+    char *updated_at;
+} cbm_project_summary_export_t;
+
 int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content);
 int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out);
 int cbm_store_adr_delete(cbm_store_t *s, const char *project);
+int cbm_store_project_summary_export(cbm_store_t *s, const char *project,
+                                      cbm_project_summary_export_t *out);
+void cbm_store_project_summary_export_free(cbm_project_summary_export_t *row);
 int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const char **keys,
                                   const char **values, int count, cbm_adr_t *out);
 void cbm_store_adr_free(cbm_adr_t *adr);
@@ -696,6 +713,9 @@ typedef struct {
 typedef struct {
     bool used_zova;
     bool zova_native_multi_query;
+    /* True when a present sidecar was rejected because its generation was
+     * stale or not marked ready. */
+    bool generation_mismatch;
     double query_vector_build_ms;
     double zova_prefetch_ms;
     int zova_fetch_limit;

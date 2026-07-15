@@ -19,6 +19,8 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "zova/cbm_zova.h"
+#include "zova/cbm_zova_repository.h"
+#include "zova/cbm_zova_route.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "foundation/log.h"
@@ -787,6 +789,16 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_pipeline_pass_tests(ctx, changed_files, ci);
     cbm_log_info("pass.timing", "pass", "incr_tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
+    /* File nodes for changed paths are deleted and recreated above, so their
+     * git-history properties disappear unless the full-repository derived
+     * pass is reapplied. Rebuild the derived edges as well to match a fresh
+     * full index instead of accumulating stale FILE_CHANGES_WITH rows. */
+    cbm_gbuf_delete_edges_by_type(ctx->gbuf, "FILE_CHANGES_WITH");
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    int history_rc = cbm_pipeline_pass_githistory(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_githistory", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)), "rc", itoa_buf(history_rc));
+
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_pass_decorator_tags(ctx->gbuf, project);
     cbm_log_info("pass.timing", "pass", "incr_decorator_tags", "elapsed_ms",
@@ -829,12 +841,26 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const char *db_path,
+                            const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                             const char *repo_path) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        if (cbm_gbuf_prepare_zova_dump(gbuf) != 0) {
+            cbm_log_error("incremental.err", "phase", "zova_prepare");
+            return CBM_NOT_FOUND;
+        }
+        if (cbm_pipeline_publish_zova_user_database(pipeline, gbuf, files, file_count,
+                                                    mode_skipped, mode_skipped_count) != 0) {
+            cbm_log_error("incremental.err", "phase", "zova_single_file");
+            return CBM_NOT_FOUND;
+        }
+        return 0;
+    }
 
     cbm_unlink(db_path);
     char wal[INCR_WAL_BUF];
@@ -873,6 +899,11 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         cbm_log_error("incremental.err", "phase", "zova_sidecar", "path", db_path);
         return CBM_NOT_FOUND;
     }
+    if (cbm_pipeline_publish_zova_user_database(pipeline, gbuf, files, file_count,
+                                                mode_skipped, mode_skipped_count) != 0) {
+        cbm_log_error("incremental.err", "phase", "zova_single_file", "path", db_path);
+        return CBM_NOT_FOUND;
+    }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {
@@ -883,24 +914,114 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
 
-int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count) {
+typedef struct {
+    int64_t snapshot_id;
+    int64_t graph_id;
+} cbm_incremental_node_id_map_t;
+
+static int compare_incremental_node_ids(const void *left, const void *right) {
+    const cbm_incremental_node_id_map_t *a = left;
+    const cbm_incremental_node_id_map_t *b = right;
+    return (a->snapshot_id > b->snapshot_id) - (a->snapshot_id < b->snapshot_id);
+}
+
+static int64_t incremental_graph_id_for_snapshot_id(const cbm_incremental_node_id_map_t *map,
+                                                     int count, int64_t snapshot_id) {
+    cbm_incremental_node_id_map_t key = {.snapshot_id = snapshot_id};
+    const cbm_incremental_node_id_map_t *match =
+        bsearch(&key, map, (size_t)count, sizeof(*map), compare_incremental_node_ids);
+    return match ? match->graph_id : 0;
+}
+
+static int load_zova_snapshot_graph(cbm_gbuf_t *gbuf,
+                                    const cbm_zova_workspace_snapshot_t *snapshot) {
+    cbm_incremental_node_id_map_t *map =
+        snapshot->node_count > 0 ? calloc((size_t)snapshot->node_count, sizeof(*map)) : NULL;
+    if (snapshot->node_count > 0 && !map) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < snapshot->node_count; i++) {
+        const CBMDumpNode *node = &snapshot->nodes[i];
+        int64_t graph_id = cbm_gbuf_upsert_node(
+            gbuf, node->label, node->name, node->qualified_name, node->file_path,
+            node->start_line, node->end_line, node->properties);
+        if (graph_id <= 0) {
+            free(map);
+            return CBM_NOT_FOUND;
+        }
+        map[i] = (cbm_incremental_node_id_map_t){.snapshot_id = node->id,
+                                                .graph_id = graph_id};
+    }
+    qsort(map, (size_t)snapshot->node_count, sizeof(*map), compare_incremental_node_ids);
+    for (int i = 0; i < snapshot->edge_count; i++) {
+        const CBMDumpEdge *edge = &snapshot->edges[i];
+        int64_t source_id =
+            incremental_graph_id_for_snapshot_id(map, snapshot->node_count, edge->source_id);
+        int64_t target_id =
+            incremental_graph_id_for_snapshot_id(map, snapshot->node_count, edge->target_id);
+        if (source_id <= 0 || target_id <= 0 ||
+            cbm_gbuf_insert_edge(gbuf, source_id, target_id, edge->type, edge->properties) <= 0) {
+            free(map);
+            return CBM_NOT_FOUND;
+        }
+    }
+    free(map);
+    return 0;
+}
+
+static int copy_zova_snapshot_hashes(const char *project,
+                                     const cbm_zova_workspace_snapshot_t *snapshot,
+                                     cbm_file_hash_t **out_hashes, int *out_count) {
+    *out_hashes = NULL;
+    *out_count = 0;
+    if (snapshot->file_hash_count <= 0) {
+        return 0;
+    }
+    cbm_file_hash_t *hashes = calloc((size_t)snapshot->file_hash_count, sizeof(*hashes));
+    if (!hashes) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < snapshot->file_hash_count; i++) {
+        const cbm_zova_file_hash_input_t *source = &snapshot->file_hashes[i];
+        hashes[i].project = strdup(project);
+        hashes[i].rel_path = strdup(source->file_path);
+        hashes[i].sha256 = strdup(source->content_hash);
+        hashes[i].mtime_ns = source->mtime_ns;
+        hashes[i].size = source->size_bytes;
+        if (!hashes[i].project || !hashes[i].rel_path || !hashes[i].sha256) {
+            cbm_store_free_file_hashes(hashes, snapshot->file_hash_count);
+            return CBM_NOT_FOUND;
+        }
+    }
+    *out_hashes = hashes;
+    *out_count = snapshot->file_hash_count;
+    return 0;
+}
+
+static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
+                           int file_count, const cbm_zova_workspace_snapshot_t *snapshot) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
 
-    /* Open existing disk DB */
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store) {
-        cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
-        return CBM_NOT_FOUND;
-    }
-
-    /* Load stored file hashes */
+    cbm_store_t *store = NULL;
     cbm_file_hash_t *stored = NULL;
     int stored_count = 0;
-    cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    if (snapshot) {
+        if (copy_zova_snapshot_hashes(project, snapshot, &stored, &stored_count) != 0) {
+            cbm_log_error("incremental.err", "msg", "load_zova_hashes_failed");
+            return CBM_NOT_FOUND;
+        }
+    } else {
+        store = cbm_store_open_path(db_path);
+        if (!store) {
+            cbm_log_error("incremental.err", "msg", "open_db_failed", "path", db_path);
+            return CBM_NOT_FOUND;
+        }
+        cbm_pipeline_capture_project_summary(p, store);
+        cbm_store_get_file_hashes(store, project, &stored, &stored_count);
+    }
 
     /* Classify files */
     int n_changed = 0;
@@ -930,7 +1051,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
-        cbm_store_close(store);
+        if (store) {
+            cbm_store_close(store);
+        }
         return 0;
     }
 
@@ -954,8 +1077,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Step 1: Load existing graph into RAM */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
-    int load_rc = cbm_gbuf_load_from_db(existing, db_path, project);
-    cbm_log_info("incremental.load_db", "rc", itoa_buf(load_rc), "nodes",
+    int load_rc = snapshot ? load_zova_snapshot_graph(existing, snapshot)
+                           : cbm_gbuf_load_from_db(existing, db_path, project);
+    cbm_log_info(snapshot ? "incremental.load_zova" : "incremental.load_db", "rc",
+                 itoa_buf(load_rc), "nodes",
                  itoa_buf(cbm_gbuf_node_count(existing)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(existing)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
@@ -969,11 +1094,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
-        cbm_store_close(store);
+        if (store) {
+            cbm_store_close(store);
+        }
         return CBM_NOT_FOUND;
     }
 
-    cbm_store_close(store);
+    if (store) {
+        cbm_store_close(store);
+    }
 
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
@@ -1096,7 +1225,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+    int persist_rc = dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
                                       mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
@@ -1106,4 +1235,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return 0;
+}
+
+int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
+                                 int file_count) {
+    return run_incremental(p, db_path, files, file_count, NULL);
+}
+
+int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
+                                      cbm_file_info_t *files, int file_count,
+                                      const cbm_zova_workspace_snapshot_t *snapshot) {
+    if (!snapshot) {
+        return CBM_NOT_FOUND;
+    }
+    return run_incremental(p, zova_path, files, file_count, snapshot);
 }

@@ -13,6 +13,8 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
+#include "zova/cbm_zova.h"
+
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -173,11 +175,21 @@ void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb);
  * Assigns sequential final IDs and remaps edge references.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
+/* Finalize stable node/edge/vector identities without creating a SQLite file. */
+int cbm_gbuf_prepare_zova_dump(cbm_gbuf_t *gb);
 
 /* Create the optional Zova sidecar after the SQLite dump has completed.
  * In i8-vector mode it writes typed collections from the finalized in-memory
  * vector arrays, while SQLite remains the paired writer. */
 int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path);
+
+/* Opt-in single-file publication using the finalized graph/vector arrays. The
+ * caller owns the optional file-hash and summary inputs and the result is
+ * filled by cbm_zova_user_database_publish_workspace(). */
+int cbm_gbuf_publish_zova_user_database(
+    const cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
+    int file_hash_count, const cbm_zova_project_summary_input_t *project_summary,
+    cbm_zova_workspace_generation_result_t *out_result);
 
 /* Flush the buffer to an existing store via the store API.
  * Deletes existing project data first. Returns 0 on success. */

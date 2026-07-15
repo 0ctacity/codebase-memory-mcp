@@ -20,11 +20,13 @@
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "cbm.h"
+#include "yyjson/yyjson.h"
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <limits.h>
 
 enum { CBM_TLD_MAX_DEPTH = 256 }; /* recursion-depth cap (cycle/stack guard) */
 
@@ -81,55 +83,75 @@ static bool json_get_bool(const char *json, const char *key) {
  * appending would leave duplicate JSON keys and stale values. */
 static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursive) {
     const char *old = node->properties_json ? node->properties_json : "{}";
-    size_t olen = strlen(old);
-    if (olen < 2 || old[olen - 1] != '}') {
-        return; /* not a JSON object — leave untouched */
-    }
-    static const char derived_first[] = "{\"transitive_loop_depth\":";
-    const char *marker = strstr(old, ",\"transitive_loop_depth\":");
-    size_t prefix_len = olen - 1;
-    if (!marker && strncmp(old, derived_first, sizeof(derived_first) - 1) == 0) {
-        marker = old + 1;
-    }
-    if (marker) {
-        const char *cursor = marker + (marker == old + 1 ? 0 : 1);
-        static const char prefix[] = "\"transitive_loop_depth\":";
-        static const char recursive_key[] = ",\"recursive\":";
-        if (strncmp(cursor, prefix, sizeof(prefix) - 1) == 0) {
-            cursor += sizeof(prefix) - 1;
-            while (*cursor >= '0' && *cursor <= '9') {
-                cursor++;
-            }
-            if (strncmp(cursor, recursive_key, sizeof(recursive_key) - 1) == 0) {
-                cursor += sizeof(recursive_key) - 1;
-                if ((strncmp(cursor, "true}", 5) == 0 && cursor[5] == '\0') ||
-                    (strncmp(cursor, "false}", 6) == 0 && cursor[6] == '\0')) {
-                    prefix_len = (size_t)(marker - old);
-                }
-            }
-        }
-    }
-    bool empty = (prefix_len == 1); /* "{}" or a previous derived-only suffix */
-    char *neu = malloc(prefix_len + CBM_SZ_64);
-    if (!neu) {
+    yyjson_doc *doc = yyjson_read(old, strlen(old), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    if (!root || !yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
         return;
     }
-    memcpy(neu, old, prefix_len); /* copy without the old trailing/suffix fields */
-    int w =
-        snprintf(neu + prefix_len, CBM_SZ_64, "%s\"transitive_loop_depth\":%d,\"recursive\":%s}",
-                 empty ? "" : ",", tld, recursive ? "true" : "false");
-    if (w < 0) {
-        free(neu);
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        yyjson_doc_free(doc);
         return;
     }
+    yyjson_mut_val *mroot = yyjson_val_mut_copy(mdoc, root);
+    if (!mroot) {
+        yyjson_mut_doc_free(mdoc);
+        yyjson_doc_free(doc);
+        return;
+    }
+    yyjson_mut_doc_set_root(mdoc, mroot);
+    /* Loaded incremental nodes may contain these fields before later-derived
+     * fields such as decorator_tags, and older generations may contain more
+     * than one copy. yyjson removes every matching key before current values
+     * are added exactly once. */
+    yyjson_mut_obj_remove_key(mroot, "transitive_loop_depth");
+    yyjson_mut_obj_remove_key(mroot, "recursive");
+    yyjson_mut_obj_add_int(mdoc, mroot, "transitive_loop_depth", tld);
+    yyjson_mut_obj_add_bool(mdoc, mroot, "recursive", recursive);
+    char *neu = yyjson_mut_write(mdoc, 0, NULL);
+    yyjson_mut_doc_free(mdoc);
+    yyjson_doc_free(doc);
+    if (!neu) return;
     free(node->properties_json);
     node->properties_json = neu;
+}
+
+static int compare_node_text(const char *left, const char *right) {
+    return strcmp(left ? left : "", right ? right : "");
+}
+
+static int compare_complexity_nodes(const void *left, const void *right) {
+    const cbm_gbuf_node_t *a = *(const cbm_gbuf_node_t *const *)left;
+    const cbm_gbuf_node_t *b = *(const cbm_gbuf_node_t *const *)right;
+    int cmp = compare_node_text(a->qualified_name, b->qualified_name);
+    if (cmp == 0) cmp = compare_node_text(a->label, b->label);
+    if (cmp == 0) cmp = compare_node_text(a->file_path, b->file_path);
+    if (cmp == 0 && a->start_line != b->start_line)
+        cmp = a->start_line < b->start_line ? -1 : 1;
+    if (cmp == 0 && a->end_line != b->end_line)
+        cmp = a->end_line < b->end_line ? -1 : 1;
+    if (cmp == 0) cmp = compare_node_text(a->name, b->name);
+    return cmp;
+}
+
+typedef struct {
+    int64_t id;
+    int rank;
+} complexity_callee_t;
+
+static int compare_complexity_callees(const void *left, const void *right) {
+    const complexity_callee_t *a = left;
+    const complexity_callee_t *b = right;
+    if (a->rank != b->rank) return a->rank < b->rank ? -1 : 1;
+    if (a->id != b->id) return a->id < b->id ? -1 : 1;
+    return 0;
 }
 
 /* Memoized DFS: tld(id) = loop_depth(id) + max over CALLS-callees of tld(callee).
  * state: 0=unvisited, 1=in-progress (back-edge → cycle), 2=done. */
 static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int *tld, char *state,
-                   bool *recursive, int64_t maxid, int depth) {
+                   bool *recursive, const int *rank, int64_t maxid, int depth) {
     if (id < 1 || id > maxid) {
         return 0;
     }
@@ -148,17 +170,34 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
     const cbm_gbuf_edge_t **edges = NULL;
     int ne = 0;
     cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &ne);
+    complexity_callee_t *callees = ne > 0 ? malloc((size_t)ne * sizeof(*callees)) : NULL;
+    if (ne > 0 && !callees) {
+        state[id] = 2;
+        tld[id] = loop_depth[id];
+        return tld[id];
+    }
     for (int i = 0; i < ne; i++) {
-        int64_t c = edges[i]->target_id;
+        int64_t target = edges[i]->target_id;
+        callees[i] = (complexity_callee_t){
+            .id = target,
+            .rank = target >= 1 && target <= maxid && rank[target] > 0
+                        ? rank[target]
+                        : INT_MAX,
+        };
+    }
+    qsort(callees, (size_t)ne, sizeof(*callees), compare_complexity_callees);
+    for (int i = 0; i < ne; i++) {
+        int64_t c = callees[i].id;
         if (c == id) {
             recursive[id] = true; /* direct self-recursion */
             continue;
         }
-        int ct = tld_dfs(gb, c, loop_depth, tld, state, recursive, maxid, depth + 1);
+        int ct = tld_dfs(gb, c, loop_depth, tld, state, recursive, rank, maxid, depth + 1);
         if (ct > best) {
             best = ct;
         }
     }
+    free(callees);
     tld[id] = loop_depth[id] + best;
     state[id] = 2;
     return tld[id];
@@ -200,35 +239,52 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     char *state = calloc(sz, sizeof(char));
     bool *recursive = calloc(sz, sizeof(bool));
     cbm_gbuf_node_t **nptr = calloc(sz, sizeof(cbm_gbuf_node_t *));
-    if (!loop_depth || !tld || !state || !recursive || !nptr) {
+    int *rank = calloc(sz, sizeof(int));
+    if (!loop_depth || !tld || !state || !recursive || !nptr || !rank) {
         free(loop_depth);
         free(tld);
         free(state);
         free(recursive);
         free(nptr);
+        free(rank);
         return;
     }
 
     seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
     seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
 
-    int updated = 0;
+    int node_count = 0;
     for (int64_t id = 1; id <= maxid; id++) {
-        if (!nptr[id]) {
-            continue; /* only Function/Method nodes */
-        }
-        if (state[id] != 2) {
-            tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
-        }
-        append_complexity_props(nptr[id], tld[id], recursive[id]);
-        updated++;
+        if (nptr[id]) node_count++;
+    }
+    cbm_gbuf_node_t **ordered = node_count > 0
+        ? malloc((size_t)node_count * sizeof(*ordered))
+        : NULL;
+    if (node_count > 0 && !ordered) {
+        free(loop_depth); free(tld); free(state); free(recursive); free(nptr); free(rank);
+        return;
+    }
+    int ordered_count = 0;
+    for (int64_t id = 1; id <= maxid; id++) {
+        if (nptr[id]) ordered[ordered_count++] = nptr[id];
+    }
+    qsort(ordered, (size_t)ordered_count, sizeof(*ordered), compare_complexity_nodes);
+    for (int i = 0; i < ordered_count; i++) rank[ordered[i]->id] = i + 1;
+
+    for (int i = 0; i < ordered_count; i++) {
+        int64_t id = ordered[i]->id;
+        if (state[id] != 2)
+            tld_dfs(gb, id, loop_depth, tld, state, recursive, rank, maxid, 0);
+        append_complexity_props(ordered[i], tld[id], recursive[id]);
     }
 
-    cbm_log_info("pass.complexity", "functions", itoa_cx(updated));
+    cbm_log_info("pass.complexity", "functions", itoa_cx(ordered_count));
 
+    free(ordered);
     free(loop_depth);
     free(tld);
     free(state);
     free(recursive);
     free(nptr);
+    free(rank);
 }

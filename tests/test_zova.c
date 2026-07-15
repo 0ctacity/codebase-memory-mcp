@@ -5,6 +5,10 @@
 #include "../src/foundation/platform.h"
 #include "store/store.h"
 #include "zova/cbm_zova.h"
+#include "zova/cbm_zova_route.h"
+#include "zova/cbm_zova_repository.h"
+#include "cypher/cypher.h"
+#include "zova/cbm_zova_writer_gate.h"
 #include "graph_buffer/graph_buffer.h"
 #include "../internal/cbm/sqlite_writer.h"
 
@@ -25,8 +29,172 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#endif
 
 enum { TZ_VEC_DIM = 768, TZ_PATH_MAX = 512 };
+
+#ifndef _WIN32
+TEST(zova_writer_gate_serializes_processes_and_releases_after_crash) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-zova-writer-gate-%d.zova", cbm_tmpdir(), getpid());
+    int ready[2], release[2], acquired[2];
+    ASSERT_EQ(pipe(ready), 0);
+    ASSERT_EQ(pipe(release), 0);
+    ASSERT_EQ(pipe(acquired), 0);
+
+    pid_t holder = fork();
+    ASSERT_TRUE(holder >= 0);
+    if (holder == 0) {
+        close(ready[0]); close(release[1]); close(acquired[0]); close(acquired[1]);
+        cbm_zova_writer_guard_t guard = {0};
+        if (cbm_zova_writer_guard_acquire(path, &guard) != 0) _exit(10);
+        (void)write(ready[1], "R", 1);
+        char byte;
+        if (read(release[0], &byte, 1) != 1) _exit(11);
+        cbm_zova_writer_guard_release(&guard);
+        _exit(0);
+    }
+    close(ready[1]); close(release[0]);
+    char byte;
+    ASSERT_EQ(read(ready[0], &byte, 1), 1);
+
+    pid_t waiter = fork();
+    ASSERT_TRUE(waiter >= 0);
+    if (waiter == 0) {
+        close(acquired[0]); close(release[1]); close(ready[0]);
+        cbm_zova_writer_guard_t guard = {0};
+        if (cbm_zova_writer_guard_acquire(path, &guard) != 0) _exit(12);
+        (void)write(acquired[1], "A", 1);
+        cbm_zova_writer_guard_release(&guard);
+        _exit(0);
+    }
+    close(acquired[1]);
+    int flags = fcntl(acquired[0], F_GETFL, 0);
+    ASSERT_TRUE(flags >= 0);
+    ASSERT_EQ(fcntl(acquired[0], F_SETFL, flags | O_NONBLOCK), 0);
+    struct timespec delay = {.tv_sec = 0, .tv_nsec = 100000000};
+    nanosleep(&delay, NULL);
+    ASSERT_EQ(read(acquired[0], &byte, 1), -1);
+    ASSERT_EQ(errno, EAGAIN);
+    ASSERT_EQ(write(release[1], "X", 1), 1);
+    ASSERT_EQ(fcntl(acquired[0], F_SETFL, flags), 0);
+    ASSERT_EQ(read(acquired[0], &byte, 1), 1);
+    int status = 0;
+    ASSERT_EQ(waitpid(holder, &status, 0), holder);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    ASSERT_EQ(waitpid(waiter, &status, 0), waiter);
+    ASSERT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    int crash_ready[2];
+    ASSERT_EQ(pipe(crash_ready), 0);
+    pid_t crashed = fork();
+    ASSERT_TRUE(crashed >= 0);
+    if (crashed == 0) {
+        close(crash_ready[0]);
+        cbm_zova_writer_guard_t guard = {0};
+        if (cbm_zova_writer_guard_acquire(path, &guard) != 0) _exit(13);
+        (void)write(crash_ready[1], "C", 1);
+        for (;;) pause();
+    }
+    close(crash_ready[1]);
+    ASSERT_EQ(read(crash_ready[0], &byte, 1), 1);
+    ASSERT_EQ(kill(crashed, SIGKILL), 0);
+    ASSERT_EQ(waitpid(crashed, &status, 0), crashed);
+    cbm_zova_writer_guard_t after_crash = {0};
+    ASSERT_EQ(cbm_zova_writer_guard_acquire(path, &after_crash), 0);
+    cbm_zova_writer_guard_release(&after_crash);
+    char lock_path[TZ_PATH_MAX + 32];
+    snprintf(lock_path, sizeof(lock_path), "%s.writer.lock", path);
+    cbm_unlink(lock_path);
+    PASS();
+}
+#endif
+
+TEST(zova_route_requires_flag_and_respects_off) {
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_COMPATIBILITY);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+    ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_COMPATIBILITY);
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_route_uses_user_cache_database) {
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-route-cache", 1);
+    char path[1024];
+    ASSERT_EQ(cbm_zova_user_database_path(path, sizeof(path)), 0);
+    ASSERT_STR_EQ(path, "/tmp/cbm-route-cache/cbm.zova");
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    PASS();
+}
+
+#if CBM_WITH_ZOVA
+TEST(zova_workspace_id_validation_rejects_missing_and_malformed_values) {
+    ASSERT_EQ(cbm_zova_workspace_id_validate(NULL), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_workspace_id_validate(""), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_workspace_id_validate("workspace-with-dash"), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_workspace_id_validate("workspace/path"), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_workspace_id_validate("workspace_A1"), CBM_STORE_OK);
+    PASS();
+}
+
+TEST(zova_repository_requires_ready_workspace_and_reads_metadata) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-zova-repository-%d.zova", cbm_tmpdir(), getpid());
+    cbm_unlink(path);
+    const CBMDumpNode nodes[] = {
+        {.id = 1, .project = "fixture", .label = "Function", .name = "alpha",
+         .qualified_name = "fixture.alpha", .file_path = "src/alpha.c", .start_line = 2,
+         .end_line = 4, .properties = "{\"visibility\":\"public\"}"},
+        {.id = 2, .project = "fixture", .label = "Function", .name = "beta",
+         .qualified_name = "fixture.beta", .file_path = "src/beta.c", .start_line = 5,
+         .end_line = 8, .properties = "{}"},
+    };
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/fixture", "fixture", 1,
+                                                       nodes, 2, NULL, 0), 0);
+    cbm_zova_repository_t *repo = cbm_zova_repository_open(path, "fixture");
+    ASSERT_NOT_NULL(repo);
+    const char *workspace_id = cbm_zova_repository_workspace_id(repo);
+    ASSERT_TRUE(workspace_id[0] != '\0');
+    cbm_node_t node = {0};
+    ASSERT_EQ(cbm_zova_repository_find_node_by_qn(repo, workspace_id, "fixture.alpha", &node),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(node.file_path, "src/alpha.c");
+    ASSERT_STR_EQ(node.properties_json, "{\"visibility\":\"public\"}");
+    cbm_node_free_fields(&node);
+    cbm_search_output_t out = {0};
+    cbm_search_params_t params = {.project = "fixture", .name_pattern = "alpha", .limit = 20,
+                                  .min_degree = -1, .max_degree = -1};
+    ASSERT_EQ(cbm_zova_repository_search(repo, workspace_id, &params, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    cbm_store_search_free(&out);
+    ASSERT_EQ(cbm_zova_repository_find_node_by_qn(repo, NULL, "fixture.alpha", &node),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_repository_find_node_by_qn(repo, "workspace_B", "fixture.alpha", &node),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_zova_repository_search(repo, "workspace_B", &params, &out), CBM_STORE_ERR);
+    cbm_zova_repository_close(repo);
+    ASSERT_NULL(cbm_zova_repository_open(path, "missing"));
+    cbm_unlink(path);
+    PASS();
+}
+#endif
 
 typedef struct {
     char db_path[TZ_PATH_MAX];
@@ -263,6 +431,41 @@ static int zova_scalar_int64(const char *path, const char *sql, int64_t *out) {
     return rc;
 }
 
+static int zova_generation_state(const char *path, const char *workspace_id, int64_t generation,
+                                 char *out, size_t out_size) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (!path || !workspace_id || !out || out_size == 0 ||
+        sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        return -1;
+    }
+    int rc = sqlite3_prepare_v2(
+        db,
+        "SELECT state FROM cbm_database_generation_v1 WHERE workspace_id=?1 AND generation=?2",
+        -1, &stmt, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_int64(stmt, 2, generation);
+    if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+        const unsigned char *text = sqlite3_column_text(stmt, 0);
+        if (!text || strlen((const char *)text) + 1 > out_size) {
+            rc = SQLITE_TOOBIG;
+        } else {
+            snprintf(out, out_size, "%s", (const char *)text);
+            rc = SQLITE_OK;
+        }
+    } else if (rc == SQLITE_OK) {
+        rc = SQLITE_NOTFOUND;
+    }
+    if (stmt)
+        sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? 0 : -1;
+}
+
 static int result_overlap(cbm_vector_result_t *a, int ac, cbm_vector_result_t *b, int bc) {
     int overlap = 0;
     for (int i = 0; i < ac; i++) {
@@ -324,18 +527,28 @@ TEST(zova_mode_parser) {
     cbm_setenv("CBM_ZOVA_MODE", "off", 1);
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_OFF);
     ASSERT_FALSE(cbm_zova_graph_read_is_enabled());
+    ASSERT_FALSE(cbm_zova_vector_read_is_enabled());
     cbm_setenv("CBM_ZOVA_MODE", "container", 1);
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_CONTAINER);
     ASSERT_FALSE(cbm_zova_graph_read_is_enabled());
+    ASSERT_FALSE(cbm_zova_vector_read_is_enabled());
     cbm_setenv("CBM_ZOVA_MODE", "i8_vectors", 1);
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_I8_VECTORS);
+    ASSERT_TRUE(cbm_zova_vector_read_is_enabled());
     cbm_setenv("CBM_ZOVA_MODE", "graph_mirror", 1);
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_GRAPH_MIRROR);
     ASSERT_FALSE(cbm_zova_graph_read_is_enabled());
+    ASSERT_TRUE(cbm_zova_vector_read_is_enabled());
     cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_GRAPH_READ);
     ASSERT_TRUE(cbm_zova_graph_read_is_enabled());
+    ASSERT_TRUE(cbm_zova_vector_read_is_enabled());
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
+    ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_AUTHORITY);
+    ASSERT_TRUE(cbm_zova_graph_read_is_enabled());
+    ASSERT_TRUE(cbm_zova_vector_read_is_enabled());
     cbm_unsetenv("CBM_ZOVA_MODE");
+    ASSERT_TRUE(cbm_zova_vector_read_is_enabled());
     PASS();
 }
 
@@ -368,15 +581,36 @@ TEST(zova_workspace_scoped_names_and_node_ids_are_deterministic) {
               0);
     ASSERT_NEQ(strcmp(node_id, changed_node_id), 0);
     ASSERT_TRUE(strncmp(node_id, "n:v1:w1_0123456789abcdef0123456789abcdef:", 40) == 0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v2(
+                  workspace_id, "Variable", "src/main.c", "", "owner:main|local:item|span:8:8",
+                  node_id, sizeof(node_id)), 0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v2(
+                  workspace_id, "Variable", "src/main.c", "", "owner:main|local:item|span:8:8",
+                  changed_node_id, sizeof(changed_node_id)), 0);
+    ASSERT_STR_EQ(node_id, changed_node_id);
+    ASSERT_TRUE(strncmp(node_id, "n:v2:", 5) == 0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v2(
+                  workspace_id, "Variable", "src/main.c", "", "owner:other|local:item|span:8:8",
+                  changed_node_id, sizeof(changed_node_id)), 0);
+    ASSERT_NEQ(strcmp(node_id, changed_node_id), 0);
+    ASSERT_EQ(cbm_zova_workspace_node_id_v2(workspace_id, "Variable", "src/main.c", "", "",
+                                             changed_node_id, sizeof(changed_node_id)), -1);
     PASS();
 }
 
 TEST(zova_workspace_registry_path_uses_cache_dir) {
     char path[TZ_PATH_MAX] = {0};
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
     cbm_setenv("CBM_CACHE_DIR", "/tmp/cbm-zova-workspace-cache", 1);
     ASSERT_EQ(cbm_zova_workspace_registry_path(path, sizeof(path)), 0);
     ASSERT_STR_EQ(path, "/tmp/cbm-zova-workspace-cache/cbm.zova");
-    cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_copy);
     PASS();
 }
 
@@ -517,6 +751,67 @@ TEST(zova_i8_direct_vectors_do_not_read_sqlite_vector_rows) {
     PASS();
 }
 
+TEST(zova_default_authority_writes_and_reads_direct_vectors) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+
+    ASSERT_EQ(build_direct_fixture_sidecar(&fx), 0);
+
+    cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(fx.zova_path);
+    ASSERT_NOT_NULL(session);
+    cbm_zova_node_candidate_t *candidates = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_zova_vector_session_prefetch_nodes_ex(
+                  session, "proj", fx.alpha_vec, TZ_VEC_DIM, 2, false, &candidates, &count, NULL),
+              0);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(candidates[0].node_id, fx.alpha_id);
+    cbm_zova_node_candidates_free(candidates, count);
+    cbm_zova_vector_session_close(session);
+
+    cbm_store_t *store = cbm_store_open_path(fx.db_path);
+    ASSERT_NOT_NULL(store);
+    const char *keywords[] = {"alpha"};
+    cbm_vector_result_t *results = NULL;
+    int result_count = 0;
+    cbm_vector_search_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_store_vector_search_ex(store, "proj", keywords, 1, 2, &results, &result_count,
+                                         &metrics),
+              CBM_STORE_OK);
+    ASSERT_EQ(result_count, 2);
+    ASSERT_TRUE(metrics.used_zova);
+    cbm_store_free_vector_results(results, result_count);
+    cbm_store_close(store);
+    cleanup_fixture(&fx);
+    PASS();
+}
+
+TEST(zova_authority_rollback_uses_sqlite) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    ASSERT_EQ(build_direct_fixture_sidecar(&fx), 0);
+
+    cbm_store_t *store = cbm_store_open_path(fx.db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+    const char *keywords[] = {"alpha"};
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    cbm_vector_search_metrics_t metrics = {0};
+    ASSERT_EQ(cbm_store_vector_search_ex(store, "proj", keywords, 1, 2, &results, &count,
+                                         &metrics),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_FALSE(metrics.used_zova);
+    cbm_store_free_vector_results(results, count);
+    cbm_store_close(store);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
 TEST(zova_workspace_registry_preserves_ready_generation) {
     char registry_path[TZ_PATH_MAX];
     snprintf(registry_path, sizeof(registry_path), "%s/cbm_workspace_registry_%d_%p.zova",
@@ -625,6 +920,96 @@ TEST(zova_sidecar_generation_matches_source_and_ready_workspace) {
 #endif
 }
 
+TEST(zova_sidecar_schema_and_integrity_record_matches_generation) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
+                  fx.db_path, "/tmp/proj", "proj", NULL, 0, NULL, 0, TZ_VEC_DIM),
+              0);
+
+    int64_t generation = 0;
+    int64_t schema_version = 0;
+    int64_t metadata_projection_version = 0;
+    int64_t edge_projection_version = 0;
+    int64_t integrity_generation = 0;
+    int64_t graph_nodes = 0;
+    int64_t graph_edges = 0;
+    int64_t metadata_nodes = 0;
+    int64_t metadata_edges = 0;
+    int64_t metadata_topology_edges = 0;
+    int64_t fts_rows = 0;
+    ASSERT_EQ(cbm_zova_sidecar_generation_get(fx.zova_path, &generation), 0);
+    ASSERT_EQ(zova_scalar_int64(fx.zova_path,
+                                "SELECT schema_version FROM cbm_zova_schema_v1 WHERE id = 1",
+                                &schema_version),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT metadata_projection_version FROM cbm_zova_schema_v1 WHERE id = 1",
+                  &metadata_projection_version),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT edge_metadata_projection_version FROM cbm_zova_schema_v1 WHERE id = 1",
+                  &edge_projection_version),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT generation FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &integrity_generation),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT graph_nodes FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &graph_nodes),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT graph_edges FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &graph_edges),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT metadata_nodes FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &metadata_nodes),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT metadata_edges FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &metadata_edges),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT metadata_topology_edges FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &metadata_topology_edges),
+              0);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT fts_rows FROM cbm_zova_generation_integrity_v1 LIMIT 1",
+                  &fts_rows),
+              0);
+
+    ASSERT_EQ(schema_version, 1);
+    ASSERT_EQ(metadata_projection_version, 1);
+    ASSERT_EQ(edge_projection_version, 1);
+    ASSERT_EQ(integrity_generation, generation);
+    ASSERT_EQ(graph_nodes, 3);
+    ASSERT_EQ(graph_edges, 1);
+    ASSERT_EQ(metadata_nodes, 3);
+    ASSERT_EQ(metadata_edges, 1);
+    ASSERT_EQ(metadata_topology_edges, 1);
+    ASSERT_EQ(fts_rows, 4);
+
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+#endif
+}
+
 TEST(zova_sidecar_failure_falls_back_until_a_ready_rebuild) {
 #if !CBM_WITH_ZOVA
     PASS();
@@ -681,6 +1066,7 @@ TEST(zova_sidecar_failure_falls_back_until_a_ready_rebuild) {
                                         &visit_count, &metrics),
               CBM_STORE_NOT_FOUND);
     ASSERT_TRUE(metrics.fallback);
+    ASSERT_TRUE(metrics.generation_mismatch);
     cbm_zova_graph_visits_free(visits, visit_count);
 
     ASSERT_EQ(cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
@@ -771,6 +1157,7 @@ TEST(zova_direct_sidecar_fault_phases_preserve_ready_read_boundary) {
                                             &visit_count, &graph_metrics),
                   CBM_STORE_NOT_FOUND);
         ASSERT_TRUE(graph_metrics.fallback);
+        ASSERT_TRUE(graph_metrics.generation_mismatch);
         cbm_zova_graph_visits_free(visits, visit_count);
 
         const char *keywords[] = {"alpha"};
@@ -781,6 +1168,7 @@ TEST(zova_direct_sidecar_fault_phases_preserve_ready_read_boundary) {
                                              &result_count, &vector_metrics),
                   CBM_STORE_OK);
         ASSERT_FALSE(vector_metrics.used_zova);
+        ASSERT_TRUE(vector_metrics.generation_mismatch);
         cbm_store_free_vector_results(results, result_count);
         cbm_node_free_fields(&alpha);
         cbm_store_close(store);
@@ -1050,11 +1438,18 @@ TEST(zova_workspace_graph_mirror_is_project_scoped_and_matches_callers) {
     ASSERT_EQ(projection_count, 1);
     ASSERT_EQ(zova_scalar_int64(
                   fx.zova_path,
+                  "SELECT count(*) FROM cbm_zova_edge_metadata_v1 "
+                  "WHERE workspace_id = 'w1_0123456789abcdef0123456789abcdef'",
+                  &projection_count),
+              0);
+    ASSERT_EQ(projection_count, 1);
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
                   "SELECT count(*) FROM pragma_table_info('cbm_zova_trace_nodes_v1') "
                   "WHERE name = 'properties'",
                   &projection_count),
               0);
-    ASSERT_EQ(projection_count, 0);
+    ASSERT_EQ(projection_count, 1);
 
     zova_database *db = NULL;
     zova_message err = {0};
@@ -1166,6 +1561,8 @@ TEST(zova_graph_session_hydrates_scoped_directional_walk) {
     ASSERT_EQ(count, 1);
     ASSERT_STR_EQ(visits[0].node_id, beta_node_id);
     ASSERT_STR_EQ(visits[0].name, "Beta");
+    ASSERT_NOT_NULL(visits[0].properties);
+    ASSERT_STR_EQ(visits[0].properties, "{}");
     ASSERT_EQ(visits[0].hop, 1);
     ASSERT_FALSE(metrics.fallback);
     ASSERT_TRUE(metrics.native_profiled);
@@ -1173,6 +1570,32 @@ TEST(zova_graph_session_hydrates_scoped_directional_walk) {
     ASSERT_GT(metrics.frontier_expansions, 0);
     cbm_unsetenv("CBM_ZOVA_GRAPH_PROFILE");
     cbm_zova_graph_visits_free(visits, count);
+
+    const char *call_types[] = {"CALLS"};
+    cbm_zova_graph_adjacency_t *adjacency = NULL;
+    int adjacency_count = 0;
+    ASSERT_EQ(cbm_zova_graph_session_adjacency(
+                  session, workspace_id, graph_name, alpha_node_id, "outbound", call_types, 1,
+                  10, &adjacency, &adjacency_count), 0);
+    ASSERT_EQ(adjacency_count, 1);
+    ASSERT_STR_EQ(adjacency[0].source_node_id, alpha_node_id);
+    ASSERT_STR_EQ(adjacency[0].target_node_id, beta_node_id);
+    ASSERT_STR_EQ(adjacency[0].edge_type, "CALLS");
+    ASSERT_NOT_NULL(adjacency[0].properties);
+    cbm_zova_graph_adjacency_free(adjacency, adjacency_count);
+    ASSERT_EQ(cbm_zova_graph_session_adjacency_prepare_count(session), 1);
+    adjacency = NULL;
+    adjacency_count = 0;
+    ASSERT_EQ(cbm_zova_graph_session_adjacency(
+                  session, workspace_id, graph_name, beta_node_id, "inbound", call_types, 1,
+                  10, &adjacency, &adjacency_count), 0);
+    ASSERT_EQ(adjacency_count, 1);
+    ASSERT_EQ(cbm_zova_graph_session_adjacency_prepare_count(session), 1);
+    cbm_zova_graph_adjacency_free(adjacency, adjacency_count);
+    int native_degree = -1;
+    ASSERT_EQ(cbm_zova_graph_session_degree(session, workspace_id, graph_name, alpha_node_id,
+                                             "both", call_types, 1, &native_degree), 0);
+    ASSERT_EQ(native_degree, 1);
 
     visits = NULL;
     count = 0;
@@ -1195,8 +1618,8 @@ TEST(zova_graph_session_hydrates_scoped_directional_walk) {
     ASSERT_TRUE(cbm_file_exists(fx.zova_path));
     cbm_node_t alpha = {0};
     ASSERT_EQ(cbm_store_find_node_by_id(store, fx.alpha_id, &alpha), CBM_STORE_OK);
-    /* Unset mode is the graph-read default. Keep the parser at OFF so this
-     * promotion does not also make the vector experiment the default. */
+    /* Unset mode keeps the legacy parser value OFF while both graph and vector
+     * reads use the ready Zova sidecar by default. */
     cbm_unsetenv("CBM_ZOVA_MODE");
     ASSERT_EQ(cbm_zova_mode_from_env(), CBM_ZOVA_MODE_OFF);
     ASSERT_TRUE(cbm_zova_graph_read_is_enabled());
@@ -1251,7 +1674,7 @@ TEST(zova_direct_workspace_graph_uses_finalized_dump_arrays) {
          .file_path = "direct/root.c",
          .start_line = 1,
          .end_line = 2,
-         .properties = "{}"},
+         .properties = "{\"source\":\"direct\"}"},
         {.id = 2,
          .project = "direct-proj",
          .label = "Function",
@@ -1260,7 +1683,7 @@ TEST(zova_direct_workspace_graph_uses_finalized_dump_arrays) {
          .file_path = "direct/leaf.c",
          .start_line = 3,
          .end_line = 4,
-         .properties = "{}"},
+         .properties = "{\"source\":\"direct\",\"kind\":\"leaf\"}"},
     };
     const CBMDumpEdge edges[] = {
         {.id = 1,
@@ -1268,13 +1691,29 @@ TEST(zova_direct_workspace_graph_uses_finalized_dump_arrays) {
          .source_id = 1,
          .target_id = 2,
          .type = "CALLS",
-         .properties = "{}",
+         .properties = "{\"kind\":\"call\"}",
+         .url_path = "",
+         .local_name = ""},
+        {.id = 2,
+         .project = "direct-proj",
+         .source_id = 1,
+         .target_id = 2,
+         .type = "CALLS",
+         .properties = "{\"kind\":\"call\"}",
          .url_path = "",
          .local_name = ""},
     };
     ASSERT_EQ(cbm_zova_write_workspace_graph_direct(fx.zova_path, workspace_id, "direct-proj",
-                                                     nodes, 2, edges, 1),
+                                                     nodes, 2, edges, 2),
               0);
+    int64_t edge_metadata_count = 0;
+    ASSERT_EQ(zova_scalar_int64(
+                  fx.zova_path,
+                  "SELECT count(*) FROM cbm_zova_edge_metadata_v1 "
+                  "WHERE json_extract(properties,'$.kind') = 'call'",
+                  &edge_metadata_count),
+              0);
+    ASSERT_EQ(edge_metadata_count, 1);
 
     cbm_zova_graph_session_t *session = cbm_zova_graph_session_open(fx.zova_path);
     ASSERT_NOT_NULL(session);
@@ -1287,6 +1726,7 @@ TEST(zova_direct_workspace_graph_uses_finalized_dump_arrays) {
     ASSERT_EQ(count, 1);
     ASSERT_STR_EQ(visits[0].node_id, leaf_id);
     ASSERT_STR_EQ(visits[0].name, "DirectLeaf");
+    ASSERT_STR_EQ(visits[0].properties, "{\"source\":\"direct\",\"kind\":\"leaf\"}");
     cbm_zova_graph_visits_free(visits, count);
     cbm_zova_graph_session_close(session);
 
@@ -1454,6 +1894,8 @@ TEST(zova_direct_workspace_lifecycle_isolates_replace_rollback_and_delete) {
 
     int64_t a_projection_count = -1;
     int64_t b_projection_count = -1;
+    int64_t a_edge_metadata_count = -1;
+    int64_t b_edge_metadata_count = -1;
     ASSERT_EQ(zova_scalar_int64(fx.zova_path,
                                 "SELECT count(*) FROM cbm_zova_trace_nodes_v1 "
                                 "WHERE workspace_id = 'wa_0123456789abcdef0123456789abcdef'",
@@ -1464,8 +1906,20 @@ TEST(zova_direct_workspace_lifecycle_isolates_replace_rollback_and_delete) {
                                 "WHERE workspace_id = 'wb_0123456789abcdef0123456789abcdef'",
                                 &b_projection_count),
               0);
+    ASSERT_EQ(zova_scalar_int64(fx.zova_path,
+                                "SELECT count(*) FROM cbm_zova_edge_metadata_v1 "
+                                "WHERE workspace_id = 'wa_0123456789abcdef0123456789abcdef'",
+                                &a_edge_metadata_count),
+              0);
+    ASSERT_EQ(zova_scalar_int64(fx.zova_path,
+                                "SELECT count(*) FROM cbm_zova_edge_metadata_v1 "
+                                "WHERE workspace_id = 'wb_0123456789abcdef0123456789abcdef'",
+                                &b_edge_metadata_count),
+              0);
     ASSERT_EQ(a_projection_count, 0);
     ASSERT_EQ(b_projection_count, 2);
+    ASSERT_EQ(a_edge_metadata_count, 0);
+    ASSERT_EQ(b_edge_metadata_count, 1);
 
     cleanup_fixture(&fx);
     cbm_unsetenv("CBM_ZOVA_MODE");
@@ -1716,6 +2170,13 @@ TEST(zova_gbuf_sidecar_uses_retained_finalized_topology) {
     cbm_unlink(db_path);
     cbm_unlink(zova_path);
 
+    char cache_path[TZ_PATH_MAX];
+    snprintf(cache_path, sizeof(cache_path), "%s/cbm-zova-gbuf-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache_path));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
+
     const char *project = "gbuf-direct";
     const char *root_path = "/tmp/gbuf-direct";
     cbm_gbuf_t *gb = cbm_gbuf_new(project, root_path);
@@ -1739,15 +2200,57 @@ TEST(zova_gbuf_sidecar_uses_retained_finalized_topology) {
 
     cbm_unsetenv("CBM_ZOVA_MODE");
     ASSERT_EQ(cbm_gbuf_finalize_zova_sidecar(gb, db_path), 0);
+    /* The SQLite dump and user-local publication must share one generation
+     * timestamp; a delay makes accidental regeneration in the publisher
+     * observable instead of relying on wall-clock second coincidence. */
+    sleep(2);
+    cbm_zova_workspace_generation_result_t user_result = {0};
+    ASSERT_EQ(cbm_gbuf_publish_zova_user_database(gb, NULL, 0, NULL, &user_result), 0);
+
+    char user_database_path[TZ_PATH_MAX];
+    ASSERT_EQ(cbm_zova_workspace_registry_path(user_database_path,
+                                                sizeof(user_database_path)), 0);
+    int64_t user_generation = 0;
+    char user_sql[512];
+    snprintf(user_sql, sizeof(user_sql),
+             "SELECT generation FROM cbm_workspace_index_state_v1 WHERE generation > 0");
+    ASSERT_EQ(zova_scalar_int64(user_database_path, user_sql, &user_generation), 0);
+    ASSERT_EQ(user_generation, 1);
 
     char registry_path[TZ_PATH_MAX];
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
-    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
-    char root_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
     ASSERT_EQ(cbm_zova_workspace_registry_path(registry_path, sizeof(registry_path)), 0);
     ASSERT_EQ(cbm_zova_workspace_lookup_at(registry_path, root_path, workspace_id,
                                             sizeof(workspace_id)),
               0);
+    sqlite3 *source_db = NULL;
+    sqlite3 *user_db = NULL;
+    sqlite3_stmt *source_stmt = NULL;
+    sqlite3_stmt *user_stmt = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db_path, &source_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_open_v2(user_database_path, &user_db, SQLITE_OPEN_READONLY, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(source_db, "SELECT indexed_at FROM projects WHERE name=?1", -1,
+                                 &source_stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(source_stmt), SQLITE_ROW);
+    const char *source_indexed_at = (const char *)sqlite3_column_text(source_stmt, 0);
+    ASSERT_NOT_NULL(source_indexed_at);
+    char source_indexed_copy[64];
+    snprintf(source_indexed_copy, sizeof(source_indexed_copy), "%s", source_indexed_at);
+    ASSERT_EQ(sqlite3_prepare_v2(user_db,
+                                 "SELECT indexed_at FROM cbm_projects_v1 WHERE workspace_id=?1",
+                                 -1, &user_stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(user_stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(user_stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(user_stmt, 0), source_indexed_copy);
+    sqlite3_finalize(source_stmt);
+    sqlite3_finalize(user_stmt);
+    sqlite3_close(source_db);
+    sqlite3_close(user_db);
+
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    char root_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
     ASSERT_EQ(cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)), 0);
     ASSERT_EQ(cbm_zova_workspace_node_id_v1(workspace_id, "Function", "root.c", "direct.Root",
                                              "named", root_id, sizeof(root_id)),
@@ -1767,6 +2270,20 @@ TEST(zova_gbuf_sidecar_uses_retained_finalized_topology) {
     cbm_gbuf_free(gb);
     cbm_unlink(zova_path);
     cbm_unlink(db_path);
+    cbm_unlink(user_database_path);
+    char user_wal[TZ_PATH_MAX];
+    char user_shm[TZ_PATH_MAX];
+    snprintf(user_wal, sizeof(user_wal), "%s-wal", user_database_path);
+    snprintf(user_shm, sizeof(user_shm), "%s-shm", user_database_path);
+    cbm_unlink(user_wal);
+    cbm_unlink(user_shm);
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
     PASS();
 #endif
 }
@@ -1849,21 +2366,1112 @@ TEST(zova_i8_vector_benchmark_smoke_report) {
     PASS();
 }
 
+TEST(zova_sqlite_schema_inventory_has_migration_coverage) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    ASSERT_EQ(cbm_zova_after_sqlite_dump(fx.db_path), 0);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open_v2(fx.db_path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    const char *required[] = {
+        "projects", "file_hashes", "nodes", "edges", "project_summaries",
+        "node_vectors", "token_vectors", "nodes_fts", "cbm_zova_sidecar_generation_v1",
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        sqlite3_stmt *stmt = NULL;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      db,
+                      "SELECT count(*) FROM sqlite_master WHERE name = ?1 AND "
+                      "type IN ('table','view')",
+                      -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_text(stmt, 1, required[i], -1, SQLITE_STATIC), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_user_database_bootstrap_creates_versioned_workspace_schema) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-user-schema-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+
+    ASSERT_EQ(cbm_zova_user_database_init(path), 0);
+    /* Bootstrap is intentionally idempotent so a restarted migration can
+     * safely resume without replacing the existing user-local database. */
+    ASSERT_EQ(cbm_zova_user_database_init(path), 0);
+
+    const char *required[] = {
+        "cbm_database_schema_v1", "cbm_workspace_registry", "cbm_workspace_generations",
+        "cbm_database_generation_v1", "cbm_projects_v1", "cbm_nodes_v1", "cbm_edges_v1",
+        "cbm_file_hashes_v1", "cbm_project_summaries_v1", "cbm_generation_integrity_v1",
+        "cbm_node_vectors_compat_v1", "cbm_token_vectors_compat_v1", "cbm_nodes_fts_v1",
+        "cbm_workspace_index_state_v1", "cbm_fts_rowmap_v1", "cbm_project_summaries_v2",
+        "cbm_generation_integrity_v2", "cbm_workspace_migrations_v1",
+    };
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        sqlite3_stmt *stmt = NULL;
+        ASSERT_EQ(sqlite3_prepare_v2(
+                      db,
+                      "SELECT count(*) FROM sqlite_master WHERE name = ?1 AND "
+                      "type IN ('table','virtual table')",
+                      -1, &stmt, NULL),
+                  SQLITE_OK);
+        ASSERT_EQ(sqlite3_bind_text(stmt, 1, required[i], -1, SQLITE_STATIC), SQLITE_OK);
+        ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+        ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+        sqlite3_finalize(stmt);
+    }
+    sqlite3_close(db);
+
+    int64_t schema_version = 0;
+    ASSERT_EQ(zova_scalar_int64(path, "SELECT schema_version FROM cbm_database_schema_v1 WHERE id = 1",
+                                &schema_version),
+              0);
+    ASSERT_EQ(schema_version, CBM_ZOVA_DATABASE_SCHEMA_VERSION);
+
+    ASSERT_EQ(sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db, "PRAGMA foreign_keys=ON", NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_stmt *fk_stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  db,
+                  "SELECT count(*) FROM pragma_foreign_key_list('cbm_edges_v1') "
+                  "WHERE \"table\"='cbm_nodes_v1'",
+                  -1, &fk_stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(fk_stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(fk_stmt, 0), 4);
+    sqlite3_finalize(fk_stmt);
+    ASSERT_EQ(sqlite3_exec(
+                  db,
+                  "INSERT INTO cbm_workspace_registry(workspace_id,canonical_root,id_format_version) "
+                  "VALUES('workspace_A','/tmp/a',1),('workspace_B','/tmp/b',1);"
+                  "INSERT INTO cbm_nodes_v1(workspace_id,node_id,project,label,name,qualified_name,"
+                  "file_path,start_line,end_line) VALUES"
+                  "('workspace_A','node_A','p','Function','a','p.a','a.c',1,1),"
+                  "('workspace_B','node_B','p','Function','b','p.b','b.c',1,1);",
+                  NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_NEQ(sqlite3_exec(
+                   db,
+                   "INSERT INTO cbm_edges_v1(workspace_id,edge_id,source_node_id,target_node_id,"
+                   "edge_type) VALUES('workspace_A','edge_bad','node_A','node_B','CALLS')",
+                   NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db, "PRAGMA foreign_key_check", NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(db);
+    zova_database *zdb = NULL;
+    zova_message zerr = {0};
+    ASSERT_EQ(zova_database_open(&(zova_database_open_request){
+                  .path=path,.out_db=&zdb,.out_error_message=&zerr}), ZOVA_OK);
+    zova_message_free(&zerr);
+    ASSERT_EQ(zova_database_exec(&(zova_database_exec_request){
+                  .db=zdb,.sql="PRAGMA foreign_keys=ON"}), ZOVA_OK);
+    ASSERT_EQ(cbm_zova_user_database_verify_workspace_schema(zdb), 0);
+    ASSERT_EQ(zova_database_close(zdb), ZOVA_OK);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_user_database_fts_table_name_is_scoped_and_validated) {
+    char name[CBM_ZOVA_WORKSPACE_ID_MAX + 32] = {0};
+    ASSERT_EQ(cbm_zova_workspace_fts_table_name("w1_abc123", name, sizeof(name)), 0);
+    ASSERT_STR_EQ(name, "cbm_fts_w1_abc123");
+    ASSERT_EQ(cbm_zova_workspace_fts_table_name("w1_bad-name", name, sizeof(name)), -1);
+    ASSERT_EQ(cbm_zova_workspace_fts_table_name("", name, sizeof(name)), -1);
+    ASSERT_EQ(cbm_zova_workspace_fts_table_name("w1_abc123", name, 8), -1);
+    PASS();
+}
+
+TEST(zova_user_database_generation_state_commits_and_rolls_back) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-user-generation-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
+    ASSERT_EQ(cbm_zova_user_database_generation_begin(
+                  path, "/tmp/cbm-user-generation-project", 1, workspace_id,
+                  sizeof(workspace_id)),
+              0);
+    ASSERT_TRUE(workspace_id[0] != '\0');
+    char state[16] = {0};
+    ASSERT_EQ(zova_generation_state(path, workspace_id, 1, state, sizeof(state)), 0);
+    ASSERT_STR_EQ(state, "building");
+
+    ASSERT_EQ(cbm_zova_user_database_generation_finish(path, workspace_id, 1, true), 0);
+    ASSERT_EQ(zova_generation_state(path, workspace_id, 1, state, sizeof(state)), 0);
+    ASSERT_STR_EQ(state, "ready");
+    int64_t active_generation = 0;
+    ASSERT_EQ(cbm_zova_workspace_active_generation_at(path, workspace_id, &active_generation), 0);
+    ASSERT_EQ(active_generation, 1);
+
+    ASSERT_EQ(cbm_zova_user_database_generation_begin(
+                  path, "/tmp/cbm-user-generation-project", 2, workspace_id,
+                  sizeof(workspace_id)),
+              0);
+    ASSERT_EQ(cbm_zova_user_database_generation_finish(path, workspace_id, 2, false), 0);
+    ASSERT_EQ(zova_generation_state(path, workspace_id, 2, state, sizeof(state)), 0);
+    ASSERT_STR_EQ(state, "failed");
+    ASSERT_EQ(cbm_zova_workspace_active_generation_at(path, workspace_id, &active_generation), 0);
+    ASSERT_EQ(active_generation, 1);
+
+    /* A generation can only transition once from building; a failed/ready
+     * generation cannot be silently rewritten by a finishing call. */
+    ASSERT_EQ(cbm_zova_user_database_generation_finish(path, workspace_id, 2, true), -1);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_sql_capability_probe_covers_workspace_metadata_and_sql_surface) {
+    zova_fixture_t fx;
+    ASSERT_EQ(create_fixture(&fx), 0);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    ASSERT_EQ(build_direct_fixture_sidecar(&fx), 0);
+
+    cbm_zova_sql_capabilities_t capabilities = {0};
+    ASSERT_EQ(cbm_zova_probe_sql_capabilities(fx.zova_path, &capabilities), 0);
+    ASSERT_TRUE(capabilities.workspace_metadata_projection);
+    ASSERT_TRUE(capabilities.fts5);
+    ASSERT_TRUE(capabilities.bm25);
+    ASSERT_TRUE(capabilities.json);
+    ASSERT_TRUE(capabilities.recursive_cte);
+    ASSERT_TRUE(capabilities.transactions);
+    ASSERT_TRUE(capabilities.cbm_scalar_functions);
+
+    ASSERT_EQ(cbm_zova_probe_sql_capabilities("/tmp/does-not-exist-cbm.zova", &capabilities), -1);
+    cleanup_fixture(&fx);
+    cbm_unsetenv("CBM_ZOVA_MODE");
+    PASS();
+}
+
+TEST(zova_user_database_capability_probe_covers_empty_schema_surface) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-user-capabilities-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+
+    ASSERT_EQ(cbm_zova_user_database_init(path), 0);
+    cbm_zova_sql_capabilities_t capabilities = {0};
+    ASSERT_EQ(cbm_zova_probe_sql_capabilities(path, &capabilities), 0);
+    ASSERT_TRUE(capabilities.workspace_metadata_projection);
+    ASSERT_TRUE(capabilities.fts5);
+    ASSERT_TRUE(capabilities.bm25);
+    ASSERT_TRUE(capabilities.json);
+    ASSERT_TRUE(capabilities.recursive_cte);
+    ASSERT_TRUE(capabilities.transactions);
+    ASSERT_TRUE(capabilities.cbm_scalar_functions);
+
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_user_database_imports_workspace_metadata_and_fts) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-user-import-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+
+    const CBMDumpNode nodes[] = {
+        {.id = 1,
+         .project = "proj",
+         .label = "Function",
+         .name = "AlphaBeta",
+         .qualified_name = "proj.AlphaBeta",
+         .file_path = "src/alpha.c",
+         .start_line = 3,
+         .end_line = 8,
+         .properties = "{\"risk\":2}"},
+        {.id = 2,
+         .project = "proj",
+         .label = "Function",
+         .name = "Helper",
+         .qualified_name = "proj.Helper",
+         .file_path = "src/helper.c",
+         .start_line = 10,
+         .end_line = 12,
+         .properties = "{}"},
+    };
+    const CBMDumpEdge edges[] = {
+        {.id = 1,
+         .project = "proj",
+         .source_id = 1,
+         .target_id = 2,
+         .type = "CALLS",
+         .properties = "{\"weight\":1}",
+         .url_path = "",
+         .local_name = ""},
+    };
+
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/user-import-a", "proj", 1,
+                                                       nodes, 2, edges, 1),
+              0);
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/user-import-a", "proj", 2,
+                                                       nodes, 2, edges, 1),
+              0);
+    cbm_zova_graph_session_t *generation_session = cbm_zova_graph_session_open(path);
+    ASSERT_NOT_NULL(generation_session);
+    int64_t session_generation = 0;
+    ASSERT_EQ(cbm_zova_graph_session_generation(generation_session, &session_generation), 0);
+    ASSERT_EQ(session_generation, 2);
+    cbm_zova_graph_session_close(generation_session);
+
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
+    ASSERT_EQ(cbm_zova_workspace_lookup_at(path, "/tmp/user-import-a", workspace_id,
+                                            sizeof(workspace_id)),
+              0);
+    cbm_store_t *workspace_store = cbm_store_open_zova_workspace_query(path, workspace_id);
+    ASSERT_NOT_NULL(workspace_store);
+    sqlite3_stmt *cache_size_stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(workspace_store), "PRAGMA cache_size", -1,
+                                 &cache_size_stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(cache_size_stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(cache_size_stmt, 0), -262144);
+    sqlite3_finalize(cache_size_stmt);
+    cbm_search_output_t workspace_search = {0};
+    cbm_search_params_t workspace_params = {.project = "proj", .min_degree = -1,
+                                             .max_degree = -1, .limit = 20};
+    (void)cbm_store_search(workspace_store, &workspace_params, &workspace_search);
+    if (workspace_search.count != 2) fprintf(stderr, "workspace search error: %s\n", cbm_store_error(workspace_store));
+    ASSERT_EQ(workspace_search.count, 2);
+    cbm_store_search_free(&workspace_search);
+    cbm_cypher_result_t workspace_cypher = {0};
+    ASSERT_EQ(cbm_cypher_execute(workspace_store,
+              "MATCH (n) WHERE n.name IS NOT NULL RETURN n.name ORDER BY n.name", "proj", 20,
+              &workspace_cypher), 0);
+    ASSERT_EQ(workspace_cypher.row_count, 2);
+    cbm_cypher_result_free(&workspace_cypher);
+    cbm_store_close(workspace_store);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    int64_t count = 0;
+    char sql[512];
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'", workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM cbm_edges_v1 WHERE workspace_id='%s'", workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM cbm_nodes_fts_v1 WHERE workspace_id='%s' "
+             "AND cbm_nodes_fts_v1 MATCH 'Alpha'",
+             workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+
+    /* A failed replacement must roll back the clear-and-rewrite transaction,
+     * leaving generation 2's rows available. */
+    cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", "user_after_nodes", 1);
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/user-import-a", "proj", 3,
+                                                       nodes, 2, edges, 1),
+              -1);
+    cbm_unsetenv("CBM_ZOVA_TEST_FAIL_PHASE");
+    snprintf(sql, sizeof(sql),
+             "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'", workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+
+    /* Reusing the same numeric dump ids for another workspace must not cause
+     * metadata or FTS rows to collide. */
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/user-import-b", "proj-b", 1,
+                                                       nodes, 2, edges, 1),
+              0);
+    char workspace_b[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
+    ASSERT_EQ(cbm_zova_workspace_lookup_at(path, "/tmp/user-import-b", workspace_b,
+                                            sizeof(workspace_b)),
+              0);
+    ASSERT_TRUE(strcmp(workspace_id, workspace_b) != 0);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             workspace_b);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+
+    /* Replacing workspace A must leave workspace B untouched. */
+    const CBMDumpNode replacement_nodes[] = {nodes[0]};
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/user-import-a", "proj", 4,
+                                                       replacement_nodes, 1, NULL, 0),
+              0);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             workspace_b);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    sqlite3_close(db);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_user_database_delete_workspace_is_isolated_and_idempotent) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-user-delete-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+    const CBMDumpNode a[] = {{.id=1,.project="shared",.label="Function",.name="same",
+        .qualified_name="shared.sameA",.file_path="same.c",.start_line=1,.end_line=2,
+        .properties="{}"}};
+    const CBMDumpNode b[] = {{.id=1,.project="shared_b",.label="Function",.name="same",
+        .qualified_name="shared.sameB",.file_path="same.c",.start_line=1,.end_line=2,
+        .properties="{}"}};
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/delete-a", "shared", 1,
+                                                       a, 1, NULL, 0), 0);
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(path, "/tmp/delete-b", "shared_b", 1,
+                                                       b, 1, NULL, 0), 0);
+    cbm_zova_repository_t *repo_a = cbm_zova_repository_open(path, "shared");
+    cbm_zova_repository_t *repo_b = cbm_zova_repository_open(path, "shared_b");
+    ASSERT_NOT_NULL(repo_a); ASSERT_NOT_NULL(repo_b);
+    char workspace_a[CBM_ZOVA_WORKSPACE_ID_MAX];
+    snprintf(workspace_a, sizeof(workspace_a), "%s", cbm_zova_repository_workspace_id(repo_a));
+    char workspace_b[CBM_ZOVA_WORKSPACE_ID_MAX];
+    snprintf(workspace_b, sizeof(workspace_b), "%s", cbm_zova_repository_workspace_id(repo_b));
+    cbm_zova_repository_close(repo_a); cbm_zova_repository_close(repo_b);
+    ASSERT_EQ(cbm_zova_user_database_delete_workspace(path, workspace_a), 0);
+    ASSERT_NULL(cbm_zova_repository_open(path, "shared"));
+    repo_b = cbm_zova_repository_open(path, "shared_b");
+    ASSERT_NOT_NULL(repo_b);
+    ASSERT_STR_EQ(cbm_zova_repository_workspace_id(repo_b), workspace_b);
+    cbm_zova_repository_close(repo_b);
+    ASSERT_EQ(cbm_zova_user_database_delete_workspace(path, workspace_a), 0);
+    ASSERT_EQ(cbm_zova_user_database_delete_workspace(path, "bad-id"), -1);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_atomic_workspace_publisher_commits_complete_generation) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-atomic-publish-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+    const CBMDumpNode nodes[] = {
+        {.id = 1, .project = "atomic", .label = "Function", .name = "Root",
+         .qualified_name = "atomic.Root", .file_path = "root.c", .properties = "{}"},
+        {.id = 2, .project = "atomic", .label = "Function", .name = "Leaf",
+         .qualified_name = "atomic.Leaf", .file_path = "leaf.c", .properties = "{\"risk\":1}"},
+    };
+    const CBMDumpEdge edges[] = {
+        {.id = 1, .project = "atomic", .source_id = 1, .target_id = 2, .type = "CALLS",
+         .properties = "{}", .url_path = "", .local_name = ""},
+    };
+    const int8_t root_vec[] = {127, 0};
+    const int8_t leaf_vec[] = {0, 127};
+    const CBMDumpVector vectors[] = {
+        {.node_id = 1, .project = "atomic", .vector = (const uint8_t *)root_vec, .vector_len = 2},
+        {.node_id = 2, .project = "atomic", .vector = (const uint8_t *)leaf_vec, .vector_len = 2},
+    };
+    const CBMDumpTokenVec tokens[] = {
+        {.id = 1, .project = "atomic", .token = "root", .vector = (const uint8_t *)root_vec,
+         .vector_len = 2, .idf = 1.0f},
+        {.id = 2, .project = "atomic", .token = "leaf", .vector = (const uint8_t *)leaf_vec,
+         .vector_len = 2, .idf = 0.5f},
+    };
+    const cbm_zova_file_hash_input_t hashes[] = {
+        {.file_path = "root.c", .content_hash = "hash-root", .mtime_ns = 1, .size_bytes = 10},
+        {.file_path = "leaf.c", .content_hash = "hash-leaf", .mtime_ns = 2, .size_bytes = 11},
+    };
+    cbm_zova_workspace_generation_input_t input = {
+        .root_path = "/tmp/atomic-publish",
+        .project = "atomic",
+        .indexed_at = "2026-07-12T00:00:00Z",
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = 2,
+        .nodes = nodes,
+        .node_count = 2,
+        .edges = edges,
+        .edge_count = 1,
+        .node_vectors = vectors,
+        .node_vector_count = 2,
+        .token_vectors = tokens,
+        .token_vector_count = 2,
+        .file_hashes = hashes,
+        .file_hash_count = 2,
+        .project_summary = {.present = true, .summary = "atomic summary", .source_hash = "sum-hash",
+                            .created_at = "created", .updated_at = "updated"},
+    };
+    cbm_zova_workspace_generation_result_t result = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &input, &result), 0);
+    ASSERT_TRUE(result.workspace_id[0] != '\0');
+    ASSERT_EQ(result.generation, 1);
+    ASSERT_EQ(result.graph_nodes, 2);
+    ASSERT_EQ(result.graph_edges, 1);
+    ASSERT_EQ(result.metadata_nodes, 2);
+    ASSERT_EQ(result.metadata_edges, 1);
+    ASSERT_EQ(result.fts_rows, 2);
+    ASSERT_EQ(result.node_vectors, 2);
+    ASSERT_EQ(result.token_vectors, 2);
+    cbm_store_t *cypher_store =
+        cbm_store_open_zova_workspace_query(path, result.workspace_id);
+    ASSERT_NOT_NULL(cypher_store);
+    cbm_cypher_result_t native_cypher = {0};
+    ASSERT_EQ(cbm_cypher_execute(cypher_store,
+              "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.name,b.name",
+              "atomic", 20, &native_cypher), 0);
+    ASSERT_EQ(native_cypher.row_count, 1);
+    ASSERT_GT(cbm_store_zova_native_topology_ops(cypher_store), 0);
+    cbm_cypher_result_free(&native_cypher);
+    int topology_before_degree = cbm_store_zova_native_topology_ops(cypher_store);
+    cbm_cypher_result_t degree_cypher = {0};
+    ASSERT_EQ(cbm_cypher_execute(cypher_store,
+              "MATCH (a:Function) RETURN a.name,a.in_degree,a.out_degree ORDER BY a.name",
+              "atomic", 20, &degree_cypher), 0);
+    ASSERT_EQ(degree_cypher.row_count, 2);
+    ASSERT_GT(cbm_store_zova_native_topology_ops(cypher_store), topology_before_degree);
+    cbm_cypher_result_free(&degree_cypher);
+    cbm_store_close(cypher_store);
+    int64_t count = 0;
+    char sql[512];
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_workspace_index_state_v1 WHERE workspace_id='%s' "
+                              "AND generation=1", result.workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_generation_integrity_v2 WHERE workspace_id='%s' "
+                              "AND generation=1", result.workspace_id);
+    ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+
+    const char *fault_phases[] = {
+        "user_after_metadata",     "user_after_fts",       "user_after_graph_nodes",
+        "user_after_graph_edges",  "user_after_node_vectors", "user_after_token_vectors",
+        "user_after_integrity",    "user_before_commit",
+    };
+    for (size_t i = 0; i < sizeof(fault_phases) / sizeof(fault_phases[0]); i++) {
+        cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", fault_phases[i], 1);
+        cbm_zova_workspace_generation_result_t failed = {0};
+        ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &input, &failed), -1);
+        cbm_unsetenv("CBM_ZOVA_TEST_FAIL_PHASE");
+        snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+                 result.workspace_id);
+        ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+        ASSERT_EQ(count, 2);
+        snprintf(sql, sizeof(sql),
+                 "SELECT active_generation FROM cbm_workspace_registry WHERE workspace_id='%s'",
+                 result.workspace_id);
+        ASSERT_EQ(zova_scalar_int64(path, sql, &count), 0);
+        ASSERT_EQ(count, 1);
+    }
+    const CBMDumpNode reordered_nodes[] = {nodes[1], nodes[0]};
+    const CBMDumpEdge reordered_edges[] = {edges[0]};
+    const CBMDumpVector reordered_vectors[] = {vectors[1], vectors[0]};
+    const CBMDumpTokenVec reordered_tokens[] = {tokens[1], tokens[0]};
+    const cbm_zova_file_hash_input_t reordered_hashes[] = {hashes[1], hashes[0]};
+    cbm_zova_workspace_generation_input_t reordered_input = input;
+    reordered_input.nodes = reordered_nodes;
+    reordered_input.edges = reordered_edges;
+    reordered_input.node_vectors = reordered_vectors;
+    reordered_input.token_vectors = reordered_tokens;
+    reordered_input.file_hashes = reordered_hashes;
+    cbm_zova_workspace_generation_result_t replacement = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &reordered_input, &replacement), 0);
+    ASSERT_EQ(replacement.generation, 2);
+    ASSERT_STR_EQ(replacement.metadata_sha256, result.metadata_sha256);
+    ASSERT_STR_EQ(replacement.fts_sha256, result.fts_sha256);
+    ASSERT_STR_EQ(replacement.topology_sha256, result.topology_sha256);
+    ASSERT_STR_EQ(replacement.node_vector_sha256, result.node_vector_sha256);
+    ASSERT_STR_EQ(replacement.token_vector_sha256, result.token_vector_sha256);
+
+    /* A semantic property byte must affect only the metadata digest, while a
+     * raw vector byte must affect only the corresponding vector digest. */
+    CBMDumpNode changed_nodes[2];
+    memcpy(changed_nodes, nodes, sizeof(changed_nodes));
+    changed_nodes[1].properties = "{\"risk\":2}";
+    int8_t changed_leaf_values[] = {1, 126};
+    CBMDumpVector changed_vectors[2];
+    memcpy(changed_vectors, vectors, sizeof(changed_vectors));
+    changed_vectors[1].vector = (const uint8_t *)changed_leaf_values;
+    cbm_zova_workspace_generation_input_t changed_input = input;
+    changed_input.nodes = changed_nodes;
+    changed_input.node_vectors = changed_vectors;
+    cbm_zova_workspace_generation_result_t changed = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &changed_input, &changed), 0);
+    ASSERT_EQ(changed.generation, 3);
+    ASSERT_TRUE(strcmp(changed.metadata_sha256, replacement.metadata_sha256) != 0);
+    ASSERT_STR_EQ(changed.fts_sha256, replacement.fts_sha256);
+    ASSERT_STR_EQ(changed.topology_sha256, replacement.topology_sha256);
+    ASSERT_TRUE(strcmp(changed.node_vector_sha256, replacement.node_vector_sha256) != 0);
+    ASSERT_STR_EQ(changed.token_vector_sha256, replacement.token_vector_sha256);
+    cbm_unlink(path);
+    PASS();
+}
+
+/* Exercise the public native-object APIs inside a caller-owned transaction.
+ * This deliberately uses a separate reader handle and only public graph,
+ * vector, and SQL operations; it must not depend on Zova private tables. */
+static int zova_tx_exec(zova_database *db, const char *sql) {
+    zova_database_exec_request req = {.db = db, .sql = sql};
+    zova_status status = zova_database_exec(&req);
+    if (status != ZOVA_OK) {
+        fprintf(stderr, "zova tx exec failed status=%s sql=%s err=%s\n", zova_status_name(status),
+                sql, zova_database_last_error_message(db));
+    }
+    return status == ZOVA_OK ? 0 : -1;
+}
+
+static int zova_tx_scalar_i64(zova_database *db, const char *sql, int64_t *out) {
+    if (!db || !sql || !out) return -1;
+    zova_statement *stmt = NULL;
+    if (zova_database_prepare(&(zova_database_prepare_request){
+            .db = db, .sql = sql, .out_statement = &stmt}) != ZOVA_OK || !stmt) {
+        return -1;
+    }
+    zova_step_result step = ZOVA_STEP_DONE;
+    int rc = zova_statement_step(&(zova_statement_step_request){
+        .statement = stmt, .out_result = &step}) == ZOVA_OK && step == ZOVA_STEP_ROW
+                 ? 0 : -1;
+    if (rc == 0) {
+        rc = zova_statement_column_int64(&(zova_statement_column_int64_request){
+            .statement = stmt, .index = 0, .out_value = out}) == ZOVA_OK ? 0 : -1;
+    }
+    (void)zova_statement_finalize(stmt);
+    return rc;
+}
+
+static int zova_tx_graph_count(zova_database *db, const char *graph_name, uint64_t expected) {
+    zova_graph_info info = {0};
+    zova_status status = zova_graph_info_get(&(zova_graph_info_get_request){
+        .db = db, .name = graph_name, .out_info = &info});
+    int rc = status == ZOVA_OK && info.node_count == expected ? 0 : -1;
+    zova_graph_info_free(&info);
+    return rc;
+}
+
+static int zova_tx_vector_count(zova_database *db, const char *collection, uint64_t expected) {
+    zova_vector_collection_info info = {0};
+    zova_status status = zova_vector_collection_info_get(&(zova_vector_collection_info_get_request){
+        .db = db, .name = collection, .out_info = &info});
+    int rc = status == ZOVA_OK && info.vector_count == expected ? 0 : -1;
+    zova_vector_collection_info_free(&info);
+    return rc;
+}
+
+static int zova_tx_commit_checked(zova_database *db, const char *who) {
+    zova_status status = zova_database_commit(&(zova_database_simple_request){.db = db});
+    if (status != ZOVA_OK) {
+        fprintf(stderr, "zova tx commit failed who=%s status=%s err=%s\n", who,
+                zova_status_name(status), zova_database_last_error_message(db));
+    }
+    return status == ZOVA_OK ? 0 : -1;
+}
+
+static int zova_tx_graph_is(zova_database *db, const char *expected) {
+    zova_graph_neighbor_results results = {0};
+    zova_graph_neighbors_request req = {
+        .db = db,
+        .graph_name = "tx_graph",
+        .node_id = "A",
+        .direction = ZOVA_GRAPH_NEIGHBOR_OUTGOING,
+        .edge_type = "CALLS",
+        .limit = 8,
+        .out_results = &results,
+    };
+    zova_status status = zova_graph_neighbors(&req);
+    int rc = status == ZOVA_OK && results.len == 1 && results.items &&
+                     results.items[0].node_id && strcmp(results.items[0].node_id, expected) == 0
+                 ? 0
+                 : -1;
+    if (rc != 0) {
+        fprintf(stderr, "zova tx graph mismatch expected=%s status=%s len=%zu\n", expected,
+                zova_status_name(status), results.len);
+    }
+    zova_graph_neighbor_results_free(&results);
+    return rc;
+}
+
+static int zova_tx_vector_is(zova_database *db, const char *expected) {
+    const int8_t query_values[] = {127, 0};
+    zova_vector_values query = {
+        .element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8,
+        .i8_values = query_values,
+        .values_len = 2,
+    };
+    zova_vector_search_results results = {0};
+    zova_vector_search_request req = {
+        .db = db,
+        .collection_name = "tx_vectors",
+        .query = query,
+        .limit = 8,
+        .out_results = &results,
+    };
+    zova_status status = zova_vector_search(&req);
+    int rc = status == ZOVA_OK && results.len == 1 && results.items &&
+                     results.items[0].id && strcmp(results.items[0].id, expected) == 0
+                 ? 0
+                 : -1;
+    if (rc != 0) {
+        fprintf(stderr, "zova tx vector mismatch expected=%s status=%s len=%zu\n", expected,
+                zova_status_name(status), results.len);
+    }
+    zova_vector_search_results_free(&results);
+    return rc;
+}
+
+static int zova_tx_fts_is(zova_database *db, const char *expected) {
+    zova_statement *stmt = NULL;
+    zova_database_prepare_request prepare = {
+        .db = db,
+        .sql = "SELECT rowid FROM tx_fts WHERE tx_fts MATCH ?1 LIMIT 1",
+        .out_statement = &stmt,
+    };
+    zova_status prepare_status = zova_database_prepare(&prepare);
+    int rc = prepare_status == ZOVA_OK && stmt ? 0 : -1;
+    if (rc == 0) {
+        zova_statement_bind_text_request bind = {
+            .statement = stmt,
+            .index = 1,
+            .data = (const uint8_t *)expected,
+            .len = strlen(expected),
+        };
+        rc = zova_statement_bind_text(&bind) == ZOVA_OK ? 0 : -1;
+    }
+    zova_step_result step = ZOVA_STEP_DONE;
+    if (rc == 0) {
+        zova_statement_step_request step_req = {.statement = stmt, .out_result = &step};
+        rc = zova_statement_step(&step_req) == ZOVA_OK && step == ZOVA_STEP_ROW ? 0 : -1;
+    }
+    if (rc == 0) {
+        int64_t rowid = 0;
+        zova_statement_column_int64_request column = {
+            .statement = stmt,
+            .index = 0,
+            .out_value = &rowid,
+        };
+        rc = zova_statement_column_int64(&column) == ZOVA_OK && rowid == 1 ? 0 : -1;
+    }
+    if (stmt) {
+        (void)zova_statement_finalize(stmt);
+    }
+    if (rc != 0) {
+        fprintf(stderr, "zova tx fts mismatch expected=%s prepare=%s\n", expected,
+                zova_status_name(prepare_status));
+    }
+    return rc;
+}
+
+static int zova_tx_seed(zova_database *db, const char *node_id, const char *term) {
+    if (zova_database_begin_immediate(&(zova_database_simple_request){.db = db}) != ZOVA_OK) {
+        return -1;
+    }
+    int rc = 0;
+    zova_graph_create_request graph_create = {.db = db, .name = "tx_graph"};
+    if (zova_graph_create(&graph_create) != ZOVA_OK) {
+        rc = -1;
+    }
+    const zova_graph_node_input nodes[] = {
+        {.graph_name = "tx_graph", .node_id = "A", .kind = "Function"},
+        {.graph_name = "tx_graph", .node_id = node_id, .kind = "Function"},
+    };
+    if (rc == 0) {
+        zova_graph_node_put_many_request put_nodes = {
+            .db = db,
+            .nodes = nodes,
+            .nodes_len = sizeof(nodes) / sizeof(nodes[0]),
+        };
+        rc = zova_graph_node_put_many(&put_nodes) == ZOVA_OK ? 0 : -1;
+    }
+    const zova_graph_edge_input edges[] = {
+        {.graph_name = "tx_graph", .from_node_id = "A", .edge_type = "CALLS", .to_node_id = node_id},
+    };
+    if (rc == 0) {
+        zova_graph_edge_put_many_request put_edges = {
+            .db = db,
+            .edges = edges,
+            .edges_len = sizeof(edges) / sizeof(edges[0]),
+        };
+        rc = zova_graph_edge_put_many(&put_edges) == ZOVA_OK ? 0 : -1;
+    }
+    zova_vector_collection_create_request create_collection = {
+        .db = db,
+        .name = "tx_vectors",
+        .options = {
+            .dimensions = 2,
+            .metric = ZOVA_VECTOR_METRIC_COSINE,
+            .element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8,
+        },
+    };
+    if (rc == 0) {
+        rc = zova_vector_collection_create(&create_collection) == ZOVA_OK ? 0 : -1;
+    }
+    const int8_t vector_values[] = {127, 0};
+    const zova_vector_input vectors[] = {
+        {.id = node_id,
+         .values = {.element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8,
+                    .i8_values = vector_values,
+                    .values_len = 2}},
+    };
+    if (rc == 0) {
+        zova_vector_put_many_request put_vectors = {
+            .db = db,
+            .collection_name = "tx_vectors",
+            .vectors = vectors,
+            .vectors_len = sizeof(vectors) / sizeof(vectors[0]),
+        };
+        rc = zova_vector_put_many(&put_vectors) == ZOVA_OK ? 0 : -1;
+    }
+    if (rc == 0) {
+        char sql[256];
+        if (snprintf(sql, sizeof(sql),
+                     "CREATE VIRTUAL TABLE tx_fts USING fts5(term, content='');"
+                     "INSERT INTO tx_fts(rowid,term) VALUES(1,'%s');",
+                     term) >= (int)sizeof(sql) || zova_tx_exec(db, sql) != 0) {
+            rc = -1;
+        }
+    }
+    if (rc == 0) {
+        rc = zova_database_commit(&(zova_database_simple_request){.db = db}) == ZOVA_OK ? 0 : -1;
+    } else {
+        (void)zova_database_rollback(&(zova_database_simple_request){.db = db});
+    }
+    return rc;
+}
+
+TEST(zova_graph_vector_objects_obey_caller_transaction) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-zova-tx-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+    zova_database *writer = NULL;
+    zova_database *reader = NULL;
+    zova_message error = {0};
+    int rc = -1;
+    zova_database_open_request create = {
+        .path = path,
+        .out_db = &writer,
+        .out_error_message = &error,
+    };
+    if (zova_database_create(&create) != ZOVA_OK || !writer) {
+        goto done;
+    }
+    zova_message_free(&error);
+    error = (zova_message){0};
+    if (zova_tx_exec(writer, "PRAGMA journal_mode=WAL") != 0) {
+        goto done;
+    }
+    if (zova_tx_seed(writer, "Old", "oldterm") != 0) {
+        goto done;
+    }
+    zova_database_open_request open_reader = {
+        .path = path,
+        .out_db = &reader,
+        .out_error_message = &error,
+    };
+    if (zova_database_open(&open_reader) != ZOVA_OK || !reader) {
+        goto done;
+    }
+    zova_message_free(&error);
+    error = (zova_message){0};
+
+    if (zova_database_exec(&(zova_database_exec_request){.db = reader, .sql = "BEGIN"}) != ZOVA_OK ||
+        zova_tx_graph_is(reader, "Old") != 0 || zova_tx_vector_is(reader, "Old") != 0 ||
+        zova_tx_fts_is(reader, "oldterm") != 0 ||
+        zova_database_begin_immediate(&(zova_database_simple_request){.db = writer}) != ZOVA_OK) {
+        goto done;
+    }
+    /* The replacement helper starts its own transaction; perform the same
+     * native replacement inline here because this phase is already inside the
+     * caller-owned writer transaction. */
+    if (zova_graph_delete(&(zova_graph_delete_request){.db = writer, .name = "tx_graph"}) != ZOVA_OK ||
+        zova_graph_create(&(zova_graph_create_request){.db = writer, .name = "tx_graph"}) != ZOVA_OK) {
+        goto done_writer;
+    }
+    const zova_graph_node_input new_nodes[] = {
+        {.graph_name = "tx_graph", .node_id = "A", .kind = "Function"},
+        {.graph_name = "tx_graph", .node_id = "New", .kind = "Function"},
+    };
+    const zova_graph_edge_input new_edges[] = {
+        {.graph_name = "tx_graph", .from_node_id = "A", .edge_type = "CALLS", .to_node_id = "New"},
+    };
+    const int8_t new_vector_values[] = {127, 0};
+    const zova_vector_input new_vectors[] = {
+        {.id = "New",
+         .values = {.element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8,
+                    .i8_values = new_vector_values,
+                    .values_len = 2}},
+    };
+    if (zova_graph_node_put_many(&(zova_graph_node_put_many_request){
+                                     .db = writer,
+                                     .nodes = new_nodes,
+                                     .nodes_len = sizeof(new_nodes) / sizeof(new_nodes[0]),
+                                 }) != ZOVA_OK ||
+        zova_graph_edge_put_many(&(zova_graph_edge_put_many_request){
+                                     .db = writer,
+                                     .edges = new_edges,
+                                     .edges_len = sizeof(new_edges) / sizeof(new_edges[0]),
+                                 }) != ZOVA_OK ||
+        zova_vector_collection_delete(&(zova_vector_collection_delete_request){
+            .db = writer,
+            .name = "tx_vectors",
+        }) != ZOVA_OK ||
+        zova_vector_collection_create(&(zova_vector_collection_create_request){
+            .db = writer,
+            .name = "tx_vectors",
+            .options = {.dimensions = 2,
+                        .metric = ZOVA_VECTOR_METRIC_COSINE,
+                        .element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8},
+        }) != ZOVA_OK ||
+        zova_vector_put_many(&(zova_vector_put_many_request){
+            .db = writer,
+            .collection_name = "tx_vectors",
+            .vectors = new_vectors,
+            .vectors_len = sizeof(new_vectors) / sizeof(new_vectors[0]),
+        }) != ZOVA_OK ||
+        zova_tx_exec(writer, "DROP TABLE tx_fts") != 0 ||
+        zova_tx_exec(writer,
+                     "CREATE VIRTUAL TABLE tx_fts USING fts5(term, content='');"
+                     "INSERT INTO tx_fts(rowid,term) VALUES(1,'newterm');") != 0) {
+        goto done_writer;
+    }
+    /* The reader's open transaction must continue to expose the old snapshot. */
+    if (zova_tx_graph_is(reader, "Old") != 0 || zova_tx_vector_is(reader, "Old") != 0 ||
+        zova_tx_fts_is(reader, "oldterm") != 0) {
+        goto done_writer;
+    }
+    if (zova_database_rollback(&(zova_database_simple_request){.db = writer}) != ZOVA_OK ||
+        zova_tx_commit_checked(reader, "reader-after-rollback") != 0) {
+        goto done;
+    }
+    /* Reopen after rollback so the post-rollback assertion is made from a
+     * fresh reader snapshot, not merely the prior transaction handle. */
+    (void)zova_database_close(reader);
+    reader = NULL;
+    zova_message_free(&error);
+    error = (zova_message){0};
+    if (zova_database_open(&open_reader) != ZOVA_OK || !reader ||
+        zova_tx_graph_is(reader, "Old") != 0 || zova_tx_vector_is(reader, "Old") != 0 ||
+        zova_tx_fts_is(reader, "oldterm") != 0) {
+        goto done;
+    }
+
+    if (zova_database_exec(&(zova_database_exec_request){.db = reader, .sql = "BEGIN"}) != ZOVA_OK ||
+        zova_tx_graph_is(reader, "Old") != 0 || zova_tx_vector_is(reader, "Old") != 0 ||
+        zova_tx_fts_is(reader, "oldterm") != 0 ||
+        zova_database_begin_immediate(&(zova_database_simple_request){.db = writer}) != ZOVA_OK) {
+        goto done;
+    }
+    if (zova_graph_delete(&(zova_graph_delete_request){.db = writer, .name = "tx_graph"}) != ZOVA_OK ||
+        zova_graph_create(&(zova_graph_create_request){.db = writer, .name = "tx_graph"}) != ZOVA_OK ||
+        zova_graph_node_put_many(&(zova_graph_node_put_many_request){
+            .db = writer,
+            .nodes = new_nodes,
+            .nodes_len = sizeof(new_nodes) / sizeof(new_nodes[0]),
+        }) != ZOVA_OK ||
+        zova_graph_edge_put_many(&(zova_graph_edge_put_many_request){
+            .db = writer,
+            .edges = new_edges,
+            .edges_len = sizeof(new_edges) / sizeof(new_edges[0]),
+        }) != ZOVA_OK ||
+        zova_vector_collection_delete(&(zova_vector_collection_delete_request){
+            .db = writer,
+            .name = "tx_vectors",
+        }) != ZOVA_OK ||
+        zova_vector_collection_create(&(zova_vector_collection_create_request){
+            .db = writer,
+            .name = "tx_vectors",
+            .options = {.dimensions = 2,
+                        .metric = ZOVA_VECTOR_METRIC_COSINE,
+                        .element_type = ZOVA_VECTOR_ELEMENT_TYPE_I8},
+        }) != ZOVA_OK ||
+        zova_vector_put_many(&(zova_vector_put_many_request){
+            .db = writer,
+            .collection_name = "tx_vectors",
+            .vectors = new_vectors,
+            .vectors_len = sizeof(new_vectors) / sizeof(new_vectors[0]),
+        }) != ZOVA_OK ||
+        zova_tx_exec(writer, "DROP TABLE tx_fts") != 0 ||
+        zova_tx_exec(writer,
+                     "CREATE VIRTUAL TABLE tx_fts USING fts5(term, content='');"
+                     "INSERT INTO tx_fts(rowid,term) VALUES(1,'newterm');") != 0 ||
+        zova_tx_graph_is(reader, "Old") != 0 || zova_tx_vector_is(reader, "Old") != 0 ||
+        zova_tx_fts_is(reader, "oldterm") != 0 ||
+        zova_tx_commit_checked(writer, "writer-replacement") != 0 ||
+        zova_tx_commit_checked(reader, "reader-replacement") != 0) {
+        goto done_writer;
+    }
+    /* A new reader snapshot observes the committed generation atomically. */
+    zova_database_close(reader);
+    reader = NULL;
+    if (zova_database_open(&open_reader) != ZOVA_OK || !reader || zova_tx_graph_is(reader, "New") != 0 ||
+        zova_tx_vector_is(reader, "New") != 0 || zova_tx_fts_is(reader, "newterm") != 0) {
+        goto done;
+    }
+    rc = 0;
+    goto done;
+
+done_writer:
+    (void)zova_database_rollback(&(zova_database_simple_request){.db = writer});
+done:
+    zova_message_free(&error);
+    if (reader) {
+        (void)zova_database_close(reader);
+    }
+    if (writer) {
+        (void)zova_database_close(writer);
+    }
+    cbm_unlink(path);
+    ASSERT_EQ(rc, 0);
+    PASS();
+}
+
+TEST(zova_atomic_publisher_reader_snapshot_is_generation_consistent) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-zova-reader-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
+             (void *)path);
+    cbm_unlink(path);
+    const int8_t root_values[] = {127, 0};
+    const int8_t leaf_values[] = {0, 127};
+    const CBMDumpNode nodes[] = {
+        {.id = 1, .project = "reader", .label = "Function", .name = "Root",
+         .qualified_name = "reader.Root", .file_path = "root.c", .properties = "{}"},
+        {.id = 2, .project = "reader", .label = "Function", .name = "Leaf",
+         .qualified_name = "reader.Leaf", .file_path = "leaf.c", .properties = "{}"},
+    };
+    const CBMDumpEdge edges[] = {
+        {.id = 1, .project = "reader", .source_id = 1, .target_id = 2, .type = "CALLS",
+         .properties = "{}", .url_path = "", .local_name = ""},
+    };
+    const CBMDumpVector vectors[] = {
+        {.node_id = 1, .project = "reader", .vector = (const uint8_t *)root_values,
+         .vector_len = 2},
+        {.node_id = 2, .project = "reader", .vector = (const uint8_t *)leaf_values,
+         .vector_len = 2},
+    };
+    const CBMDumpTokenVec tokens[] = {
+        {.id = 1, .project = "reader", .token = "root",
+         .vector = (const uint8_t *)root_values, .vector_len = 2, .idf = 1.0f},
+    };
+    cbm_zova_workspace_generation_input_t input = {
+        .root_path = "/tmp/reader-snapshot",
+        .project = "reader",
+        .indexed_at = "2026-07-12T00:00:00Z",
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = 2,
+        .nodes = nodes,
+        .node_count = 2,
+        .edges = edges,
+        .edge_count = 1,
+        .node_vectors = vectors,
+        .node_vector_count = 2,
+        .token_vectors = tokens,
+        .token_vector_count = 1,
+    };
+    cbm_zova_workspace_generation_result_t first = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &input, &first), 0);
+
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    char node_collection[CBM_ZOVA_WORKSPACE_ID_MAX + 128];
+    char fts_table[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    ASSERT_EQ(cbm_zova_workspace_graph_name(first.workspace_id, graph_name, sizeof(graph_name)), 0);
+    ASSERT_EQ(cbm_zova_workspace_node_vector_collection_name(
+                  first.workspace_id, CBM_ZOVA_MODEL_FINGERPRINT, 2,
+                  node_collection, sizeof(node_collection)), 0);
+    ASSERT_EQ(cbm_zova_workspace_fts_table_name(first.workspace_id, fts_table, sizeof(fts_table)), 0);
+
+    const CBMDumpNode replacement_nodes[] = {nodes[0]};
+    const CBMDumpVector replacement_vectors[] = {vectors[0]};
+    cbm_zova_workspace_generation_input_t replacement_input = input;
+    replacement_input.nodes = replacement_nodes;
+    replacement_input.node_count = 1;
+    replacement_input.edges = NULL;
+    replacement_input.edge_count = 0;
+    replacement_input.node_vectors = replacement_vectors;
+    replacement_input.node_vector_count = 1;
+    replacement_input.token_vectors = NULL;
+    replacement_input.token_vector_count = 0;
+
+    zova_database *writer = NULL;
+    zova_database *reader = NULL;
+    zova_message writer_error = {0};
+    zova_message reader_error = {0};
+    ASSERT_EQ(zova_database_open(&(zova_database_open_request){
+        .path = path, .out_db = &writer, .out_error_message = &writer_error}), ZOVA_OK);
+    ASSERT_EQ(zova_database_open(&(zova_database_open_request){
+        .path = path, .out_db = &reader, .out_error_message = &reader_error}), ZOVA_OK);
+    zova_message_free(&writer_error);
+    zova_message_free(&reader_error);
+    ASSERT_EQ(zova_tx_exec(reader, "BEGIN"), 0);
+    int64_t count = 0;
+    char sql[512];
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             first.workspace_id);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", fts_table);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             first.workspace_id);
+    ASSERT_EQ(zova_tx_graph_count(reader, graph_name, 2), 0);
+    ASSERT_EQ(zova_tx_vector_count(reader, node_collection, 2), 0);
+
+    ASSERT_EQ(zova_database_begin_immediate(&(zova_database_simple_request){.db = writer}), ZOVA_OK);
+    cbm_zova_workspace_generation_result_t second = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace_tx(writer, &replacement_input, &second), 0);
+    ASSERT_EQ(second.generation, 2);
+    ASSERT_EQ(zova_tx_scalar_i64(writer, "PRAGMA cache_size", &count), 0);
+    ASSERT_EQ(count, -65536);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             first.workspace_id);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(zova_tx_graph_count(reader, graph_name, 2), 0);
+    ASSERT_EQ(zova_tx_vector_count(reader, node_collection, 2), 0);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", fts_table);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+
+    ASSERT_EQ(zova_tx_commit_checked(writer, "reader_snapshot_writer"), 0);
+    /* The already-open reader transaction keeps generation 1 even after the
+     * writer commits. */
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s'",
+             first.workspace_id);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(zova_tx_commit_checked(reader, "reader_snapshot_reader"), 0);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM %s", fts_table);
+    ASSERT_EQ(zova_tx_scalar_i64(reader, sql, &count), 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(zova_tx_graph_count(reader, graph_name, 1), 0);
+    ASSERT_EQ(zova_tx_vector_count(reader, node_collection, 1), 0);
+
+    (void)zova_database_close(reader);
+    (void)zova_database_close(writer);
+    cbm_unlink(path);
+    PASS();
+}
+
 #endif
 
 SUITE(zova) {
+#ifndef _WIN32
+    RUN_TEST(zova_writer_gate_serializes_processes_and_releases_after_crash);
+#endif
+    RUN_TEST(zova_route_requires_flag_and_respects_off);
+    RUN_TEST(zova_route_uses_user_cache_database);
     RUN_TEST(zova_mode_parser);
     RUN_TEST(zova_workspace_scoped_names_and_node_ids_are_deterministic);
     RUN_TEST(zova_workspace_registry_path_uses_cache_dir);
 #if !CBM_WITH_ZOVA
     RUN_TEST(zova_disabled_request_fails_clearly);
 #else
+    RUN_TEST(zova_workspace_id_validation_rejects_missing_and_malformed_values);
+    RUN_TEST(zova_repository_requires_ready_workspace_and_reads_metadata);
     RUN_TEST(zova_container_sidecar_preserves_app_sql);
     RUN_TEST(zova_i8_vector_mirror_and_prefetch);
     RUN_TEST(zova_i8_direct_vectors_do_not_read_sqlite_vector_rows);
+    RUN_TEST(zova_default_authority_writes_and_reads_direct_vectors);
+    RUN_TEST(zova_authority_rollback_uses_sqlite);
     RUN_TEST(zova_workspace_registry_preserves_ready_generation);
     RUN_TEST(zova_workspace_registry_lookup_is_read_only);
     RUN_TEST(zova_sidecar_generation_matches_source_and_ready_workspace);
+    RUN_TEST(zova_sidecar_schema_and_integrity_record_matches_generation);
     RUN_TEST(zova_sidecar_failure_falls_back_until_a_ready_rebuild);
     RUN_TEST(zova_direct_sidecar_fault_phases_preserve_ready_read_boundary);
     RUN_TEST(zova_i8_vector_search_in_uses_candidate_ids);
@@ -1873,6 +3481,17 @@ SUITE(zova) {
     RUN_TEST(zova_i8_vector_search_matches_current_topk);
     RUN_TEST(zova_i8_native_multi_query_matches_sqlite_topk);
     RUN_TEST(zova_i8_vector_benchmark_smoke_report);
+    RUN_TEST(zova_sqlite_schema_inventory_has_migration_coverage);
+    RUN_TEST(zova_user_database_bootstrap_creates_versioned_workspace_schema);
+    RUN_TEST(zova_user_database_fts_table_name_is_scoped_and_validated);
+    RUN_TEST(zova_user_database_generation_state_commits_and_rolls_back);
+    RUN_TEST(zova_sql_capability_probe_covers_workspace_metadata_and_sql_surface);
+    RUN_TEST(zova_graph_vector_objects_obey_caller_transaction);
+    RUN_TEST(zova_atomic_publisher_reader_snapshot_is_generation_consistent);
+    RUN_TEST(zova_user_database_capability_probe_covers_empty_schema_surface);
+    RUN_TEST(zova_user_database_imports_workspace_metadata_and_fts);
+    RUN_TEST(zova_user_database_delete_workspace_is_isolated_and_idempotent);
+    RUN_TEST(zova_atomic_workspace_publisher_commits_complete_generation);
     RUN_TEST(zova_graph_mirror_neighbors);
     RUN_TEST(zova_workspace_graph_mirror_is_project_scoped_and_matches_callers);
     RUN_TEST(zova_graph_session_hydrates_scoped_directional_walk);

@@ -282,6 +282,15 @@ struct cbm_query {
     const char *unwind_alias; /* variable name */
 };
 
+typedef enum {
+    CBM_CYPHER_ROUTE_NATIVE_GRAPH,
+    CBM_CYPHER_ROUTE_IN_DATABASE_COMPAT,
+    CBM_CYPHER_ROUTE_UNSUPPORTED
+} cbm_cypher_route_t;
+
+cbm_cypher_route_t cbm_cypher_classify_plan(const cbm_query_t *query,
+                                            const char **reason);
+
 /* Convenience: access first pattern (backwards compat) */
 #define cbm_query_pattern(q) ((q)->patterns[0])
 

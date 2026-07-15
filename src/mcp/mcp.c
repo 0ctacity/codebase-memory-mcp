@@ -59,6 +59,8 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "zova/cbm_zova_repository.h"
+#include "zova/cbm_zova_route.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -78,6 +80,7 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <math.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -860,6 +863,10 @@ struct cbm_mcp_server {
     cbm_pipeline_t *active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
+    cbm_mutex_t index_queue_mutex;
+    uint64_t index_queue_next_ticket;
+    uint64_t index_queue_serving_ticket;
+    _Atomic uint64_t index_queue_waiters;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -877,6 +884,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
         srv->store = cbm_store_open_memory();
     }
     srv->owns_store = true;
+    cbm_mutex_init(&srv->index_queue_mutex);
 
     return srv;
 }
@@ -920,6 +928,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
+    cbm_mutex_destroy(&srv->index_queue_mutex);
     free(srv);
 }
 
@@ -1008,6 +1017,26 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     }
 
     srv->store_last_used = time(NULL);
+
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        char path[CBM_SZ_1K];
+        cbm_zova_repository_t *repo = NULL;
+        if (cbm_zova_user_database_path(path, sizeof(path)) != 0 ||
+            !(repo = cbm_zova_repository_open(path, project))) {
+            return NULL;
+        }
+        char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+        snprintf(workspace_id, sizeof(workspace_id), "%s",
+                 cbm_zova_repository_workspace_id(repo));
+        cbm_zova_repository_close(repo);
+        if (cbm_zova_workspace_id_validate(workspace_id) != 0) return NULL;
+        if (srv->owns_store && srv->store) cbm_store_close(srv->store);
+        srv->store = cbm_store_open_zova_workspace_query(path, workspace_id);
+        srv->owns_store = srv->store != NULL;
+        free(srv->current_project);
+        srv->current_project = srv->store ? heap_strdup(project) : NULL;
+        return srv->store;
+    }
 
     /* Already open for this project? */
     if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
@@ -1709,7 +1738,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         "WHERE n.project = ?2 "
         "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
-        "ORDER BY rank "
+        "ORDER BY rank, n.qualified_name, n.id "
         "LIMIT ?3 OFFSET ?4";
 
     sqlite3_stmt *stmt = NULL;
@@ -1844,6 +1873,120 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     *out_pdoc_count = pdoc_count;
 }
 
+static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
+                               cbm_store_t *store, const char *project, int limit);
+
+static void emit_flagged_fts_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     const cbm_search_output_t *out, int offset) {
+    yyjson_mut_obj_add_int(doc, root, "total", out->total);
+    yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    for (int i = 0; i < out->count; i++) {
+        const cbm_search_result_t *sr = &out->results[i];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "name", sr->node.name ? sr->node.name : "");
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               sr->node.qualified_name ? sr->node.qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "label", sr->node.label ? sr->node.label : "");
+        yyjson_mut_obj_add_str(doc, item, "file_path",
+                               sr->node.file_path ? sr->node.file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", sr->node.start_line);
+        yyjson_mut_obj_add_int(doc, item, "end_line", sr->node.end_line);
+        yyjson_mut_obj_add_real(doc, item, "rank", sr->rank);
+        yyjson_mut_arr_add_val(results, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+}
+
+static char *handle_search_graph_flagged(const char *args, char *project) {
+    char path[CBM_SZ_1K];
+    if (!project || !project[0] || cbm_zova_user_database_path(path, sizeof(path)) != 0) {
+        free(project);
+        return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+    }
+    cbm_zova_repository_t *repo = cbm_zova_repository_open(path, project);
+    if (!repo) {
+        free(project);
+        return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+    }
+    const char *workspace_id = cbm_zova_repository_workspace_id(repo);
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
+    char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
+    char *label = cbm_mcp_get_string_arg(args, "label");
+    char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *relationship = cbm_mcp_get_string_arg(args, "relationship");
+    int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    cbm_search_params_t params = {
+        .project = project,
+        .label = label,
+        .name_pattern = query && query[0] ? query : name_pattern,
+        .qn_pattern = qn_pattern,
+        .file_pattern = file_pattern,
+        .relationship = relationship,
+        .exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points"),
+        .include_connected = false,
+        .limit = cbm_mcp_get_int_arg(args, "limit",
+                                     query && query[0] ? BM25_DEFAULT_LIMIT
+                                                       : CBM_DEFAULT_SEARCH_LIMIT),
+        .offset = offset,
+        .min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND),
+        .max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND),
+    };
+    cbm_search_output_t out = {0};
+    int rc = query && query[0]
+                 ? cbm_zova_repository_search_fts(repo, workspace_id, query, file_pattern, params.limit,
+                                                  params.offset, &out)
+                 : cbm_zova_repository_search(repo, workspace_id, &params, &out);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_doc **props_docs = NULL;
+    int props_doc_count = 0;
+    if (rc == CBM_STORE_OK) {
+        if (query && query[0]) {
+            emit_flagged_fts_results(doc, root, &out, offset);
+        } else {
+            emit_search_results(doc, root, &out, NULL, relationship, false, offset,
+                                &props_docs, &props_doc_count);
+        }
+    }
+    bool semantic_type_error = false;
+    cbm_store_t *vector_store = cbm_store_open_zova_workspace_query(path, workspace_id);
+    if (rc == CBM_STORE_OK && vector_store) {
+        semantic_type_error = run_semantic_query(doc, root, args, vector_store, project,
+                                                 params.limit);
+    }
+    if (vector_store) cbm_store_close(vector_store);
+    if (semantic_type_error) {
+        for (int i = 0; i < props_doc_count; i++) yyjson_doc_free(props_docs[i]);
+        free(props_docs);
+        yyjson_mut_doc_free(doc);
+        cbm_store_search_free(&out);
+        cbm_zova_repository_close(repo);
+        free(query); free(name_pattern); free(qn_pattern); free(label); free(file_pattern);
+        free(relationship); free(project);
+        return cbm_mcp_text_result(
+            "semantic_query must be an array of keyword strings, e.g. "
+            "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
+            "into individual keywords; each is scored independently via per-keyword "
+            "min-cosine.", true);
+    }
+    char *json = rc == CBM_STORE_OK ? yy_doc_to_str(doc) : NULL;
+    for (int i = 0; i < props_doc_count; i++) yyjson_doc_free(props_docs[i]);
+    free(props_docs);
+    yyjson_mut_doc_free(doc);
+    cbm_store_search_free(&out);
+    cbm_zova_repository_close(repo);
+    free(query); free(name_pattern); free(qn_pattern); free(label); free(file_pattern);
+    free(relationship); free(project);
+    if (!json) return cbm_mcp_text_result("flagged cbm.zova search failed", true);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
  * number of strings copied (capped at `max_out`). */
 static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, int max_out) {
@@ -1873,7 +2016,8 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         yyjson_mut_obj_add_strcpy(doc, vitem, "qualified_name", vresults[v].qualified_name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "label", vresults[v].label);
         yyjson_mut_obj_add_strcpy(doc, vitem, "file_path", vresults[v].file_path);
-        yyjson_mut_obj_add_real(doc, vitem, "score", vresults[v].score);
+        double score = round(vresults[v].score * 1e12) / 1e12;
+        yyjson_mut_obj_add_real(doc, vitem, "score", score);
         yyjson_mut_arr_add_val(sem_results, vitem);
     }
     yyjson_mut_obj_add_val(doc, root, "semantic_results", sem_results);
@@ -1912,6 +2056,9 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        return handle_search_graph_flagged(args, project);
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -2057,6 +2204,101 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
     char *project = get_project_arg(args);
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        char path[CBM_SZ_1K];
+        cbm_zova_repository_t *repo = NULL;
+        if (!query) {
+            free(project);
+            return cbm_mcp_text_result("query is required", true);
+        }
+        if (!project || cbm_zova_user_database_path(path, sizeof(path)) != 0 ||
+            !(repo = cbm_zova_repository_open(path, project)) ||
+            cbm_zova_workspace_id_validate(cbm_zova_repository_workspace_id(repo)) != 0) {
+            if (repo) cbm_zova_repository_close(repo);
+            free(query); free(project);
+            return cbm_mcp_text_result("workspace-scoped flagged Cypher request is invalid", true);
+        }
+        const char *workspace_id = cbm_zova_repository_workspace_id(repo);
+        char workspace_copy[CBM_ZOVA_WORKSPACE_ID_MAX];
+        snprintf(workspace_copy, sizeof(workspace_copy), "%s", workspace_id);
+        int64_t generation = 0;
+        char *indexed_at = NULL;
+        if (cbm_zova_repository_index_status(repo, workspace_id, &generation,
+                                             &indexed_at) != CBM_STORE_OK) {
+            cbm_zova_repository_close(repo);
+            free(query); free(project); free(indexed_at);
+            return cbm_mcp_text_result("could not bind Cypher request generation", true);
+        }
+        free(indexed_at);
+        cbm_query_t *plan = NULL;
+        char *parse_error = NULL;
+        if (cbm_cypher_parse(query, &plan, &parse_error) != 0) {
+            char diagnostic[CBM_SZ_1K];
+            snprintf(diagnostic, sizeof(diagnostic),
+                     "route=unsupported workspace=%s operator=parser reason=%s",
+                     workspace_copy, parse_error ? parse_error : "Cypher parse failed");
+            cbm_zova_repository_close(repo);
+            free(query); free(project);
+            char *response = cbm_mcp_text_result(diagnostic, true);
+            free(parse_error);
+            return response;
+        }
+        const char *route_reason = NULL;
+        cbm_cypher_route_t route = cbm_cypher_classify_plan(plan, &route_reason);
+        cbm_query_free(plan);
+        if (route == CBM_CYPHER_ROUTE_UNSUPPORTED) {
+            char diagnostic[CBM_SZ_1K];
+            snprintf(diagnostic, sizeof(diagnostic),
+                     "route=unsupported workspace=%s operator=logical_plan reason=%s",
+                     workspace_copy, route_reason ? route_reason : "unsupported query shape");
+            cbm_zova_repository_close(repo);
+            free(query); free(project); free(parse_error);
+            return cbm_mcp_text_result(diagnostic, true);
+        }
+        free(parse_error);
+        cbm_store_t *zova_store = cbm_store_open_zova_workspace_query(path, workspace_id);
+        if (!zova_store) {
+            cbm_zova_repository_close(repo);
+            free(query); free(project);
+            return cbm_mcp_text_result("could not open workspace-scoped Cypher session", true);
+        }
+        cbm_zova_repository_close(repo);
+        int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 1000);
+        cbm_cypher_result_t result = {0};
+        int rc = cbm_cypher_execute(zova_store, query, project, max_rows, &result);
+        cbm_store_close(zova_store);
+        free(query); free(project);
+        if (rc != 0) {
+            char *error = cbm_mcp_text_result(result.error ? result.error : "Cypher execution failed", true);
+            cbm_cypher_result_free(&result);
+            return error;
+        }
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_val *cols = yyjson_mut_arr(doc);
+        for (int i = 0; i < result.col_count; ++i) yyjson_mut_arr_add_str(doc, cols, result.columns[i]);
+        yyjson_mut_obj_add_val(doc, root, "columns", cols);
+        yyjson_mut_val *rows = yyjson_mut_arr(doc);
+        for (int r = 0; r < result.row_count; ++r) {
+            yyjson_mut_val *row = yyjson_mut_arr(doc);
+            for (int c = 0; c < result.col_count; ++c)
+                yyjson_mut_arr_add_str(doc, row, result.rows[r][c] ? result.rows[r][c] : "");
+            yyjson_mut_arr_add_val(rows, row);
+        }
+        yyjson_mut_obj_add_val(doc, root, "rows", rows);
+        yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        yyjson_mut_obj_add_str(doc, root, "route",
+                               route == CBM_CYPHER_ROUTE_NATIVE_GRAPH
+                                   ? "native_graph" : "in_database_compat");
+        yyjson_mut_obj_add_sint(doc, root, "generation", generation);
+        char *json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        cbm_cypher_result_free(&result);
+        char *response = cbm_mcp_text_result(json, false);
+        free(json);
+        return response;
+    }
     cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
@@ -2135,6 +2377,42 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        char path[CBM_SZ_1K];
+        cbm_zova_repository_t *repo = NULL;
+        if (!project || cbm_zova_user_database_path(path, sizeof(path)) != 0 ||
+            !(repo = cbm_zova_repository_open(path, project))) {
+            free(project);
+            return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+        }
+        int nodes = 0, edges = 0;
+        cbm_project_t info = {0};
+        const char *workspace_id = cbm_zova_repository_workspace_id(repo);
+        int rc = cbm_zova_repository_counts(repo, workspace_id, &nodes, &edges);
+        if (rc == CBM_STORE_OK)
+            rc = cbm_zova_repository_get_project(repo, workspace_id, &info);
+        cbm_zova_repository_close(repo);
+        if (rc != CBM_STORE_OK) {
+            free(project);
+            return cbm_mcp_text_result("flagged cbm.zova status read failed", true);
+        }
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_str(doc, root, "project", project);
+        yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
+        yyjson_mut_obj_add_int(doc, root, "edges", edges);
+        yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        yyjson_mut_obj_add_strcpy(doc, root, "root_path", info.root_path ? info.root_path : "");
+        add_git_context_json(doc, root, info.root_path);
+        char *json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+        safe_str_free(&info.name); safe_str_free(&info.indexed_at); safe_str_free(&info.root_path);
+        free(project);
+        char *result = cbm_mcp_text_result(json, false);
+        free(json);
+        return result;
+    }
     cbm_store_t *store = resolve_store(srv, project);
     REQUIRE_STORE(store, project);
 
@@ -3043,6 +3321,7 @@ static void zova_metrics_add(cbm_zova_graph_metrics_t *total,
     total->adjacency_query_binds += part->adjacency_query_binds;
     total->adjacency_rows_stepped += part->adjacency_rows_stepped;
     total->native_result_count += part->native_result_count;
+    total->generation_mismatch = total->generation_mismatch || part->generation_mismatch;
     total->fallback = total->fallback || part->fallback;
 }
 
@@ -3061,6 +3340,7 @@ static int zova_union_same_name(cbm_store_t *store, const char *project, const c
                                       MCP_BFS_LIMIT, &current, &current_count,
                                       &call_metrics) != CBM_STORE_OK) {
             if (metrics) {
+                zova_metrics_add(metrics, &call_metrics);
                 metrics->fallback = true;
             }
             cbm_zova_graph_visits_free(current, current_count);
@@ -3420,6 +3700,22 @@ static char *read_file_lines(const char *path, int start, int end) {
 static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     if (!project) {
         return NULL;
+    }
+    if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        char path[CBM_SZ_1K];
+        if (cbm_zova_user_database_path(path, sizeof(path)) != 0) return NULL;
+        cbm_zova_repository_t *repo = cbm_zova_repository_open(path, project);
+        if (!repo) return NULL;
+        cbm_project_t proj = {0};
+        const char *workspace_id = cbm_zova_repository_workspace_id(repo);
+        char *root = cbm_zova_repository_get_project(repo, workspace_id, &proj) == CBM_STORE_OK
+                         ? heap_strdup(proj.root_path)
+                         : NULL;
+        safe_str_free(&proj.name);
+        safe_str_free(&proj.indexed_at);
+        safe_str_free(&proj.root_path);
+        cbm_zova_repository_close(repo);
+        return root;
     }
     cbm_store_t *store = resolve_store(srv, project);
     if (!store) {
@@ -3883,7 +4179,7 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  *   - a contained-failure response only if even that cannot produce a clean run.
  * Returns NULL only when the worker could not be spawned at all, so the caller
  * degrades to the in-process path. */
-static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+static char *index_run_supervised_impl(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
 
     /* First attempt: normal parallel run. */
@@ -4053,6 +4349,40 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         return resp;
     }
     return build_worker_failure_response(args, last_outcome);
+}
+
+void cbm_index_job_queue_enter(cbm_mcp_server_t *srv) {
+    if (!srv) return;
+    cbm_mutex_lock(&srv->index_queue_mutex);
+    uint64_t ticket = srv->index_queue_next_ticket++;
+    atomic_fetch_add_explicit(&srv->index_queue_waiters, 1, memory_order_relaxed);
+    while (ticket != srv->index_queue_serving_ticket) {
+        cbm_mutex_unlock(&srv->index_queue_mutex);
+        struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000};
+        cbm_nanosleep(&pause, NULL);
+        cbm_mutex_lock(&srv->index_queue_mutex);
+    }
+    atomic_fetch_sub_explicit(&srv->index_queue_waiters, 1, memory_order_relaxed);
+    cbm_mutex_unlock(&srv->index_queue_mutex);
+}
+
+void cbm_index_job_queue_leave(cbm_mcp_server_t *srv) {
+    if (!srv) return;
+    cbm_mutex_lock(&srv->index_queue_mutex);
+    srv->index_queue_serving_ticket++;
+    cbm_mutex_unlock(&srv->index_queue_mutex);
+}
+
+uint64_t cbm_index_job_queue_waiter_count(const cbm_mcp_server_t *srv) {
+    return srv ? atomic_load_explicit(&srv->index_queue_waiters, memory_order_relaxed) : 0;
+}
+
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+    bool queued = srv && cbm_zova_route_from_env() == CBM_ZOVA_ROUTE_FULL_AUTHORITY;
+    if (queued) cbm_index_job_queue_enter(srv);
+    char *result = index_run_supervised_impl(srv, args);
+    if (queued) cbm_index_job_queue_leave(srv);
+    return result;
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
@@ -4267,6 +4597,19 @@ static void copy_node(const cbm_node_t *src, cbm_node_t *dst) {
 }
 
 /* Build a JSON suggestions response for ambiguous or fuzzy results. */
+static int compare_snippet_suggestions(const void *left, const void *right) {
+    const cbm_node_t *a = left;
+    const cbm_node_t *b = right;
+    const char *a_qn = a->qualified_name ? a->qualified_name : "";
+    const char *b_qn = b->qualified_name ? b->qualified_name : "";
+    int cmp = strcmp(a_qn, b_qn);
+    if (cmp == 0)
+        cmp = strcmp(a->file_path ? a->file_path : "", b->file_path ? b->file_path : "");
+    if (cmp == 0)
+        cmp = strcmp(a->label ? a->label : "", b->label ? b->label : "");
+    return cmp;
+}
+
 static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -4281,6 +4624,7 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
              count, input);
     yyjson_mut_obj_add_str(doc, root, "message", msg);
 
+    qsort(nodes, (size_t)count, sizeof(*nodes), compare_snippet_suggestions);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
         yyjson_mut_val *s = yyjson_mut_obj(doc);

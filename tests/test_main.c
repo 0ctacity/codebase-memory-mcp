@@ -246,10 +246,14 @@ extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
 extern void suite_zova(void);
+extern void suite_zova_operations(void);
+extern void suite_zova_migration(void);
 extern void suite_zova_c_sql_functions(void);
 extern void suite_zova_bridge(void);
 extern void suite_zova_real_repo(void);
 extern void suite_zova_graph_real_repo(void);
+extern void suite_zova_single_file_real_repo(void);
+extern void suite_zova_single_file_promotion_real_repo(void);
 
 /* Free the main thread's thread-local node-type bitset cache before exit so
  * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
@@ -313,6 +317,9 @@ int main(int argc, char **argv) {
 
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);
+
+    RUN_SELECTED_SUITE(zova_migration);
+    RUN_SELECTED_SUITE(zova_operations);
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);
@@ -418,6 +425,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(zova_bridge);
     RUN_EXPLICIT_SUITE(zova_real_repo);
     RUN_EXPLICIT_SUITE(zova_graph_real_repo);
+    RUN_EXPLICIT_SUITE(zova_single_file_real_repo);
+    RUN_EXPLICIT_SUITE(zova_single_file_promotion_real_repo);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);

@@ -404,6 +404,143 @@ codebase-memory-mcp cli list_projects
 codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.results[].name'
 ```
 
+### Zova migration and rollback (Section 7 opt-in)
+
+Section 7 migration is an explicit operator action. It discovers the existing
+project `.db` and sibling `.zova` in the resolved CBM cache and publishes their
+verified generation into `cbm.zova`. Migrate, status, and rollback preserve the
+source artifacts.
+
+```bash
+codebase-memory-mcp zova-migrate migrate --repo-path /absolute/path/to/repository --json
+codebase-memory-mcp zova-migrate status --repo-path /absolute/path/to/repository --json
+codebase-memory-mcp zova-migrate rollback --repo-path /absolute/path/to/repository --json
+codebase-memory-mcp zova-migrate cleanup --repo-path /absolute/path/to/repository \
+  --confirm-workspace w1_0123456789abcdef0123456789abcdef --json
+```
+
+The command prints one compact JSON object. Exit `0` means success or an
+idempotent no-op, exit `1` means an operational failure, and exit `2` means a
+usage error. Cleanup requires the exact reported workspace ID. It removes the
+verified legacy bundle and permanently ends rollback availability for that
+migration.
+
+The wrapper exposes the same lifecycle:
+
+```bash
+scripts/zova-migrate-repo.sh migrate /absolute/path/to/repository
+scripts/zova-migrate-repo.sh status /absolute/path/to/repository
+scripts/zova-migrate-repo.sh rollback /absolute/path/to/repository
+scripts/zova-migrate-repo.sh cleanup /absolute/path/to/repository \
+  --confirm-workspace w1_0123456789abcdef0123456789abcdef
+```
+
+The historical `scripts/zova-migrate-repo.sh REPOSITORY [RUN_ROOT]` form is a
+`migrate` alias. The wrapper holds a run-root lock and retains the exact compact
+JSON response as `runs/<run>/migration.json`; the default run root is
+`build/zova-migrate`.
+
+The one-file `cbm.zova` schema is documented in
+[`docs/zova-single-file-schema.md`](docs/zova-single-file-schema.md).
+
+### Zova backup, recovery, and workspace operations (Section 8 opt-in)
+
+The shared-database operator commands remain behind
+`CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1`. They act only on
+`${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}/cbm.zova` and emit exactly
+one compact JSON object. Exit `0` means success or no-op, exit `1` means an
+operational refusal/failure, and exit `2` means invalid command syntax.
+
+```bash
+export CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1
+codebase-memory-mcp zova-ops status --json
+codebase-memory-mcp zova-ops backup --output /safe/path/cbm-backup.zova --json
+codebase-memory-mcp zova-ops restore --input /safe/path/cbm-backup.zova --confirm-replace --json
+codebase-memory-mcp zova-ops export-database --output /safe/path/database-archive --json
+codebase-memory-mcp zova-ops import-database --input /safe/path/database-archive --confirm-replace --json
+codebase-memory-mcp zova-ops export-workspace --workspace-id WORKSPACE_ID --output /safe/path/workspace-archive --json
+codebase-memory-mcp zova-ops import-workspace --input /safe/path/workspace-archive --json
+codebase-memory-mcp zova-ops delete-workspace --workspace-id WORKSPACE_ID --confirm-workspace WORKSPACE_ID --json
+codebase-memory-mcp zova-ops compact --json
+codebase-memory-mcp zova-ops health --workspace-id WORKSPACE_ID --json
+codebase-memory-mcp zova-ops recover-workspace --workspace-id WORKSPACE_ID --repo-path /absolute/repository --json
+```
+
+Full-database archives contain a versioned manifest and verified `data.zova`.
+Workspace archives contain one workspace's metadata, FTS, graph, compatibility
+vector payload, file hashes, summary, generation, and integrity digests; import
+rebuilds and verifies native graph/vector objects. Restore and database import
+require the literal `--confirm-replace` flag. Workspace deletion requires the
+exact target ID as `--confirm-workspace`.
+
+Replacement is same-directory and resumable: the candidate is verified before
+the live file moves, and interruption leaves either the preceding verified live
+database or a retryable recovery artifact. Compaction runs only when reclaimable
+space is at least both 64 MiB and 10 percent of the database, and requires free
+space of at least the larger of 8 GiB or database bytes plus 1 GiB.
+
+Health distinguishes `workspace_rebuild` from `whole_file_recovery`. A confined
+workspace defect blocks only that flagged workspace until a full source rebuild
+publishes successfully. Shared-schema, open, quick-check, foreign-key, or other
+unattributable damage requires a verified full backup restore; without one,
+explicit recovery quarantines the corrupt file and creates no replacement.
+
+The wrapper builds once, applies the disk guard, serializes operations, writes
+progress to stderr, and retains JSON reports under `build/zova-operations`:
+
+```bash
+scripts/zova-operations.sh status
+scripts/zova-operations.sh backup --output /safe/path/cbm-backup.zova
+```
+
+The one-file path is currently opt-in. Its compact real-repository validation
+runner is:
+
+```bash
+CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 scripts/zova-single-file-validation.sh
+```
+
+It retains only a JSON report on success; normal indexing and the default
+`.db`/sidecar authority are unchanged.
+
+Exact opt-in reports for CBM, motive, rvault, and tops are retained at
+`build/zova-single-file-multi/<repository>/latest-report.json`. They cover rich
+SQL rows, 20 FTS/BM25 queries, sampled native graph degree/neighbors/walks,
+compatibility and public native raw-i8 bytes, single/multi-query rankings,
+atomic fault phases, and reader visibility. The dedicated Section 9 promotion
+gate subsequently passed three fresh full/incremental attempts on TOPS, motive,
+rvault, and CBM with exact parity, zero unexpected fallback, and accepted read,
+ingestion, and storage ratios. The flag remains opt-in: compatibility-write
+retirement and the final Section 10 one-file cutover remain separate work.
+
+### Reproducible Zova development builds
+
+CBM builds against an immutable local snapshot in `.zova-sdk`, not the live
+neighboring Zova checkout. Pin the currently built Zova library and headers
+once, build CBM once, then run any number of suites directly:
+
+```bash
+scripts/zova-pin-current.sh
+scripts/zova-build-once.sh
+scripts/zova-run-tests.sh zova mcp
+```
+
+Later changes under `../zova` are ignored. Refresh the snapshot only when a
+Zova update is intentionally being adopted:
+
+```bash
+scripts/zova-pin-current.sh --refresh
+```
+
+The wrapper keeps both CBM's Zig cache and the global Zig cache under
+`build/.zova-build-cache`, and uses a build lock to reject overlapping builds.
+It never writes the repository `.zig-cache`, so interrupted builds do not
+poison the working tree. Real-repository validation keeps compact JSON
+reports and deletes successful temporary databases, sidecars, logs, and caches.
+It refuses to start with less than 8 GiB free by default; adjust that guard with
+`CBM_ZOVA_MIN_FREE_GB` when necessary. Full four-repository, three-run gates are
+promotion tests, not routine development tests.
+
 ## MCP Tools
 
 ### Indexing

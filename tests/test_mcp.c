@@ -6,7 +6,9 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
+#include "../src/foundation/compat_thread.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/sha256.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -15,15 +17,54 @@
 #include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
+#include <zova/cbm_zova.h>
+#include <zova/cbm_zova_route.h>
+#include <zova/cbm_zova_migration.h>
+#include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
 #ifndef CBM_WITH_ZOVA
 #define CBM_WITH_ZOVA 0
 #endif
+
+typedef struct {
+    cbm_mcp_server_t *srv;
+    atomic_int entered;
+} index_queue_test_ctx_t;
+
+static void *index_queue_test_contender(void *arg) {
+    index_queue_test_ctx_t *ctx = arg;
+    cbm_index_job_queue_enter(ctx->srv);
+    atomic_store_explicit(&ctx->entered, 1, memory_order_release);
+    cbm_index_job_queue_leave(ctx->srv);
+    return NULL;
+}
+
+TEST(index_job_queue_is_fifo_and_blocks_second_contender) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    index_queue_test_ctx_t ctx = {.srv = srv};
+    atomic_init(&ctx.entered, 0);
+    cbm_index_job_queue_enter(srv);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, index_queue_test_contender, &ctx), 0);
+    for (int i = 0; i < 100 && cbm_index_job_queue_waiter_count(srv) != 1; ++i) {
+        struct timespec delay = {.tv_sec = 0, .tv_nsec = 1000000};
+        cbm_nanosleep(&delay, NULL);
+    }
+    ASSERT_EQ(cbm_index_job_queue_waiter_count(srv), 1);
+    ASSERT_EQ(atomic_load_explicit(&ctx.entered, memory_order_acquire), 0);
+    cbm_index_job_queue_leave(srv);
+    ASSERT_EQ(cbm_thread_join(&thread), 0);
+    ASSERT_EQ(atomic_load_explicit(&ctx.entered, memory_order_acquire), 1);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
 #ifdef _WIN32
 #include <direct.h>
 #define cbm_chdir _chdir
@@ -40,6 +81,110 @@ static char mcp_log_buf[4096];
 static void mcp_capture_log(const char *line) {
     snprintf(mcp_log_buf, sizeof(mcp_log_buf), "%s", line ? line : "");
 }
+
+static char *mcp_normalized_tool_payload(const char *response, bool normalize_elapsed) {
+    if (!response) return NULL;
+    yyjson_doc *outer = yyjson_read(response, strlen(response), 0);
+    yyjson_val *result = outer ? yyjson_obj_get(yyjson_doc_get_root(outer), "result") : NULL;
+    yyjson_val *content = result ? yyjson_obj_get(result, "content") : NULL;
+    yyjson_val *item = content ? yyjson_arr_get(content, 0) : NULL;
+    const char *text = item ? yyjson_get_str(yyjson_obj_get(item, "text")) : NULL;
+    yyjson_doc *payload = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_mut_doc *normalized = payload ? yyjson_doc_mut_copy(payload, NULL) : NULL;
+    if (normalized) {
+        yyjson_mut_val *root = yyjson_mut_doc_get_root(normalized);
+        /* Normalize only route/generation diagnostics and, when explicitly
+         * requested for search_code, nondeterministic elapsed time. User
+         * payload, order, counts, scores, and errors remain byte-exact. */
+        (void)yyjson_mut_obj_remove_key(root, "route");
+        (void)yyjson_mut_obj_remove_key(root, "generation");
+        if (normalize_elapsed) (void)yyjson_mut_obj_remove_key(root, "elapsed_ms");
+    }
+    char *json = normalized ? yyjson_mut_write(normalized, 0, NULL) : NULL;
+    yyjson_mut_doc_free(normalized);
+    yyjson_doc_free(payload);
+    yyjson_doc_free(outer);
+    return json;
+}
+
+#if CBM_WITH_ZOVA
+TEST(mcp_migration_route_is_explicit_and_never_fallback) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-migration-route-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    char target[512], legacy_path[512];
+    snprintf(target, sizeof(target), "%s/cbm.zova", cache);
+    snprintf(legacy_path, sizeof(legacy_path), "%s/route-proj.db", cache);
+    ASSERT_EQ(cbm_zova_user_database_init(target), 0);
+    cbm_store_t *legacy = cbm_store_open_path(legacy_path);
+    ASSERT_NOT_NULL(legacy);
+    ASSERT_EQ(cbm_store_upsert_project(legacy, "route-proj", "/tmp/route-proj"), CBM_STORE_OK);
+    cbm_store_close(legacy);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(target, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(
+                  db,
+                  "INSERT INTO cbm_workspace_registry(workspace_id,canonical_root,"
+                  "id_format_version,active_generation) VALUES('w:v1:route','/tmp/route-proj',2,0);"
+                  "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+                  "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
+                  "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
+                  "token_vector_sha256,prepared_at) VALUES('w:v1:route',1,'route-proj',"
+                  "'/tmp/route-proj','source.db','source.zova',1,0,'prepared','m','f','t','n','v',"
+                  "CURRENT_TIMESTAMP)",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+    int previous_level = cbm_log_get_level();
+    memset(mcp_log_buf, 0, sizeof(mcp_log_buf));
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new("route-proj");
+    ASSERT_NOT_NULL(srv);
+    char *legacy_response = cbm_mcp_handle_tool(srv, "index_status",
+                                                "{\"project\":\"route-proj\"}");
+    ASSERT_NOT_NULL(legacy_response);
+    ASSERT_NULL(strstr(legacy_response, "project not indexed in flagged cbm.zova"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "migration_legacy"));
+    ASSERT_NULL(strstr(mcp_log_buf, "unexpected_fallback"));
+    free(legacy_response);
+    ASSERT_EQ(sqlite3_open(target, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "UPDATE cbm_workspace_migrations_v1 SET state='cleanup_pending'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+    char *cleanup_response = cbm_mcp_handle_tool(srv, "index_status",
+                                                 "{\"project\":\"route-proj\"}");
+    ASSERT_NOT_NULL(cleanup_response);
+    ASSERT_NOT_NULL(strstr(cleanup_response, "project not indexed in flagged cbm.zova"));
+    free(cleanup_response);
+    char *absent_response = cbm_mcp_handle_tool(srv, "index_status",
+                                                "{\"project\":\"absent\"}");
+    ASSERT_NOT_NULL(absent_response);
+    ASSERT_NOT_NULL(strstr(absent_response, "project not indexed in flagged cbm.zova"));
+    free(absent_response);
+    cbm_mcp_server_free(srv);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    free(saved_cache_copy);
+    free(saved_flag_copy);
+    cbm_unlink(legacy_path);
+    cbm_unlink(target);
+    cbm_rmdir(cache);
+    PASS();
+}
+#endif
 
 static bool response_contains_json_fragment(const char *response, const char *fragment) {
     if (!response || !fragment) {
@@ -59,6 +204,26 @@ static bool response_contains_json_fragment(const char *response, const char *fr
     }
     escaped[out] = '\0';
     return strstr(response, escaped) != NULL;
+}
+
+static bool mcp_test_path_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0;
+}
+
+static int mcp_test_file_digest(const char *path, uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return -1;
+    cbm_sha256_ctx hash;
+    cbm_sha256_init(&hash);
+    uint8_t buffer[4096];
+    size_t read_len = 0;
+    while ((read_len = fread(buffer, 1, sizeof(buffer), file)) > 0)
+        cbm_sha256_update(&hash, buffer, read_len);
+    int rc = ferror(file) ? -1 : 0;
+    fclose(file);
+    if (rc == 0) cbm_sha256_final(&hash, out);
+    return rc;
 }
 
 static void restore_cache_dir(const char *saved_copy) {
@@ -726,6 +891,547 @@ TEST(tool_search_graph_basic) {
     PASS();
 }
 
+TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-flagged-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    char user_db[512], project_db[512], repo_root[512], source_dir[512], source_path[512];
+    ASSERT_EQ(cbm_zova_user_database_path(user_db, sizeof(user_db)), 0);
+    snprintf(project_db, sizeof(project_db), "%s/fixture.db", cache);
+    snprintf(repo_root, sizeof(repo_root), "%s/repo", cache);
+    snprintf(source_dir, sizeof(source_dir), "%s/src", repo_root);
+    snprintf(source_path, sizeof(source_path), "%s/alpha.c", source_dir);
+    ASSERT_EQ(cbm_mkdir(repo_root), 0);
+    ASSERT_EQ(cbm_mkdir(source_dir), 0);
+    FILE *source = fopen(source_path, "w");
+    ASSERT_NOT_NULL(source);
+    fputs("\nint alpha(void) { return 1; }\n", source);
+    fclose(source);
+    const CBMDumpNode nodes[] = {{.id = 1,
+                                  .project = "fixture",
+                                  .label = "Function",
+                                  .name = "alpha",
+                                  .qualified_name = "fixture.alpha",
+                                  .file_path = "src/alpha.c",
+                                  .start_line = 2,
+                                  .end_line = 4,
+                                  .properties = "{\"visibility\":\"public\"}"},
+                                 {.id = 2,
+                                  .project = "fixture",
+                                  .label = "Function",
+                                  .name = "beta",
+                                  .qualified_name = "fixture.beta",
+                                  .file_path = "src/alpha.c",
+                                  .start_line = 5,
+                                  .end_line = 6,
+                                  .properties = "{}"},
+                                 {.id = 3,
+                                  .project = "fixture",
+                                  .label = "Function",
+                                  .name = "aardvark",
+                                  .qualified_name = "fixture.zzz",
+                                  .file_path = "src/alpha.c",
+                                  .start_line = 7,
+                                  .end_line = 8,
+                                  .properties = "{}"},
+                                 {.id = 4,
+                                  .project = "fixture",
+                                  .label = "Function",
+                                  .name = "aardvark",
+                                  .qualified_name = "fixture.aaa",
+                                  .file_path = "src/alpha.c",
+                                  .start_line = 9,
+                                  .end_line = 10,
+                                  .properties = "{}"}};
+    const CBMDumpEdge edges[] = {{.id = 1, .project = "fixture", .source_id = 1,
+                                  .target_id = 2, .type = "CALLS", .properties = "{}"},
+                                 {.id = 2, .project = "fixture", .source_id = 2,
+                                  .target_id = 1, .type = "DEFINES", .properties = "{}"}};
+    int8_t alpha_vector[2] = {10, 0};
+    int8_t beta_vector[2] = {0, 10};
+    int8_t aardvark_vector[2] = {7, 7};
+    const CBMDumpVector node_vectors[] = {
+        {.node_id = 1, .project = "fixture", .vector = (uint8_t *)alpha_vector, .vector_len = 2},
+        {.node_id = 2, .project = "fixture", .vector = (uint8_t *)beta_vector, .vector_len = 2},
+        {.node_id = 3, .project = "fixture", .vector = (uint8_t *)aardvark_vector,
+         .vector_len = 2},
+    };
+    const CBMDumpTokenVec token_vectors[] = {
+        {.id = 1, .project = "fixture", .token = "alpha", .vector = (uint8_t *)alpha_vector,
+         .vector_len = 2, .idf = 1.0f},
+    };
+    cbm_zova_workspace_generation_input_t published = {
+        .root_path = repo_root, .project = "fixture",
+        .indexed_at = "2026-07-13T00:00:00Z",
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = 2, .nodes = nodes, .node_count = 4,
+        .edges = edges, .edge_count = 2,
+        .node_vectors = node_vectors, .node_vector_count = 3,
+        .token_vectors = token_vectors, .token_vector_count = 1,
+    };
+    cbm_zova_workspace_generation_result_t published_result = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(user_db, &published,
+                                                        &published_result), 0);
+    ASSERT_FALSE(mcp_test_path_exists(project_db));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":901,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"alpha\"}}}");
+    bool has_qn = response && strstr(response, "fixture.alpha");
+    char *metadata_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":909,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"name_pattern\":\"alpha\"}}}");
+    bool has_properties = metadata_response && strstr(metadata_response, "visibility");
+    char *vector_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":907,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"semantic_query\":[\"alpha\"]}}}");
+    bool has_vector_result = vector_response && strstr(vector_response, "semantic_results") &&
+                             strstr(vector_response, "fixture.alpha");
+    char *code_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":902,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_code\",\"arguments\":{\"project\":\"fixture\","
+        "\"pattern\":\"alpha\"}}}");
+    bool has_code = code_response && strstr(code_response, "alpha");
+    const char *snippet_request =
+        "{\"jsonrpc\":\"2.0\",\"id\":908,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"fixture\","
+        "\"qualified_name\":\"fixture.alpha\"}}}";
+    char *snippet_response = cbm_mcp_server_handle(srv, snippet_request);
+    bool has_snippet = snippet_response && strstr(snippet_response, "fixture.alpha") &&
+                       strstr(snippet_response, "visibility");
+    char *status_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":903,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"index_status\",\"arguments\":{\"project\":\"fixture\"}}}");
+    bool has_status = status_response && strstr(status_response, "\\\"status\\\":\\\"ready\\\"");
+    char *cypher_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":904,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"query_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"MATCH (n:Function) RETURN n.qualified_name\"}}}");
+    bool cypher_uses_flagged_db = cypher_response && strstr(cypher_response, "fixture.alpha") &&
+                                  !strstr(cypher_response, "\"isError\":true");
+    bool cypher_has_diagnostics = cypher_response &&
+        strstr(cypher_response, "in_database_compat") &&
+        strstr(cypher_response, "generation");
+    char *unsupported_response = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":905,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"query_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"UNWIND [1] AS x RETURN x\"}}}");
+    bool unsupported_is_structured = unsupported_response &&
+        strstr(unsupported_response, "route=unsupported") &&
+        strstr(unsupported_response, "workspace=") &&
+        strstr(unsupported_response, "operator=parser") &&
+        strstr(unsupported_response, "reason=") &&
+        strstr(unsupported_response, "\"isError\":true");
+    const char *trace_request =
+        "{\"jsonrpc\":\"2.0\",\"id\":906,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"trace_path\",\"arguments\":{\"project\":\"fixture\","
+        "\"function_name\":\"alpha\",\"direction\":\"both\",\"depth\":2}}}";
+    cbm_mcp_server_t *baseline_srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(baseline_srv);
+    cbm_store_t *baseline_store = cbm_mcp_server_store(baseline_srv);
+    ASSERT_NOT_NULL(baseline_store);
+    ASSERT_EQ(cbm_store_upsert_project(baseline_store, "fixture", repo_root), CBM_STORE_OK);
+    cbm_node_t baseline_node = {.project = "fixture", .label = "Function", .name = "alpha",
+                                .qualified_name = "fixture.alpha", .file_path = "src/alpha.c",
+                                .start_line = 2, .end_line = 4,
+                                .properties_json = "{\"visibility\":\"public\"}"};
+    int64_t baseline_alpha_id = cbm_store_upsert_node(baseline_store, &baseline_node);
+    ASSERT_GT(baseline_alpha_id, 0);
+    cbm_node_t baseline_beta = {.project = "fixture", .label = "Function", .name = "beta",
+                                .qualified_name = "fixture.beta", .file_path = "src/alpha.c",
+                                .start_line = 5, .end_line = 6, .properties_json = "{}"};
+    int64_t baseline_beta_id = cbm_store_upsert_node(baseline_store, &baseline_beta);
+    ASSERT_GT(baseline_beta_id, 0);
+    cbm_node_t baseline_aardvark = {
+        .project = "fixture", .label = "Function", .name = "aardvark",
+        .qualified_name = "fixture.zzz", .file_path = "src/alpha.c",
+        .start_line = 7, .end_line = 8, .properties_json = "{}"};
+    int64_t baseline_aardvark_id = cbm_store_upsert_node(baseline_store, &baseline_aardvark);
+    ASSERT_GT(baseline_aardvark_id, 0);
+    baseline_aardvark.qualified_name = "fixture.aaa";
+    baseline_aardvark.start_line = 9;
+    baseline_aardvark.end_line = 10;
+    ASSERT_GT(cbm_store_upsert_node(baseline_store, &baseline_aardvark), 0);
+    cbm_edge_t baseline_edge = {.project = "fixture", .source_id = baseline_alpha_id,
+                                .target_id = baseline_beta_id, .type = "CALLS",
+                                .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(baseline_store, &baseline_edge), 0);
+    baseline_edge.source_id = baseline_beta_id;
+    baseline_edge.target_id = baseline_alpha_id;
+    baseline_edge.type = "DEFINES";
+    ASSERT_GT(cbm_store_insert_edge(baseline_store, &baseline_edge), 0);
+    ASSERT_EQ(cbm_store_exec(
+                  baseline_store,
+                  "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');"
+                  "INSERT INTO nodes_fts(rowid,name,qualified_name,label,file_path) "
+                  "SELECT id,cbm_camel_split(name),qualified_name,label,file_path FROM nodes;"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_exec(
+                  baseline_store,
+                  "CREATE TABLE node_vectors(node_id INTEGER PRIMARY KEY,project TEXT NOT NULL,"
+                  "vector BLOB NOT NULL);CREATE TABLE token_vectors(id INTEGER PRIMARY KEY,"
+                  "project TEXT NOT NULL,token TEXT NOT NULL,vector BLOB NOT NULL,idf REAL NOT "
+                  "NULL);"),
+              CBM_STORE_OK);
+    sqlite3 *baseline_db = cbm_store_get_db(baseline_store);
+    sqlite3_stmt *vector_stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(baseline_db,
+                                 "INSERT INTO node_vectors VALUES(?1,'fixture',?2)",
+                                 -1, &vector_stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_alpha_id), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, alpha_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
+    sqlite3_finalize(vector_stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(baseline_db,
+                                 "INSERT INTO node_vectors VALUES(?1,'fixture',?2)",
+                                 -1, &vector_stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_aardvark_id), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, aardvark_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
+    sqlite3_finalize(vector_stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(baseline_db,
+                                 "INSERT INTO node_vectors VALUES(?1,'fixture',?2)",
+                                 -1, &vector_stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_beta_id), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, beta_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
+    sqlite3_finalize(vector_stmt);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  baseline_db,
+                  "INSERT INTO token_vectors VALUES(1,'fixture','alpha',?1,1)",
+                  -1, &vector_stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 1, alpha_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
+    sqlite3_finalize(vector_stmt);
+    cbm_mcp_server_set_project(baseline_srv, "fixture");
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+    char *vector_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":907,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"semantic_query\":[\"alpha\"]}}}");
+    char *search_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":901,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"alpha\"}}}");
+    char *metadata_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":909,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"name_pattern\":\"alpha\"}}}");
+    char *code_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":902,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_code\",\"arguments\":{\"project\":\"fixture\","
+        "\"pattern\":\"alpha\"}}}");
+    char *snippet_baseline = cbm_mcp_server_handle(baseline_srv, snippet_request);
+    char *status_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":903,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"index_status\",\"arguments\":{\"project\":\"fixture\"}}}");
+    char *cypher_baseline = cbm_mcp_server_handle(
+        baseline_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":904,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"query_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"MATCH (n:Function) RETURN n.qualified_name\"}}}");
+    char *trace_baseline = cbm_mcp_server_handle(baseline_srv, trace_request);
+    sqlite3 *legacy_db = NULL;
+    ASSERT_EQ(sqlite3_open(project_db, &legacy_db), SQLITE_OK);
+    sqlite3_backup *backup = sqlite3_backup_init(legacy_db, "main", baseline_db, "main");
+    ASSERT_NOT_NULL(backup);
+    ASSERT_EQ(sqlite3_backup_step(backup, -1), SQLITE_DONE);
+    ASSERT_EQ(sqlite3_backup_finish(backup), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(legacy_db), SQLITE_OK);
+    uint8_t project_db_before_rollback[CBM_SHA256_DIGEST_LEN];
+    ASSERT_EQ(mcp_test_file_digest(project_db, project_db_before_rollback), 0);
+    cbm_mcp_server_free(baseline_srv);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    char *trace_response = cbm_mcp_server_handle(
+        srv,
+        trace_request);
+    bool trace_uses_flagged_db = trace_response && strstr(trace_response, "alpha") &&
+                                 !strstr(trace_response, "\"isError\":true") &&
+                                 trace_baseline && strcmp(trace_response, trace_baseline) == 0;
+    bool vector_matches_baseline = vector_baseline && vector_response &&
+                                   strcmp(vector_baseline, vector_response) == 0;
+    char *search_active_normalized = mcp_normalized_tool_payload(response, false);
+    char *search_baseline_normalized = mcp_normalized_tool_payload(search_baseline, false);
+    char *metadata_active_normalized = mcp_normalized_tool_payload(metadata_response, false);
+    char *metadata_baseline_normalized = mcp_normalized_tool_payload(metadata_baseline, false);
+    char *code_active_normalized = mcp_normalized_tool_payload(code_response, true);
+    char *code_baseline_normalized = mcp_normalized_tool_payload(code_baseline, true);
+    char *snippet_active_normalized = mcp_normalized_tool_payload(snippet_response, false);
+    char *snippet_baseline_normalized = mcp_normalized_tool_payload(snippet_baseline, false);
+    char *status_active_normalized = mcp_normalized_tool_payload(status_response, false);
+    char *status_baseline_normalized = mcp_normalized_tool_payload(status_baseline, false);
+    char *cypher_active_normalized = mcp_normalized_tool_payload(cypher_response, false);
+    char *cypher_baseline_normalized = mcp_normalized_tool_payload(cypher_baseline, false);
+    bool fts_matches = search_active_normalized && search_baseline_normalized &&
+                       strcmp(search_active_normalized, search_baseline_normalized) == 0;
+    bool metadata_matches = metadata_active_normalized && metadata_baseline_normalized &&
+                            strcmp(metadata_active_normalized, metadata_baseline_normalized) == 0;
+    bool code_matches = code_active_normalized && code_baseline_normalized &&
+                        strcmp(code_active_normalized, code_baseline_normalized) == 0;
+    bool snippet_matches = snippet_active_normalized && snippet_baseline_normalized &&
+                           strcmp(snippet_active_normalized, snippet_baseline_normalized) == 0;
+    bool status_matches = status_active_normalized && status_baseline_normalized &&
+                          strcmp(status_active_normalized, status_baseline_normalized) == 0;
+    bool cypher_matches = cypher_active_normalized && cypher_baseline_normalized &&
+                          strcmp(cypher_active_normalized, cypher_baseline_normalized) == 0;
+    bool public_payloads_match_baseline = fts_matches && metadata_matches && code_matches &&
+                                          snippet_matches && status_matches && cypher_matches;
+    if (!public_payloads_match_baseline) {
+        fprintf(stderr,
+                "public payload mismatch: search=%d metadata=%d code=%d snippet=%d status=%d "
+                "cypher=%d\n",
+                fts_matches, metadata_matches, code_matches, snippet_matches, status_matches,
+                cypher_matches);
+    }
+    bool project_db_retained = mcp_test_path_exists(project_db);
+
+    sqlite3 *route_db = NULL;
+    ASSERT_EQ(sqlite3_open(user_db, &route_db), SQLITE_OK);
+    char migration_sql[4096];
+    snprintf(migration_sql, sizeof(migration_sql),
+             "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+             "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
+             "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
+             "token_vector_sha256,prepared_at) VALUES('%s',1,'fixture','%s','%s','source.zova',"
+             "1,%lld,'rolled_back','m','f','t','n','v',CURRENT_TIMESTAMP)",
+             published_result.workspace_id, repo_root, project_db,
+             (long long)published_result.generation);
+    ASSERT_EQ(sqlite3_exec(route_db, migration_sql, NULL, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(route_db), SQLITE_OK);
+    cbm_mcp_server_t *rolled_srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(rolled_srv);
+    char *rolled_search = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":901,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"alpha\"}}}");
+    char *rolled_metadata = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":909,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"name_pattern\":\"alpha\"}}}");
+    char *rolled_code = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":902,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_code\",\"arguments\":{\"project\":\"fixture\","
+        "\"pattern\":\"alpha\"}}}");
+    char *rolled_snippet = cbm_mcp_server_handle(rolled_srv, snippet_request);
+    char *rolled_status = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":903,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"index_status\",\"arguments\":{\"project\":\"fixture\"}}}");
+    char *rolled_cypher = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":904,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"query_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"MATCH (n:Function) RETURN n.qualified_name\"}}}");
+    char *rolled_vector = cbm_mcp_server_handle(
+        rolled_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":907,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"semantic_query\":[\"alpha\"]}}}");
+    char *rolled_trace = cbm_mcp_server_handle(rolled_srv, trace_request);
+    char *rolled_code_normalized = mcp_normalized_tool_payload(rolled_code, true);
+    bool rollback_payloads_match =
+        rolled_search && strcmp(rolled_search, search_baseline) == 0 &&
+        rolled_metadata && strcmp(rolled_metadata, metadata_baseline) == 0 &&
+        rolled_code_normalized && code_baseline_normalized &&
+        strcmp(rolled_code_normalized, code_baseline_normalized) == 0 &&
+        rolled_snippet && strcmp(rolled_snippet, snippet_baseline) == 0 &&
+        rolled_status && strcmp(rolled_status, status_baseline) == 0 &&
+        rolled_cypher && strcmp(rolled_cypher, cypher_baseline) == 0 &&
+        rolled_vector && strcmp(rolled_vector, vector_baseline) == 0 &&
+        rolled_trace && strcmp(rolled_trace, trace_baseline) == 0;
+    uint8_t project_db_after_rollback[CBM_SHA256_DIGEST_LEN];
+    bool rollback_source_bytes_preserved =
+        mcp_test_file_digest(project_db, project_db_after_rollback) == 0 &&
+        memcmp(project_db_before_rollback, project_db_after_rollback,
+               sizeof(project_db_before_rollback)) == 0;
+    cbm_mcp_server_free(rolled_srv);
+
+    ASSERT_EQ(sqlite3_open(user_db, &route_db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(route_db,
+                           "UPDATE cbm_workspace_migrations_v1 SET state='active'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_close(route_db), SQLITE_OK);
+    cbm_mcp_server_t *reactivated_srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(reactivated_srv);
+    char *reactivated_search = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":901,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"alpha\"}}}");
+    char *reactivated_metadata = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":909,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"name_pattern\":\"alpha\"}}}");
+    char *reactivated_code = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":902,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_code\",\"arguments\":{\"project\":\"fixture\","
+        "\"pattern\":\"alpha\"}}}");
+    char *reactivated_snippet = cbm_mcp_server_handle(reactivated_srv, snippet_request);
+    char *reactivated_status = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":903,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"index_status\",\"arguments\":{\"project\":\"fixture\"}}}");
+    char *reactivated_cypher = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":904,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"query_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"query\":\"MATCH (n:Function) RETURN n.qualified_name\"}}}");
+    char *reactivated_vector = cbm_mcp_server_handle(
+        reactivated_srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":907,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"fixture\","
+        "\"semantic_query\":[\"alpha\"]}}}");
+    char *reactivated_trace = cbm_mcp_server_handle(reactivated_srv, trace_request);
+    char *reactivated_code_normalized = mcp_normalized_tool_payload(reactivated_code, true);
+    bool reactivation_payloads_match =
+        reactivated_search && strcmp(reactivated_search, response) == 0 &&
+        reactivated_metadata && strcmp(reactivated_metadata, metadata_response) == 0 &&
+        reactivated_code_normalized && code_active_normalized &&
+        strcmp(reactivated_code_normalized, code_active_normalized) == 0 &&
+        reactivated_snippet && strcmp(reactivated_snippet, snippet_response) == 0 &&
+        reactivated_status && strcmp(reactivated_status, status_response) == 0 &&
+        reactivated_cypher && strcmp(reactivated_cypher, cypher_response) == 0 &&
+        reactivated_vector && strcmp(reactivated_vector, vector_response) == 0 &&
+        reactivated_trace && strcmp(reactivated_trace, trace_response) == 0;
+    cbm_mcp_server_free(reactivated_srv);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(user_db);
+    char wal[520], shm[520];
+    snprintf(wal, sizeof(wal), "%s-wal", user_db);
+    snprintf(shm, sizeof(shm), "%s-shm", user_db);
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+    cbm_unlink(project_db);
+    cbm_unlink(source_path);
+    cbm_rmdir(source_dir);
+    cbm_rmdir(repo_root);
+    cbm_rmdir(cache);
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1); else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1); else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1); else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_cache_copy); free(saved_flag_copy); free(saved_mode_copy);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(has_qn);
+    ASSERT_TRUE(has_properties);
+    ASSERT_TRUE(has_vector_result);
+    ASSERT_NOT_NULL(strstr(vector_response,
+                           "\"results\":[{\"name\":\"aardvark\","
+                           "\"qualified_name\":\"fixture.aaa\""));
+    const char *aardvark_result = strstr(vector_response, "aardvark");
+    ASSERT_NOT_NULL(aardvark_result);
+    aardvark_result = strstr(aardvark_result + 1, "aardvark");
+    ASSERT_NOT_NULL(aardvark_result);
+    const char *aardvark_score = strstr(aardvark_result, "\\\"score\\\":");
+    ASSERT_NOT_NULL(aardvark_score);
+    const char *score_dot = strchr(aardvark_score, '.');
+    const char *score_end = score_dot ? strpbrk(score_dot, ",}") : NULL;
+    ASSERT_NOT_NULL(score_dot);
+    ASSERT_NOT_NULL(score_end);
+    ASSERT_TRUE((score_end - score_dot - 1) <= 12);
+    ASSERT_TRUE(has_code);
+    ASSERT_TRUE(has_snippet);
+    ASSERT_TRUE(has_status);
+    ASSERT_TRUE(cypher_uses_flagged_db);
+    ASSERT_TRUE(cypher_has_diagnostics);
+    ASSERT_TRUE(unsupported_is_structured);
+    ASSERT_TRUE(trace_uses_flagged_db);
+    ASSERT_TRUE(vector_matches_baseline);
+    ASSERT_TRUE(public_payloads_match_baseline);
+    ASSERT_TRUE(rollback_payloads_match);
+    ASSERT_TRUE(rollback_source_bytes_preserved);
+    ASSERT_TRUE(reactivation_payloads_match);
+    ASSERT_TRUE(project_db_retained);
+    free(response);
+    free(metadata_response);
+    free(vector_response);
+    free(code_response);
+    free(snippet_response);
+    free(status_response);
+    free(cypher_response);
+    free(unsupported_response);
+    free(trace_response);
+    free(trace_baseline);
+    free(vector_baseline);
+    free(search_baseline);
+    free(metadata_baseline);
+    free(code_baseline);
+    free(snippet_baseline);
+    free(status_baseline);
+    free(cypher_baseline);
+    free(rolled_search);
+    free(rolled_metadata);
+    free(rolled_code);
+    free(rolled_code_normalized);
+    free(rolled_snippet);
+    free(rolled_status);
+    free(rolled_cypher);
+    free(rolled_vector);
+    free(rolled_trace);
+    free(reactivated_search);
+    free(reactivated_metadata);
+    free(reactivated_code);
+    free(reactivated_code_normalized);
+    free(reactivated_snippet);
+    free(reactivated_status);
+    free(reactivated_cypher);
+    free(reactivated_vector);
+    free(reactivated_trace);
+    free(search_active_normalized);
+    free(search_baseline_normalized);
+    free(metadata_active_normalized);
+    free(metadata_baseline_normalized);
+    free(code_active_normalized);
+    free(code_baseline_normalized);
+    free(snippet_active_normalized);
+    free(snippet_baseline_normalized);
+    free(status_active_normalized);
+    free(status_baseline_normalized);
+    free(cypher_active_normalized);
+    free(cypher_baseline_normalized);
+    PASS();
+#endif
+}
+
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
@@ -929,8 +1635,8 @@ TEST(tool_trace_call_path_ambiguous) {
                     .file_path = "b.c",
                     .start_line = 10,
                     .end_line = 20}; /* equal span -> genuine tie */
-    ASSERT_GT(cbm_store_upsert_node(st, &a), 0);
     ASSERT_GT(cbm_store_upsert_node(st, &b), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &a), 0);
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
@@ -942,6 +1648,11 @@ TEST(tool_trace_call_path_ambiguous) {
     ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
     ASSERT_NOT_NULL(strstr(inner, "suggestions"));
     ASSERT_NULL(strstr(inner, "\"callees\""));
+    const char *a_suggestion = strstr(inner, "amb-proj.a.amb");
+    const char *b_suggestion = strstr(inner, "amb-proj.b.amb");
+    ASSERT_NOT_NULL(a_suggestion);
+    ASSERT_NOT_NULL(b_suggestion);
+    ASSERT_TRUE(a_suggestion < b_suggestion);
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
@@ -1096,8 +1807,8 @@ TEST(tool_trace_call_path_graph_read_matches_sqlite) {
         free(sqlite_result);
     }
 
-    /* Graph reads default to Zova when a current sidecar is present. The
-     * parser remains OFF when unset so vector reads retain their own mode. */
+    /* Graph reads default to Zova when a current sidecar is present. Unset
+     * mode also enables the default vector authority policy. */
     cbm_unsetenv("CBM_ZOVA_MODE");
     char *default_result = cbm_mcp_handle_tool(
         srv, "trace_path",
@@ -5213,6 +5924,10 @@ TEST(index_repository_honors_allowed_root) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
+#if CBM_WITH_ZOVA
+    RUN_TEST(mcp_migration_route_is_explicit_and_never_fallback);
+#endif
+    RUN_TEST(index_job_queue_is_fifo_and_blocks_second_contender);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(index_repository_honors_allowed_root);
@@ -5290,6 +6005,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_search_graph_flagged_reads_user_database_without_project_db);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);

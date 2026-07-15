@@ -190,24 +190,21 @@ static int inject_callee_tokens(const char *name, char **tokens, int count, int 
     return count;
 }
 
+static const char **collect_sorted_call_neighbors(const cbm_gbuf_t *gbuf, int64_t node_id,
+                                                  bool outbound, int *out_n);
+
 /* Walk the outbound CALLS edges of n and inject tokens for each target. */
 static int inject_calls_pattern_tokens(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf,
                                        char **tokens, int count, int max_tokens) {
     if (!gbuf) {
         return count;
     }
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ec = 0;
-    if (cbm_gbuf_find_edges_by_source_type(gbuf, n->id, "CALLS", &edges, &ec) != 0) {
-        return count;
+    int neighbor_count = 0;
+    const char **names = collect_sorted_call_neighbors(gbuf, n->id, true, &neighbor_count);
+    for (int i = 0; i < neighbor_count && count < max_tokens; i++) {
+        count = inject_callee_tokens(names[i], tokens, count, max_tokens);
     }
-    for (int e = 0; e < ec && count < max_tokens; e++) {
-        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(gbuf, edges[e]->target_id);
-        if (!t || !t->name) {
-            continue;
-        }
-        count = inject_callee_tokens(t->name, tokens, count, max_tokens);
-    }
+    free(names);
     return count;
 }
 

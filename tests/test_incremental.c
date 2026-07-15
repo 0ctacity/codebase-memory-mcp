@@ -18,6 +18,7 @@
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
+#include <foundation/platform.h>
 
 #include <stdarg.h>
 #include <string.h>
@@ -227,13 +228,13 @@ static int incremental_setup(void) {
     if (!g_project)
         return -1;
 
-    const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/.cache/codebase-memory-mcp/%s.db", home, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
+    /* CBM_CACHE_DIR is the production cache override.  The old test derived
+     * this path from HOME, which made isolated lifecycle runs open a second,
+     * empty database whenever the runner supplied CBM_CACHE_DIR. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir || !cache_dir[0])
+        return -1;
+    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project);
     cbm_mkdir(cache_dir);
 
     unlink(g_dbpath);

@@ -118,7 +118,12 @@ struct cbm_store {
     bool zova_graph_session_stat_valid;
     char *zova_graph_workspace_root;
     char zova_graph_workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    int64_t zova_graph_cached_numeric_id;
+    char zova_graph_cached_stable_id[CBM_ZOVA_WORKSPACE_ID_MAX + 96];
+    bool zova_graph_cached_stable_id_valid;
     cbm_zova_graph_metrics_t zova_graph_last_metrics;
+    bool zova_workspace_query;
+    int zova_native_topology_ops;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -681,8 +686,16 @@ cbm_store_t *cbm_store_open_memory(void) {
     return store_open_internal(":memory:", true);
 }
 
+static bool store_cleanup_pending(const char *db_path) {
+    char marker[2048];
+    int n = snprintf(marker, sizeof(marker), "%s.cbm-cleanup-pending", db_path ? db_path : "");
+    if (n <= 0 || (size_t)n >= sizeof(marker)) return false;
+    struct stat marker_stat;
+    return lstat(marker, &marker_stat) == 0;
+}
+
 cbm_store_t *cbm_store_open_path(const char *db_path) {
-    if (!db_path) {
+    if (!db_path || store_cleanup_pending(db_path)) {
         return NULL;
     }
     return store_open_internal(db_path, false);
@@ -752,7 +765,7 @@ static bool build_immutable_uri(const char *path, char *out, size_t out_sz) {
 }
 
 cbm_store_t *cbm_store_open_path_query(const char *db_path) {
-    if (!db_path) {
+    if (!db_path || store_cleanup_pending(db_path)) {
         return NULL;
     }
 
@@ -832,6 +845,81 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     return s;
+}
+
+static int64_t store_stable_numeric_id(const char *value) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)value; p && *p; ++p)
+        hash = (hash ^ *p) * 1099511628211ULL;
+    return (int64_t)(hash & INT64_MAX);
+}
+
+static void sqlite_stable_numeric_id(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    const unsigned char *value = sqlite3_value_text(argv[0]);
+    if (!value) {
+        sqlite3_result_null(ctx);
+        return;
+    }
+    sqlite3_result_int64(ctx, (sqlite3_int64)store_stable_numeric_id((const char *)value));
+}
+
+cbm_store_t *cbm_store_open_zova_workspace_query(const char *db_path,
+                                                 const char *workspace_id) {
+    if (!db_path || cbm_zova_workspace_id_validate(workspace_id) != 0) return NULL;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) return NULL;
+    /* A user-local database can hold several workspaces, and graph hydration
+     * precedes vector sampling on the same handle. A bounded 256 MiB ceiling
+     * keeps both working sets resident on large repositories without changing
+     * compatibility project-store behavior. SQLite allocates pages lazily. */
+    if (sqlite3_exec(s->db, "PRAGMA cache_size=-262144", NULL, NULL, NULL) != SQLITE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    (void)sqlite3_exec(s->db, "PRAGMA query_only=OFF", NULL, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_stable_numeric_id", 1,
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_stable_numeric_id, NULL, NULL);
+    char sql[CBM_SZ_4K];
+    int n = snprintf(
+        sql, sizeof(sql),
+        "CREATE TEMP VIEW projects AS SELECT project AS name,indexed_at,root_path "
+        "FROM cbm_projects_v1 WHERE workspace_id='%s';"
+        "CREATE TEMP VIEW nodes AS SELECT cbm_stable_numeric_id(node_id) AS id,project,label,"
+        "name,qualified_name,file_path,start_line,end_line,properties "
+        "FROM cbm_nodes_v1 WHERE workspace_id='%s';"
+        "CREATE TEMP VIEW edges AS SELECT cbm_stable_numeric_id(edge_id) AS id,"
+        "(SELECT project FROM cbm_projects_v1 p WHERE p.workspace_id=cbm_edges_v1.workspace_id) AS project,"
+        "cbm_stable_numeric_id(source_node_id) AS source_id,"
+        "cbm_stable_numeric_id(target_node_id) AS target_id,edge_type AS type,properties "
+        "FROM cbm_edges_v1 WHERE workspace_id='%s';"
+        "CREATE TEMP VIEW node_vectors AS SELECT cbm_stable_numeric_id(node_id) AS node_id,"
+        "(SELECT project FROM cbm_projects_v1 p "
+        "WHERE p.workspace_id=cbm_node_vectors_compat_v1.workspace_id) AS project,vector "
+        "FROM cbm_node_vectors_compat_v1 WHERE workspace_id='%s';"
+        "CREATE TEMP VIEW token_vectors AS SELECT token_id AS id,"
+        "(SELECT project FROM cbm_projects_v1 p "
+        "WHERE p.workspace_id=cbm_token_vectors_compat_v1.workspace_id) AS project,"
+        "token,vector,idf FROM cbm_token_vectors_compat_v1 WHERE workspace_id='%s';",
+        workspace_id, workspace_id, workspace_id, workspace_id, workspace_id);
+    if (n < 0 || (size_t)n >= sizeof(sql) || sqlite3_exec(s->db, sql, NULL, NULL, NULL) != SQLITE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    (void)sqlite3_exec(s->db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    s->zova_graph_session = cbm_zova_graph_session_open(db_path);
+    if (!s->zova_graph_session) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    snprintf(s->zova_graph_workspace_id, sizeof(s->zova_graph_workspace_id), "%s", workspace_id);
+    s->zova_workspace_query = true;
+    return s;
+}
+
+int cbm_store_zova_native_topology_ops(const cbm_store_t *s) {
+    return s ? s->zova_native_topology_ops : 0;
 }
 
 /* ── Integrity check ───────────────────────────────────────────── */
@@ -1430,7 +1518,8 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
     return find_nodes_generic(s, &s->stmt_find_nodes_by_label,
                               "SELECT id, project, label, name, qualified_name, file_path, "
                               "start_line, end_line, properties FROM nodes "
-                              "WHERE project = ?1 AND label = ?2;",
+                              "WHERE project = ?1 AND label = ?2 "
+                              "ORDER BY qualified_name,file_path,start_line,end_line,id;",
                               project, label, out, count);
 }
 
@@ -1638,8 +1727,49 @@ static void bind_proj_and_type(sqlite3_stmt *stmt, const void *data) {
     bind_text(stmt, ST_COL_2, b->type);
 }
 
+static int store_zova_workspace_edges(cbm_store_t *s, int64_t node_numeric_id,
+                                      const char *direction, const char *type,
+                                      cbm_edge_t **out, int *count) {
+    if (!s || !s->zova_workspace_query || !s->zova_graph_session || !out || !count)
+        return CBM_STORE_NOT_FOUND;
+    *out = NULL; *count = 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,"SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+                                "AND cbm_stable_numeric_id(node_id)=?2",-1,&stmt,NULL)!=SQLITE_OK)
+        return CBM_STORE_ERR;
+    bind_text(stmt,1,s->zova_graph_workspace_id);sqlite3_bind_int64(stmt,2,node_numeric_id);
+    char stable[CBM_ZOVA_WORKSPACE_ID_MAX+96]={0};
+    if(sqlite3_step(stmt)==SQLITE_ROW){const char *v=(const char*)sqlite3_column_text(stmt,0);
+        if(v)snprintf(stable,sizeof(stable),"%s",v);}sqlite3_finalize(stmt);
+    if(!stable[0])return CBM_STORE_NOT_FOUND;
+    char graph[CBM_ZOVA_WORKSPACE_ID_MAX+32];
+    if(cbm_zova_workspace_graph_name(s->zova_graph_workspace_id,graph,sizeof(graph))!=0)
+        return CBM_STORE_ERR;
+    const char *types[1]={type};cbm_zova_graph_adjacency_t *native=NULL;int native_count=0;
+    if(cbm_zova_graph_session_adjacency(s->zova_graph_session,s->zova_graph_workspace_id,graph,
+        stable,direction,type?types:NULL,type?1:0,100000,&native,&native_count)!=0)return CBM_STORE_ERR;
+    cbm_node_t root={0};if(cbm_store_find_node_by_id(s,node_numeric_id,&root)!=CBM_STORE_OK){
+        cbm_zova_graph_adjacency_free(native,native_count);return CBM_STORE_ERR;}
+    cbm_edge_t *edges=native_count?calloc((size_t)native_count,sizeof(*edges)):NULL;
+    if(native_count&&!edges){cbm_node_free_fields(&root);cbm_zova_graph_adjacency_free(native,native_count);return CBM_STORE_ERR;}
+    for(int i=0;i<native_count;i++){
+        char identity[CBM_SZ_1K];snprintf(identity,sizeof(identity),"%s|%s|%s",
+            native[i].source_node_id,native[i].edge_type,native[i].target_node_id);
+        edges[i].id=store_stable_numeric_id(identity);
+        edges[i].project=heap_strdup(root.project?root.project:"");
+        edges[i].source_id=store_stable_numeric_id(native[i].source_node_id);
+        edges[i].target_id=store_stable_numeric_id(native[i].target_node_id);
+        edges[i].type=heap_strdup(native[i].edge_type);
+        edges[i].properties_json=heap_strdup(native[i].properties?native[i].properties:"{}");
+    }
+    cbm_node_free_fields(&root);cbm_zova_graph_adjacency_free(native,native_count);
+    *out=edges;*count=native_count;s->zova_native_topology_ops++;return CBM_STORE_OK;
+}
+
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
                                    int *count) {
+    if (s && s->zova_workspace_query)
+        return store_zova_workspace_edges(s,source_id,"outbound",NULL,out,count);
     bind_id_t b = {source_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_source,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -1649,6 +1779,8 @@ int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t
 
 int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t **out,
                                    int *count) {
+    if (s && s->zova_workspace_query)
+        return store_zova_workspace_edges(s,target_id,"inbound",NULL,out,count);
     bind_id_t b = {target_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_target,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -1658,6 +1790,8 @@ int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t
 
 int cbm_store_find_edges_by_source_type(cbm_store_t *s, int64_t source_id, const char *type,
                                         cbm_edge_t **out, int *count) {
+    if (s && s->zova_workspace_query)
+        return store_zova_workspace_edges(s,source_id,"outbound",type,out,count);
     bind_id_type_t b = {source_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_source_type,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -1667,6 +1801,8 @@ int cbm_store_find_edges_by_source_type(cbm_store_t *s, int64_t source_id, const
 
 int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const char *type,
                                         cbm_edge_t **out, int *count) {
+    if (s && s->zova_workspace_query)
+        return store_zova_workspace_edges(s,target_id,"inbound",type,out,count);
     bind_id_type_t b = {target_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_target_type,
                               "SELECT id, project, source_id, target_id, type, properties "
@@ -1971,6 +2107,44 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
     *in_deg = 0;
     *out_deg = 0;
 
+    if (s->zova_workspace_query) {
+        sqlite3_stmt *stmt = NULL;
+        char stable[CBM_ZOVA_WORKSPACE_ID_MAX + 96] = {0};
+        char graph[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+        if (!s->zova_graph_session ||
+            sqlite3_prepare_v2(s->db,
+                               "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+                               "AND cbm_stable_numeric_id(node_id)=?2",
+                               -1, &stmt, NULL) != SQLITE_OK) {
+            return;
+        }
+        bind_text(stmt, 1, s->zova_graph_workspace_id);
+        sqlite3_bind_int64(stmt, 2, node_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *value = (const char *)sqlite3_column_text(stmt, 0);
+            if (value) snprintf(stable, sizeof(stable), "%s", value);
+        }
+        sqlite3_finalize(stmt);
+        if (!stable[0] ||
+            cbm_zova_workspace_graph_name(s->zova_graph_workspace_id, graph,
+                                          sizeof(graph)) != 0) {
+            return;
+        }
+        const char *types[] = {"CALLS"};
+        if (cbm_zova_graph_session_degree(s->zova_graph_session,
+                                          s->zova_graph_workspace_id, graph, stable,
+                                          "inbound", types, 1, in_deg) != 0 ||
+            cbm_zova_graph_session_degree(s->zova_graph_session,
+                                          s->zova_graph_workspace_id, graph, stable,
+                                          "outbound", types, 1, out_deg) != 0) {
+            *in_deg = 0;
+            *out_deg = 0;
+            return;
+        }
+        s->zova_native_topology_ops += 2;
+        return;
+    }
+
     const char *in_sql = "SELECT COUNT(*) FROM edges WHERE target_id = ?1 AND type = 'CALLS'";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, in_sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
@@ -2139,6 +2313,32 @@ int cbm_store_batch_count_degrees(cbm_store_t *s, const int64_t *node_ids, int i
 
     memset(out_in, 0, (size_t)id_count * sizeof(int));
     memset(out_out, 0, (size_t)id_count * sizeof(int));
+
+    if (s->zova_workspace_query) {
+        for (int i = 0; i < id_count; ++i) {
+            if (!edge_type || strcmp(edge_type, "CALLS") == 0) {
+                cbm_store_node_degree(s, node_ids[i], &out_in[i], &out_out[i]);
+                continue;
+            }
+            cbm_edge_t *edges = NULL;
+            int count = 0;
+            if (store_zova_workspace_edges(s, node_ids[i], "inbound", edge_type,
+                                           &edges, &count) != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
+            out_in[i] = count;
+            cbm_store_free_edges(edges, count);
+            edges = NULL;
+            count = 0;
+            if (store_zova_workspace_edges(s, node_ids[i], "outbound", edge_type,
+                                           &edges, &count) != CBM_STORE_OK) {
+                return CBM_STORE_ERR;
+            }
+            out_out[i] = count;
+            cbm_store_free_edges(edges, count);
+        }
+        return CBM_STORE_OK;
+    }
 
     /* Build IN clause: (?,?,?) */
     char in_clause[CBM_SZ_4K];
@@ -2672,8 +2872,11 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     int offset = params->offset;
     const char *name_col = has_degree_filter ? "name" : "n.name";
     char order_limit[CBM_SZ_128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
+    snprintf(order_limit, sizeof(order_limit),
+             has_degree_filter
+                 ? " ORDER BY %s, qualified_name, id LIMIT %d OFFSET %d"
+                 : " ORDER BY %s, n.qualified_name, n.id LIMIT %d OFFSET %d",
+             name_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     /* Execute count query */
@@ -2839,16 +3042,113 @@ static void bfs_build_types_clause(int edge_type_count, char *buf, int buf_sz) {
     }
 }
 
+static int store_find_cached_zova_workspace_node(cbm_store_t *s, int64_t node_numeric_id,
+                                                 cbm_node_t *out) {
+    if (!s || !out || !s->zova_workspace_query ||
+        !s->zova_graph_cached_stable_id_valid ||
+        s->zova_graph_cached_numeric_id != node_numeric_id) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "SELECT cbm_stable_numeric_id(node_id),project,label,name,qualified_name,"
+        "file_path,start_line,end_line,properties FROM cbm_nodes_v1 "
+        "WHERE workspace_id=?1 AND node_id=?2";
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, s->zova_graph_workspace_id);
+    bind_text(stmt, 2, s->zova_graph_cached_stable_id);
+    int rc = sqlite3_step(stmt) == SQLITE_ROW ? CBM_STORE_OK : CBM_STORE_NOT_FOUND;
+    if (rc == CBM_STORE_OK) scan_node(stmt, out);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int store_zova_workspace_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
+                                    const char **edge_types, int edge_type_count, int max_depth,
+                                    int max_results, cbm_traverse_result_t *out) {
+    if (!s->zova_workspace_query || !s->zova_graph_session ||
+        (edge_type_count > 1) ||
+        (edge_type_count == 1 && strcmp(edge_types[0], "CALLS") != 0) ||
+        (direction && strcmp(direction, "outbound") != 0 && strcmp(direction, "inbound") != 0))
+        return CBM_STORE_NOT_FOUND;
+    char stable_copy[CBM_ZOVA_WORKSPACE_ID_MAX + 96];
+    stable_copy[0] = '\0';
+    if (s->zova_graph_cached_stable_id_valid &&
+        s->zova_graph_cached_numeric_id == start_id) {
+        snprintf(stable_copy, sizeof(stable_copy), "%s",
+                 s->zova_graph_cached_stable_id);
+    } else {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+                "AND cbm_stable_numeric_id(node_id)=?2", -1, &stmt, NULL) != SQLITE_OK)
+            return CBM_STORE_ERR;
+        bind_text(stmt, 1, s->zova_graph_workspace_id);
+        sqlite3_bind_int64(stmt, 2, start_id);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const char *stable = (const char *)sqlite3_column_text(stmt, 0);
+            snprintf(stable_copy, sizeof(stable_copy), "%s", stable ? stable : "");
+        }
+        sqlite3_finalize(stmt);
+        if (stable_copy[0]) {
+            s->zova_graph_cached_numeric_id = start_id;
+            snprintf(s->zova_graph_cached_stable_id,
+                     sizeof(s->zova_graph_cached_stable_id), "%s", stable_copy);
+            s->zova_graph_cached_stable_id_valid = true;
+        }
+    }
+    if (!stable_copy[0]) return CBM_STORE_NOT_FOUND;
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    if (cbm_zova_workspace_graph_name(s->zova_graph_workspace_id, graph_name,
+                                      sizeof(graph_name)) != 0) return CBM_STORE_ERR;
+    cbm_zova_graph_visit_t *visits = NULL;
+    int count = 0;
+    cbm_zova_graph_metrics_t metrics = {0};
+    if (cbm_zova_graph_session_walk_calls(
+            s->zova_graph_session, s->zova_graph_workspace_id, graph_name, stable_copy,
+            direction ? direction : "outbound", max_depth, max_results, &visits, &count,
+            &metrics) != 0) return CBM_STORE_ERR;
+    cbm_node_hop_t *items = count ? calloc((size_t)count, sizeof(*items)) : NULL;
+    if (count && !items) { cbm_zova_graph_visits_free(visits, count); return CBM_STORE_ERR; }
+    for (int i = 0; i < count; ++i) {
+        items[i].node.id = store_stable_numeric_id(visits[i].node_id);
+        items[i].node.project = heap_strdup(out->root.project ? out->root.project : "");
+        items[i].node.label = visits[i].label; visits[i].label = NULL;
+        items[i].node.name = visits[i].name; visits[i].name = NULL;
+        items[i].node.qualified_name = visits[i].qualified_name; visits[i].qualified_name = NULL;
+        items[i].node.file_path = visits[i].file_path; visits[i].file_path = NULL;
+        items[i].node.start_line = visits[i].start_line;
+        items[i].node.end_line = visits[i].end_line;
+        items[i].node.properties_json = visits[i].properties; visits[i].properties = NULL;
+        items[i].hop = visits[i].hop;
+    }
+    cbm_zova_graph_visits_free(visits, count);
+    out->visited = items;
+    out->visited_count = count;
+    s->zova_native_topology_ops++;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
 
     cbm_node_t root = {0};
-    int rc = cbm_store_find_node_by_id(s, start_id, &root);
+    int rc = store_find_cached_zova_workspace_node(s, start_id, &root);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        rc = cbm_store_find_node_by_id(s, start_id, &root);
+    }
     if (rc != CBM_STORE_OK) {
         return rc;
     }
     out->root = root;
+
+    rc = store_zova_workspace_bfs(s, start_id, direction, edge_types, edge_type_count,
+                                  max_depth, max_results, out);
+    if (rc == CBM_STORE_OK) return rc;
+    if (s->zova_workspace_query) return rc;
 
     char types_clause[CBM_SZ_512];
     bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
@@ -6052,6 +6352,50 @@ int cbm_store_adr_update_sections(cbm_store_t *s, const char *project, const cha
     return cbm_store_adr_get(s, project, out);
 }
 
+int cbm_store_project_summary_export(cbm_store_t *s, const char *project,
+                                      cbm_project_summary_export_t *out) {
+    if (!s || !project || !out) return CBM_STORE_ERR;
+    memset(out, 0, sizeof(*out));
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT summary, source_hash, created_at, updated_at "
+                      "FROM project_summaries WHERE project=?1";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "project_summary_export_prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (step != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "project_summary_export_step");
+        return CBM_STORE_ERR;
+    }
+    out->summary = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->source_hash = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+    out->created_at = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+    out->updated_at = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+    sqlite3_finalize(stmt);
+    if (!out->summary || !out->source_hash || !out->created_at || !out->updated_at) {
+        cbm_store_project_summary_export_free(out);
+        store_set_error(s, "project summary export allocation failed");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+void cbm_store_project_summary_export_free(cbm_project_summary_export_t *row) {
+    if (!row) return;
+    free(row->summary);
+    free(row->source_hash);
+    free(row->created_at);
+    free(row->updated_at);
+    memset(row, 0, sizeof(*row));
+}
+
 void cbm_store_adr_free(cbm_adr_t *adr) {
     if (!adr) {
         return;
@@ -6317,6 +6661,63 @@ static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
     return min_score;
 }
 
+typedef struct {
+    char *node_id;
+    double score;
+} vs_workspace_vector_candidate_t;
+
+static bool vs_workspace_candidate_is_worse(const vs_workspace_vector_candidate_t *a,
+                                             const vs_workspace_vector_candidate_t *b) {
+    return a->score < b->score ||
+           (a->score == b->score && strcmp(a->node_id, b->node_id) > 0);
+}
+
+static void vs_workspace_candidate_swap(vs_workspace_vector_candidate_t *a,
+                                        vs_workspace_vector_candidate_t *b) {
+    vs_workspace_vector_candidate_t tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+static void vs_workspace_candidate_sift_up(vs_workspace_vector_candidate_t *heap, int index) {
+    while (index > 0) {
+        int parent = (index - 1) / 2;
+        if (!vs_workspace_candidate_is_worse(&heap[index], &heap[parent])) break;
+        vs_workspace_candidate_swap(&heap[index], &heap[parent]);
+        index = parent;
+    }
+}
+
+static void vs_workspace_candidate_sift_down(vs_workspace_vector_candidate_t *heap, int count,
+                                             int index) {
+    for (;;) {
+        int left = index * 2 + 1;
+        if (left >= count) break;
+        int right = left + 1;
+        int worst = left;
+        if (right < count && vs_workspace_candidate_is_worse(&heap[right], &heap[left])) {
+            worst = right;
+        }
+        if (!vs_workspace_candidate_is_worse(&heap[worst], &heap[index])) break;
+        vs_workspace_candidate_swap(&heap[index], &heap[worst]);
+        index = worst;
+    }
+}
+
+static double vs_cosine_i8_with_query_magnitude(const int8_t *node_vec, int node_vec_len,
+                                                const int8_t query[VS_VEC_DIM],
+                                                int32_t query_magnitude) {
+    if (!node_vec || node_vec_len != VS_VEC_DIM || query_magnitude <= 0) return 0.0;
+    int32_t dot = 0;
+    int32_t node_magnitude = 0;
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        dot += (int32_t)query[d] * (int32_t)node_vec[d];
+        node_magnitude += (int32_t)node_vec[d] * (int32_t)node_vec[d];
+    }
+    double denom = sqrt((double)query_magnitude * (double)node_magnitude);
+    return denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0;
+}
+
 /* Append one candidate row read from the scan statement into the result
  * vector.  Grows the results array geometrically on demand.  Returns the
  * (possibly grown) results pointer, or NULL on allocation failure. */
@@ -6354,7 +6755,11 @@ static void vs_sort_and_trim(cbm_vector_result_t *results, int *count, int limit
     }
     for (int i = 0; i < *count - SKIP_ONE; i++) {
         for (int j = i + SKIP_ONE; j < *count; j++) {
-            if (results[j].score > results[i].score) {
+            bool higher_score = results[j].score > results[i].score;
+            bool stable_tie = results[j].score == results[i].score &&
+                              strcmp(results[j].qualified_name ? results[j].qualified_name : "",
+                                     results[i].qualified_name ? results[i].qualified_name : "") < 0;
+            if (higher_score || stable_tie) {
                 cbm_vector_result_t tmp = results[i];
                 results[i] = results[j];
                 results[j] = tmp;
@@ -6594,10 +6999,25 @@ int cbm_store_zova_walk_calls(cbm_store_t *s, const char *project, const cbm_nod
     }
     cbm_zova_graph_session_t *session = store_get_zova_graph_session(s, sidecar_path);
     int64_t sidecar_generation = 0;
-    if (!session || cbm_zova_graph_session_generation(session, &sidecar_generation) != 0 ||
-        !store_zova_generation_is_ready(s, project_row.root_path, workspace_id,
-                                        sidecar_generation) ||
-        cbm_zova_graph_session_walk_calls(session, workspace_id, graph_name, node_id,
+    bool generation_ready = session &&
+                             cbm_zova_graph_session_generation(session, &sidecar_generation) == 0 &&
+                             store_zova_generation_is_ready(s, project_row.root_path, workspace_id,
+                                                            sidecar_generation);
+    if (!generation_ready) {
+        if (session) {
+            metrics.generation_mismatch = true;
+            cbm_log_warn("zova.fallback", "path", "graph", "reason", "generation_mismatch",
+                         "project", project);
+        }
+        if (session) {
+            store_close_zova_graph_session(s);
+        }
+        cbm_zova_graph_visits_free(*out_visits, *out_count);
+        *out_visits = NULL;
+        *out_count = 0;
+        goto done;
+    }
+    if (cbm_zova_graph_session_walk_calls(session, workspace_id, graph_name, node_id,
                                           direction, max_depth, max_results, out_visits, out_count,
                                           &metrics) != 0) {
         if (session) {
@@ -6672,13 +7092,182 @@ static bool store_zova_vector_generation_is_ready(cbm_store_t *s, const char *pr
     return ready;
 }
 
+static int vs_try_zova_workspace_sql_vector_search(
+    cbm_store_t *s, const char *project, const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw,
+    int limit, cbm_vector_result_t **out, int *out_count,
+    cbm_vector_search_metrics_t *metrics) {
+    if (!s || !s->zova_workspace_query) return CBM_STORE_NOT_FOUND;
+
+    sqlite3_stmt *generation_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+            "SELECT generation,model_fingerprint,vector_dimensions "
+            "FROM cbm_workspace_index_state_v1 "
+            "WHERE workspace_id=?1 AND generation>0 AND EXISTS("
+            "SELECT 1 FROM cbm_projects_v1 p WHERE p.workspace_id=?1 AND p.project=?2)",
+            -1, &generation_stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(generation_stmt, 1, s->zova_graph_workspace_id);
+    bind_text(generation_stmt, 2, project);
+    int generation_ready = sqlite3_step(generation_stmt) == SQLITE_ROW;
+    int vector_dimensions = 0;
+    if (generation_ready) {
+        const char *model = (const char *)sqlite3_column_text(generation_stmt, 1);
+        vector_dimensions = sqlite3_column_int(generation_stmt, 2);
+        if (!model || !model[0] || vector_dimensions != VS_VEC_DIM) {
+            generation_ready = false;
+        }
+    }
+    sqlite3_finalize(generation_stmt);
+    if (!generation_ready) return CBM_STORE_NOT_FOUND;
+
+    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
+    int fetch_limit = actual_kw == 1 ? requested_limit : requested_limit * ST_COL_5;
+    struct timespec started;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &started);
+
+    /* The native vector index is exact, but its fixed search overhead grows
+     * beyond the compatibility scan on larger workspaces. Scan the
+     * authoritative vector rows directly and retain only the first-keyword
+     * top-K. This preserves the compatibility prefilter contract while
+     * avoiding SQLite's scalar-function sorter and the SDK's large-index
+     * materialization cost. */
+    vs_workspace_vector_candidate_t *candidates =
+        calloc((size_t)fetch_limit, sizeof(*candidates));
+    if (!candidates) return CBM_STORE_ERR;
+    sqlite3_stmt *scan = NULL;
+    const char *scan_sql =
+        "SELECT v.node_id,v.vector FROM cbm_node_vectors_compat_v1 v "
+        "INNER JOIN cbm_nodes_v1 n ON n.workspace_id=v.workspace_id AND n.node_id=v.node_id "
+        "WHERE v.workspace_id=?1 AND n.label IN ('Function','Method','Class')";
+    if (sqlite3_prepare_v2(s->db, scan_sql, -1, &scan, NULL) != SQLITE_OK) {
+        free(candidates);
+        return CBM_STORE_ERR;
+    }
+    bind_text(scan, 1, s->zova_graph_workspace_id);
+    int candidate_count = 0;
+    int scan_rc = SQLITE_DONE;
+    int32_t query_magnitude = 0;
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        query_magnitude += (int32_t)kw_vecs[0][d] * (int32_t)kw_vecs[0][d];
+    }
+    while ((scan_rc = sqlite3_step(scan)) == SQLITE_ROW) {
+        const char *node_id = (const char *)sqlite3_column_text(scan, 0);
+        const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(scan, 1);
+        int node_vec_len = sqlite3_column_bytes(scan, 1);
+        if (!node_id || node_vec_len != vector_dimensions) continue;
+        double score = vs_cosine_i8_with_query_magnitude(
+            node_vec, node_vec_len, kw_vecs[0], query_magnitude);
+        int slot = candidate_count;
+        if (candidate_count >= fetch_limit) {
+            slot = 0;
+            bool better = score > candidates[0].score;
+            bool earlier_tie = score == candidates[0].score &&
+                               strcmp(node_id, candidates[0].node_id) < 0;
+            if (!better && !earlier_tie) continue;
+            free(candidates[0].node_id);
+        } else {
+            candidate_count++;
+        }
+        candidates[slot].node_id = strdup(node_id);
+        candidates[slot].score = score;
+        if (!candidates[slot].node_id) {
+            scan_rc = SQLITE_NOMEM;
+            break;
+        }
+        if (candidate_count <= fetch_limit && slot == candidate_count - 1) {
+            vs_workspace_candidate_sift_up(candidates, slot);
+        } else {
+            vs_workspace_candidate_sift_down(candidates, candidate_count, 0);
+        }
+    }
+    sqlite3_finalize(scan);
+    if (scan_rc != SQLITE_DONE) {
+        for (int i = 0; i < candidate_count; i++) free(candidates[i].node_id);
+        free(candidates);
+        return CBM_STORE_ERR;
+    }
+    if (candidate_count == 0) {
+        free(candidates);
+        *out = NULL;
+        *out_count = 0;
+        return CBM_STORE_OK;
+    }
+
+    char sql[CBM_SZ_4K];
+    int sql_len = snprintf(
+        sql, sizeof(sql),
+        "SELECT cbm_stable_numeric_id(n.node_id),n.name,n.qualified_name,n.file_path,n.label,"
+        "0.0,v.vector FROM cbm_nodes_v1 n INNER JOIN cbm_node_vectors_compat_v1 v "
+        "ON v.workspace_id=n.workspace_id AND v.node_id=n.node_id "
+        "WHERE n.workspace_id=?1 AND n.node_id IN (");
+    for (int i = 0; sql_len > 0 && (size_t)sql_len < sizeof(sql) && i < candidate_count; i++) {
+        int written = snprintf(sql + sql_len, sizeof(sql) - (size_t)sql_len,
+                               "%s?%d", i ? "," : "", i + 2);
+        if (written < 0 || (size_t)written >= sizeof(sql) - (size_t)sql_len) sql_len = -1;
+        else sql_len += written;
+    }
+    if (sql_len <= 0 ||
+        snprintf(sql + sql_len, sizeof(sql) - (size_t)sql_len,
+                 ") AND n.label IN ('Function','Method','Class')") >=
+            (int)(sizeof(sql) - (size_t)sql_len)) {
+        for (int i = 0; i < candidate_count; i++) free(candidates[i].node_id);
+        free(candidates);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        for (int i = 0; i < candidate_count; i++) free(candidates[i].node_id);
+        free(candidates);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, s->zova_graph_workspace_id);
+    for (int i = 0; i < candidate_count; i++) bind_text(stmt, i + 2, candidates[i].node_id);
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    int cap = 0;
+    int rc = CBM_STORE_OK;
+    int step_rc = SQLITE_DONE;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        cbm_vector_result_t *grown =
+            vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
+        if (!grown) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        results = grown;
+    }
+    if (step_rc != SQLITE_DONE || count != candidate_count) rc = CBM_STORE_ERR;
+    sqlite3_finalize(stmt);
+    for (int i = 0; i < candidate_count; i++) free(candidates[i].node_id);
+    free(candidates);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_vector_results(results, count);
+        return CBM_STORE_ERR;
+    }
+    if (metrics) {
+        metrics->used_zova = true;
+        metrics->zova_native_multi_query = actual_kw > 1;
+        metrics->zova_fetch_limit = fetch_limit;
+        vs_record_elapsed(&started, &metrics->zova_prefetch_ms);
+    }
+    vs_sort_and_trim(results, &count, limit);
+    *out = results;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
 static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
                                      const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw,
                                      int limit, cbm_vector_result_t **out, int *out_count,
                                      cbm_vector_search_metrics_t *metrics) {
-    if (cbm_zova_mode_from_env() < CBM_ZOVA_MODE_I8_VECTORS || !cbm_zova_build_enabled() ||
-        !s || !s->db_path) {
+    if (!cbm_zova_vector_read_is_enabled() || !cbm_zova_build_enabled() || !s || !s->db_path) {
         return CBM_STORE_NOT_FOUND;
+    }
+
+    if (s->zova_workspace_query) {
+        return vs_try_zova_workspace_sql_vector_search(
+            s, project, kw_vecs, actual_kw, limit, out, out_count, metrics);
     }
 
     char zova_path[ST_QUERY_URI_MAX];
@@ -6693,8 +7282,18 @@ static int vs_try_zova_vector_search(cbm_store_t *s, const char *project,
     int candidate_count = 0;
     cbm_zova_vector_session_t *session = vs_get_zova_vector_session(s, zova_path);
     int64_t sidecar_generation = 0;
-    if (!session || cbm_zova_vector_session_generation(session, &sidecar_generation) != 0 ||
-        !store_zova_vector_generation_is_ready(s, project, session, sidecar_generation)) {
+    bool generation_ready = session &&
+                             cbm_zova_vector_session_generation(session, &sidecar_generation) == 0 &&
+                             store_zova_vector_generation_is_ready(s, project, session,
+                                                                   sidecar_generation);
+    if (!generation_ready) {
+        if (session) {
+            if (metrics) {
+                metrics->generation_mismatch = true;
+            }
+            cbm_log_warn("zova.fallback", "path", "vector", "reason", "generation_mismatch",
+                         "project", project);
+        }
         if (session) {
             store_close_zova_vector_session(s);
         }
@@ -6800,14 +7399,18 @@ int cbm_store_vector_search_ex(cbm_store_t *s, const char *project, const char *
     /* Scan all node vectors, compute per-keyword cosine, take min.
      * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
      * then re-score with min across all keywords in the append helper. */
-    const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
-                      "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
-                      " FROM node_vectors v"
-                      " INNER JOIN nodes n ON n.id = v.node_id"
-                      " WHERE v.project = ?2"
-                      " AND n.label IN ('Function','Method','Class')"
-                      " ORDER BY score DESC"
-                      " LIMIT ?3";
+    const char *sql = NULL;
+    if (s->zova_workspace_query) {
+        sql = "SELECT n.id,n.name,n.qualified_name,n.file_path,n.label,"
+              "cbm_cosine_i8(v.vector,?1) AS score,v.vector FROM node_vectors v "
+              "INNER JOIN nodes n ON n.id=v.node_id "
+              "WHERE n.label IN ('Function','Method','Class') ORDER BY score DESC LIMIT ?2";
+    } else {
+        sql = "SELECT n.id,n.name,n.qualified_name,n.file_path,n.label,"
+              "cbm_cosine_i8(v.vector,?1) AS score,v.vector FROM node_vectors v "
+              "INNER JOIN nodes n ON n.id=v.node_id WHERE v.project=?2 "
+              "AND n.label IN ('Function','Method','Class') ORDER BY score DESC LIMIT ?3";
+    }
 
     sqlite3_stmt *stmt = NULL;
     int prep_rc = sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &stmt, NULL);
@@ -6819,8 +7422,12 @@ int cbm_store_vector_search_ex(cbm_store_t *s, const char *project, const char *
     /* Use first keyword for SQL pre-filter, fetch more candidates for re-ranking */
     int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
     sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
-    sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
+    if (s->zova_workspace_query) {
+        sqlite3_bind_int(stmt, ST_COL_2, fetch_limit);
+    } else {
+        sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
+    }
 
     {
         char kw_buf[VS_STR_BUF];

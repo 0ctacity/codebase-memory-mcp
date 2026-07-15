@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "zova/cbm_zova.h"
+#include "zova/cbm_zova_route.h"
 #include "yyjson/yyjson.h"
 #include "sqlite3.h" /* vendored/sqlite3 — PRAGMA integrity_check on dumped DBs */
 
@@ -33,6 +34,55 @@
 
 #if CBM_WITH_ZOVA
 #include "zova.h"
+
+TEST(pipeline_migration_route_states_are_operator_explicit) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-pipeline-route-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    char target[512];
+    snprintf(target, sizeof(target), "%s/cbm.zova", cache);
+    ASSERT_EQ(cbm_zova_user_database_init(target), 0);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(target, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(
+                  db,
+                  "INSERT INTO cbm_workspace_registry(workspace_id,canonical_root,"
+                  "id_format_version,active_generation) VALUES('w:v1:pipeline','/tmp/pipeline',2,0);"
+                  "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+                  "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
+                  "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
+                  "token_vector_sha256,prepared_at) VALUES('w:v1:pipeline',1,'pipeline-route',"
+                  "'/tmp/pipeline','source.db','source.zova',1,0,'rolled_back','m','f','t','n','v',"
+                  "CURRENT_TIMESTAMP)",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_zova_route_for_project("pipeline-route"),
+              CBM_ZOVA_ROUTE_MIGRATION_LEGACY);
+    ASSERT_EQ(sqlite3_open(target, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "UPDATE cbm_workspace_migrations_v1 SET state='cleanup_pending'",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+    ASSERT_EQ(cbm_zova_route_for_project("pipeline-route"), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
+    ASSERT_EQ(cbm_zova_route_for_project("absent"), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    free(saved_cache_copy);
+    free(saved_flag_copy);
+    cbm_unlink(target);
+    cbm_rmdir(cache);
+    PASS();
+}
 #endif
 
 /* ── Helper: create temp test repo with known layout ───────────── */
@@ -5418,6 +5468,114 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+static bool pipeline_single_file_generation_exists(const char *path) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    bool exists = false;
+    if (!path || sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) sqlite3_close(db);
+        return false;
+    }
+    if (sqlite3_prepare_v2(db,
+                           "SELECT count(*) FROM cbm_workspace_index_state_v1",
+                           -1, &stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(stmt) == SQLITE_ROW) {
+        exists = sqlite3_column_int64(stmt, 0) > 0;
+    }
+    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return exists;
+}
+
+static bool pipeline_test_path_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0;
+}
+
+static int pipeline_single_file_summary_row(const char *path, const char *workspace_id,
+                                            char **summary, char **source_hash,
+                                            char **created_at, char **updated_at) {
+    if (!path || !workspace_id || !summary || !source_hash || !created_at || !updated_at) {
+        return -1;
+    }
+    *summary = NULL;
+    *source_hash = NULL;
+    *created_at = NULL;
+    *updated_at = NULL;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db,
+                           "SELECT summary,source_hash,created_at,updated_at "
+                           "FROM cbm_project_summaries_v2 WHERE workspace_id=?1",
+                           -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return 1;
+    }
+    if (step != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    *summary = strdup((const char *)sqlite3_column_text(stmt, 0));
+    *source_hash = strdup((const char *)sqlite3_column_text(stmt, 1));
+    *created_at = strdup((const char *)sqlite3_column_text(stmt, 2));
+    *updated_at = strdup((const char *)sqlite3_column_text(stmt, 3));
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    if (!*summary || !*source_hash || !*created_at || !*updated_at) {
+        free(*summary);
+        free(*source_hash);
+        free(*created_at);
+        free(*updated_at);
+        *summary = NULL;
+        *source_hash = NULL;
+        *created_at = NULL;
+        *updated_at = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+static int pipeline_single_file_text_row(const char *path, const char *sql, const char *bind,
+                                         char **out) {
+    if (!path || !sql || !bind || !out) return -1;
+    *out = NULL;
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, bind, -1, SQLITE_STATIC) != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return 1;
+    }
+    if (step != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return -1;
+    }
+    const unsigned char *value = sqlite3_column_text(stmt, 0);
+    *out = strdup(value ? (const char *)value : "");
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return *out ? 0 : -1;
+}
+
 /* A canonical digest deliberately excludes SQLite's local ids.  It is used
  * only by the direct-Zova incremental parity test below: matching rows prove
  * the two independently written databases contain the same semantic graph. */
@@ -5755,6 +5913,31 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
+    /* Keep derived properties exercised on an unchanged decorated node. The
+     * incremental route reruns global enrichment/complexity passes over nodes
+     * loaded from the prior generation, so these properties must be replaced
+     * rather than appended a second time. */
+    char decorated_path[512];
+    snprintf(decorated_path, sizeof(decorated_path), "%s/decorated.py", g_incr_tmpdir);
+    FILE *decorated = fopen(decorated_path, "w");
+    ASSERT_NOT_NULL(decorated);
+    fprintf(decorated, "def route(fn):\n    return fn\n\n"
+                       "@route\ndef first():\n    return 1\n\n"
+                       "@route\ndef second():\n    return 2\n");
+    fclose(decorated);
+    /* Exercise deterministic complexity propagation across a mutual-recursion
+     * cycle. Direct Zova rehydration assigns different temporary IDs than a
+     * fresh extraction, but derived properties must not depend on those IDs. */
+    char cycle_path[512];
+    snprintf(cycle_path, sizeof(cycle_path), "%s/cycle.go", g_incr_tmpdir);
+    FILE *cycle = fopen(cycle_path, "w");
+    ASSERT_NOT_NULL(cycle);
+    fprintf(cycle, "package main\n\n"
+                   "func Alpha() {\n\tfor i := 0; i < 1; i++ { Beta() }\n}\n\n"
+                   "func Beta() {\n\tfor i := 0; i < 1; i++ {\n"
+                   "\t\tfor j := 0; j < 1; j++ { Gamma() }\n\t}\n}\n\n"
+                   "func Gamma() { Alpha() }\n");
+    fclose(cycle);
     char incremental_db[512];
     char full_db[512];
     snprintf(incremental_db, sizeof(incremental_db), "%s/incremental.db", g_incr_tmpdir);
@@ -5833,6 +6016,263 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
 
     free(project);
     cbm_unsetenv("CBM_ZOVA_MODE");
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char db_path[512];
+    char cache_path[512];
+    char user_db_path[512];
+    sqlite3 *user_db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int64_t first_generation = 0;
+    const char *previous_cache = getenv("CBM_CACHE_DIR");
+    char *previous_cache_copy = previous_cache ? strdup(previous_cache) : NULL;
+    const char *previous_mode = getenv("CBM_ZOVA_MODE");
+    char *previous_mode_copy = previous_mode ? strdup(previous_mode) : NULL;
+    const char *previous_single = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *previous_single_copy = previous_single ? strdup(previous_single) : NULL;
+    snprintf(db_path, sizeof(db_path), "%s/single-file.db", g_incr_tmpdir);
+    snprintf(cache_path, sizeof(cache_path), "%s/cache", g_incr_tmpdir);
+    snprintf(user_db_path, sizeof(user_db_path), "%s/cbm.zova", cache_path);
+    ASSERT_EQ(cbm_mkdir(cache_path), 0);
+    cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+
+    /* The opt-in flag is genuinely opt-in, and mode=off wins over it. */
+    char disabled_db_path[512];
+    char off_db_path[512];
+    snprintf(disabled_db_path, sizeof(disabled_db_path), "%s/disabled.db", g_incr_tmpdir);
+    snprintf(off_db_path, sizeof(off_db_path), "%s/off.db", g_incr_tmpdir);
+    cbm_unlink(user_db_path);
+    cbm_pipeline_t *disabled = cbm_pipeline_new(g_incr_tmpdir, disabled_db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(disabled);
+    ASSERT_EQ(cbm_pipeline_run(disabled), 0);
+    cbm_pipeline_free(disabled);
+    ASSERT_FALSE(pipeline_single_file_generation_exists(user_db_path));
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    cbm_pipeline_t *off_mode = cbm_pipeline_new(g_incr_tmpdir, off_db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(off_mode);
+    ASSERT_EQ(cbm_pipeline_run(off_mode), 0);
+    cbm_pipeline_free(off_mode);
+    ASSERT_FALSE(pipeline_single_file_generation_exists(user_db_path));
+    /* Sidecar generation bookkeeping creates the shared registry file even
+     * when publication is disabled. Remove that staging-only registry so the
+     * first published user-local generation has a deterministic baseline. */
+    cbm_unlink(user_db_path);
+    char user_db_wal[512];
+    char user_db_shm[512];
+    snprintf(user_db_wal, sizeof(user_db_wal), "%s-wal", user_db_path);
+    snprintf(user_db_shm, sizeof(user_db_shm), "%s-shm", user_db_path);
+    cbm_unlink(user_db_wal);
+    cbm_unlink(user_db_shm);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+
+    cbm_pipeline_t *full = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    cbm_pipeline_free(full);
+    ASSERT_TRUE(pipeline_single_file_generation_exists(user_db_path));
+
+    ASSERT_EQ(sqlite3_open_v2(user_db_path, &user_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(user_db,
+                                 "SELECT generation FROM cbm_workspace_index_state_v1 LIMIT 1",
+                                 -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    first_generation = sqlite3_column_int64(stmt, 0);
+    ASSERT_GT(first_generation, 0);
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    sqlite3_close(user_db);
+    user_db = NULL;
+
+    char helper_path[512];
+    snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    FILE *helper = fopen(helper_path, "w");
+    ASSERT_NOT_NULL(helper);
+    fprintf(helper, "package main\n\nfunc Helper() string {\n\treturn \"single-file-edit\"\n}\n");
+    fclose(helper);
+    cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", "user_before_commit", 1);
+    cbm_pipeline_t *failed_incremental = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(failed_incremental);
+    ASSERT_EQ(cbm_pipeline_run(failed_incremental), -1);
+    cbm_pipeline_free(failed_incremental);
+    cbm_unsetenv("CBM_ZOVA_TEST_FAIL_PHASE");
+    ASSERT_EQ(sqlite3_open_v2(user_db_path, &user_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(user_db,
+                                 "SELECT generation FROM cbm_workspace_index_state_v1 LIMIT 1",
+                                 -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), first_generation);
+    sqlite3_finalize(stmt);
+    sqlite3_close(user_db);
+    user_db = NULL;
+
+    helper = fopen(helper_path, "w");
+    ASSERT_NOT_NULL(helper);
+    fprintf(helper, "package main\n\nfunc Helper() string {\n\treturn \"single-file-edit-2\"\n}\n");
+    fclose(helper);
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    cbm_pipeline_free(incremental);
+
+    ASSERT_EQ(sqlite3_open_v2(user_db_path, &user_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(user_db,
+                                 "SELECT generation FROM cbm_workspace_index_state_v1 LIMIT 1",
+                                 -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), first_generation + 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(user_db);
+    if (previous_single_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", previous_single_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    if (previous_mode_copy) cbm_setenv("CBM_ZOVA_MODE", previous_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    if (previous_cache_copy) cbm_setenv("CBM_CACHE_DIR", previous_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    free(previous_single_copy);
+    free(previous_mode_copy);
+    free(previous_cache_copy);
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+TEST(pipeline_single_file_preserves_and_removes_exact_project_summary) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char db_path[512];
+    char cache_path[512];
+    char user_db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/summary.db", g_incr_tmpdir);
+    snprintf(cache_path, sizeof(cache_path), "%s/cache", g_incr_tmpdir);
+    snprintf(user_db_path, sizeof(user_db_path), "%s/cbm.zova", cache_path);
+    ASSERT_EQ(cbm_mkdir(cache_path), 0);
+
+    const char *previous_cache = getenv("CBM_CACHE_DIR");
+    char *previous_cache_copy = previous_cache ? strdup(previous_cache) : NULL;
+    const char *previous_mode = getenv("CBM_ZOVA_MODE");
+    char *previous_mode_copy = previous_mode ? strdup(previous_mode) : NULL;
+    const char *previous_single = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *previous_single_copy = previous_single ? strdup(previous_single) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+    ASSERT_TRUE(pipeline_single_file_generation_exists(user_db_path));
+    ASSERT_FALSE(pipeline_test_path_exists(db_path));
+
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
+    ASSERT_EQ(cbm_zova_workspace_lookup_at(user_db_path, g_incr_tmpdir, workspace_id,
+                                            sizeof(workspace_id)),
+              0);
+
+    sqlite3 *source = NULL;
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_open_v2(user_db_path, &source, SQLITE_OPEN_READWRITE, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  source,
+                  "INSERT OR REPLACE INTO cbm_project_summaries_v2 "
+                  "(workspace_id,summary,source_hash,created_at,updated_at) "
+                  "VALUES(?1,?2,?3,?4,?5)",
+                  -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 2, "summary with exact fields", -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 3, "source-hash-v1", -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 4, "created-at-v1", -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 5, "updated-at-v1", -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(source);
+
+    char helper_path[512];
+    snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    FILE *helper = fopen(helper_path, "w");
+    ASSERT_NOT_NULL(helper);
+    fprintf(helper, "package main\n\nfunc Helper() string {\n\treturn \"summary-preserve\"\n}\n");
+    fclose(helper);
+    cbm_pipeline_t *preserve = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(preserve);
+    ASSERT_EQ(cbm_pipeline_run(preserve), 0);
+    cbm_pipeline_free(preserve);
+
+    char *summary = NULL;
+    char *source_hash = NULL;
+    char *created_at = NULL;
+    char *updated_at = NULL;
+    ASSERT_EQ(pipeline_single_file_summary_row(user_db_path, workspace_id, &summary, &source_hash,
+                                                &created_at, &updated_at),
+              0);
+    ASSERT_STR_EQ(summary, "summary with exact fields");
+    ASSERT_STR_EQ(source_hash, "source-hash-v1");
+    ASSERT_STR_EQ(created_at, "created-at-v1");
+    ASSERT_STR_EQ(updated_at, "updated-at-v1");
+    ASSERT_FALSE(pipeline_test_path_exists(db_path));
+    free(summary);
+    free(source_hash);
+    free(created_at);
+    free(updated_at);
+
+    source = NULL;
+    stmt = NULL;
+    ASSERT_EQ(sqlite3_open_v2(user_db_path, &source, SQLITE_OPEN_READWRITE, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(source, "DELETE FROM cbm_project_summaries_v2 WHERE workspace_id=?1", -1,
+                                 &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    sqlite3_close(source);
+
+    helper = fopen(helper_path, "w");
+    ASSERT_NOT_NULL(helper);
+    fprintf(helper, "package main\n\nfunc Helper() string {\n\treturn \"summary-remove\"\n}\n");
+    fclose(helper);
+    cbm_pipeline_t *remove = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(remove);
+    ASSERT_EQ(cbm_pipeline_run(remove), 0);
+    cbm_pipeline_free(remove);
+    ASSERT_FALSE(pipeline_test_path_exists(db_path));
+    ASSERT_EQ(pipeline_single_file_summary_row(user_db_path, workspace_id, &summary, &source_hash,
+                                                &created_at, &updated_at),
+              1);
+    free(summary);
+    free(source_hash);
+    free(created_at);
+    free(updated_at);
+
+    free(project);
+    if (previous_single_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", previous_single_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    if (previous_mode_copy) cbm_setenv("CBM_ZOVA_MODE", previous_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    if (previous_cache_copy) cbm_setenv("CBM_CACHE_DIR", previous_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    free(previous_single_copy);
+    free(previous_mode_copy);
+    free(previous_cache_copy);
     cleanup_incremental_repo();
     PASS();
 #endif
@@ -7067,6 +7507,55 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+static cbm_gbuf_t *pipeline_complexity_cycle_graph(int reversed) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("complexity-cycle", "/tmp/complexity-cycle");
+    if (!gb) return NULL;
+    const char *names[] = {"Alpha", "Beta", "Gamma"};
+    const int depths[] = {1, 2, 0};
+    int64_t ids[3] = {0};
+    for (int step = 0; step < 3; step++) {
+        int i = reversed ? 2 - step : step;
+        char properties[128];
+        snprintf(properties, sizeof(properties),
+                 "{\"loop_depth\":%d,\"self_recursive\":false}", depths[i]);
+        ids[i] = cbm_gbuf_upsert_node(gb, "Function", names[i], names[i], "cycle.go",
+                                      i + 1, i + 1, properties);
+        if (!ids[i]) {
+            cbm_gbuf_free(gb);
+            return NULL;
+        }
+    }
+    if (!cbm_gbuf_insert_edge(gb, ids[0], ids[1], "CALLS", "{}") ||
+        !cbm_gbuf_insert_edge(gb, ids[1], ids[2], "CALLS", "{}") ||
+        !cbm_gbuf_insert_edge(gb, ids[2], ids[0], "CALLS", "{}")) {
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
+    return gb;
+}
+
+TEST(pipeline_complexity_cycle_is_independent_of_temporary_ids) {
+    cbm_gbuf_t *forward = pipeline_complexity_cycle_graph(0);
+    cbm_gbuf_t *reverse = pipeline_complexity_cycle_graph(1);
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+    cbm_pipeline_ctx_t forward_ctx = {.gbuf = forward};
+    cbm_pipeline_ctx_t reverse_ctx = {.gbuf = reverse};
+    cbm_pipeline_pass_complexity(&forward_ctx);
+    cbm_pipeline_pass_complexity(&reverse_ctx);
+    const char *names[] = {"Alpha", "Beta", "Gamma"};
+    for (int i = 0; i < 3; i++) {
+        const cbm_gbuf_node_t *a = cbm_gbuf_find_by_qn(forward, names[i]);
+        const cbm_gbuf_node_t *b = cbm_gbuf_find_by_qn(reverse, names[i]);
+        ASSERT_NOT_NULL(a);
+        ASSERT_NOT_NULL(b);
+        ASSERT_STR_EQ(a->properties_json, b->properties_json);
+    }
+    cbm_gbuf_free(forward);
+    cbm_gbuf_free(reverse);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -7261,6 +7750,9 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
 }
 
 SUITE(pipeline) {
+#if CBM_WITH_ZOVA
+    RUN_TEST(pipeline_migration_route_states_are_operator_explicit);
+#endif
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
     RUN_TEST(pipeline_lock_blocking);
@@ -7296,6 +7788,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
+    RUN_TEST(pipeline_complexity_cycle_is_independent_of_temporary_ids);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
@@ -7469,6 +7962,8 @@ SUITE(pipeline) {
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(pipeline_incremental_direct_zova_matches_fresh_full);
+    RUN_TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation);
+    RUN_TEST(pipeline_single_file_preserves_and_removes_exact_project_summary);
     RUN_TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full);
     RUN_TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full);
     RUN_TEST(incremental_detects_deleted_file);

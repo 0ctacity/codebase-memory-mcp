@@ -49,6 +49,7 @@ build/
 node_modules/
 graph-ui/dist/
 .zig-cache/
+.zova-sdk/
 
 
 # Generated reports
@@ -68,3 +69,6 @@ graph-ui/.npm-cache-local/
 # Python bytecode from tests/windows/ harness
 __pycache__/
 *.pyc
+
+# Miscellaneous
+.docs/

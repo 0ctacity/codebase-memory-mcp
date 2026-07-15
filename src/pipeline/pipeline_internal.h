@@ -11,6 +11,8 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/path_alias.h"
 #include "graph_buffer/graph_buffer.h"
+#include "store/store.h"
+#include "zova/cbm_zova_repository.h"
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
@@ -133,6 +135,14 @@ static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *c
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
+
+/* Publish finalized graph/vector arrays plus the exact discovered hash set to
+ * the opt-in user-local Zova generation. Returns 0 when disabled or when the
+ * publication succeeds. */
+int cbm_pipeline_publish_zova_user_database(
+    cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
+    const cbm_file_hash_t *mode_skipped, int mode_skipped_count);
+void cbm_pipeline_capture_project_summary(cbm_pipeline_t *p, cbm_store_t *store);
 
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
@@ -610,6 +620,9 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
  * files, merges into disk DB. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count);
+int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
+                                      cbm_file_info_t *files, int file_count,
+                                      const cbm_zova_workspace_snapshot_t *snapshot);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

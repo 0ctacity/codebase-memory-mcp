@@ -11,6 +11,9 @@
 #include "foundation/sha256.h"
 #include "cli/cli_zig.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
+#include "zova/cbm_zova.h"
+#include "zova/cbm_zova_migration.h"
+#include "zova/cbm_zova_operations.h"
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
 
@@ -2696,6 +2699,421 @@ int cbm_remove_indexes(const char *home_dir) {
 /* ── Config store (persistent key-value in _config.db) ─────────── */
 
 #include <sqlite3.h>
+
+static bool cli_zova_db_matches_root(const char *path, const char *canonical_root) {
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(db,
+                                "SELECT count(*) FROM projects WHERE root_path=?1",
+                                -1, &stmt, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_bind_text(stmt, 1, canonical_root, -1, SQLITE_STATIC);
+    int matches = rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW &&
+                  sqlite3_column_int64(stmt, 0) > 0;
+    sqlite3_finalize(stmt);
+    if (db) sqlite3_close(db);
+    return matches;
+}
+
+int cbm_cli_zova_migration_discover(const char *canonical_root, char *source_db,
+                                    size_t source_db_size, char *source_zova,
+                                    size_t source_zova_size, char *target_zova,
+                                    size_t target_zova_size) {
+    if (!canonical_root || !canonical_root[0] || !source_db || !source_db_size ||
+        !source_zova || !source_zova_size || !target_zova || !target_zova_size)
+        return CLI_ERR;
+    source_db[0] = source_zova[0] = target_zova[0] = '\0';
+    const char *cache = cbm_resolve_cache_dir();
+    cbm_dir_t *directory = cache ? cbm_opendir(cache) : NULL;
+    if (!directory) return CLI_ERR;
+    int matches = 0;
+    cbm_dirent_t *entry = NULL;
+    while ((entry = cbm_readdir(directory)) != NULL) {
+        size_t length = strlen(entry->name);
+        if (strcmp(entry->name, "cbm.zova") == 0 || length <= DB_EXT_LEN ||
+            strcmp(entry->name + length - DB_EXT_LEN, ".db") != 0)
+            continue;
+        char candidate[CLI_BUF_2K];
+        int n = snprintf(candidate, sizeof(candidate), "%s/%s", cache, entry->name);
+        struct stat candidate_stat;
+        if (n <= 0 || (size_t)n >= sizeof(candidate) ||
+            lstat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode) ||
+            !cli_zova_db_matches_root(candidate, canonical_root))
+            continue;
+        matches++;
+        if (matches == 1) {
+            if ((size_t)snprintf(source_db, source_db_size, "%s", candidate) >= source_db_size) {
+                matches = 2;
+                break;
+            }
+        }
+    }
+    cbm_closedir(directory);
+    if (matches != 1 || cbm_zova_sidecar_path(source_db, source_zova, source_zova_size) != 0 ||
+        cbm_zova_workspace_registry_path(target_zova, target_zova_size) != 0) {
+        source_db[0] = source_zova[0] = target_zova[0] = '\0';
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+static bool cli_zova_workspace_confirmation_valid(const char *value) {
+    if (!value || strlen(value) != 35 || strncmp(value, "w1_", 3) != 0) return false;
+    for (const char *p = value + 3; *p; p++)
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return false;
+    return true;
+}
+
+static const char *cli_zova_code_name(cbm_zova_migration_code_t code) {
+    switch (code) {
+        case CBM_ZOVA_MIGRATION_OK: return "ok";
+        case CBM_ZOVA_MIGRATION_NOOP: return "noop";
+        case CBM_ZOVA_MIGRATION_INVALID: return "invalid";
+        case CBM_ZOVA_MIGRATION_SOURCE_MISSING: return "source_missing";
+        case CBM_ZOVA_MIGRATION_SOURCE_NOT_READY: return "source_not_ready";
+        case CBM_ZOVA_MIGRATION_SOURCE_INCOMPATIBLE: return "source_incompatible";
+        case CBM_ZOVA_MIGRATION_TARGET_INCOMPATIBLE: return "target_incompatible";
+        case CBM_ZOVA_MIGRATION_VERIFY_FAILED: return "verify_failed";
+        case CBM_ZOVA_MIGRATION_ROLLBACK_UNAVAILABLE: return "rollback_unavailable";
+        case CBM_ZOVA_MIGRATION_CLEANUP_REFUSED: return "cleanup_refused";
+    }
+    return "unknown";
+}
+
+static void cli_zova_add_manifest(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *key,
+                                  const cbm_zova_migration_manifest_t *manifest) {
+    yyjson_mut_val *value = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_uint(doc, value, "workspace_count", manifest->workspace_count);
+    yyjson_mut_obj_add_uint(doc, value, "stable_id_count", manifest->stable_id_count);
+    yyjson_mut_obj_add_uint(doc, value, "graph_node_count", manifest->graph_node_count);
+    yyjson_mut_obj_add_uint(doc, value, "graph_edge_count", manifest->graph_edge_count);
+    yyjson_mut_obj_add_uint(doc, value, "node_vector_count", manifest->node_vector_count);
+    yyjson_mut_obj_add_uint(doc, value, "token_vector_count", manifest->token_vector_count);
+    yyjson_mut_obj_add_uint(doc, value, "fts_query_count", manifest->fts_query_count);
+    yyjson_mut_obj_add_str(doc, value, "metadata_sha256", manifest->metadata_sha256);
+    yyjson_mut_obj_add_str(doc, value, "fts_sha256", manifest->fts_sha256);
+    yyjson_mut_obj_add_str(doc, value, "topology_sha256", manifest->topology_sha256);
+    yyjson_mut_obj_add_str(doc, value, "node_vector_sha256", manifest->node_vector_sha256);
+    yyjson_mut_obj_add_str(doc, value, "token_vector_sha256", manifest->token_vector_sha256);
+    yyjson_mut_obj_add_val(doc, root, key, value);
+}
+
+static void cli_zova_print_report(const char *action, const char *repository,
+                                  const char *source_db, const char *source_zova,
+                                  const char *target_zova, cbm_zova_migration_code_t code,
+                                  const cbm_zova_migration_report_t *report) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "action", action ? action : "");
+    yyjson_mut_obj_add_int(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "result", cli_zova_code_name(code));
+    yyjson_mut_obj_add_bool(doc, root, "success",
+                           code == CBM_ZOVA_MIGRATION_OK || code == CBM_ZOVA_MIGRATION_NOOP);
+    yyjson_mut_obj_add_int(doc, root, "schema_version", CBM_ZOVA_DATABASE_SCHEMA_VERSION);
+    yyjson_mut_obj_add_int(doc, root, "migration_version", CBM_ZOVA_MIGRATION_VERSION);
+    yyjson_mut_obj_add_str(doc, root, "repository", repository ? repository : "");
+    yyjson_mut_obj_add_str(doc, root, "source_db_path", source_db ? source_db : "");
+    yyjson_mut_obj_add_str(doc, root, "source_zova_path", source_zova ? source_zova : "");
+    yyjson_mut_obj_add_str(doc, root, "target_zova_path", target_zova ? target_zova : "");
+    const char *state = report && report->workspace_id[0]
+                            ? cbm_zova_migration_state_name(report->state)
+                            : NULL;
+    if (state) yyjson_mut_obj_add_str(doc, root, "state", state);
+    else yyjson_mut_obj_add_null(doc, root, "state");
+    yyjson_mut_obj_add_str(doc, root, "workspace_id",
+                           report ? report->workspace_id : "");
+    yyjson_mut_obj_add_sint(doc, root, "source_generation",
+                            report ? report->source_generation : 0);
+    yyjson_mut_obj_add_sint(doc, root, "target_generation",
+                            report ? report->target_generation : 0);
+    yyjson_mut_obj_add_bool(doc, root, "no_op", report && report->no_op);
+    if (report) {
+        cli_zova_add_manifest(doc, root, "source", &report->source);
+        cli_zova_add_manifest(doc, root, "target", &report->target);
+    }
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    if (json) {
+        printf("%s\n", json);
+        free(json);
+    } else {
+        printf("{\"action\":\"\",\"code\":-1,\"result\":\"invalid\",\"success\":false}\n");
+    }
+    yyjson_mut_doc_free(doc);
+}
+
+static int cli_zova_usage_error(const char *action, const char *message) {
+    (void)fprintf(stderr, "error: %s\n", message);
+    cli_zova_print_report(action, NULL, NULL, NULL, NULL, CBM_ZOVA_MIGRATION_INVALID, NULL);
+    return 2;
+}
+
+int cbm_cmd_zova_migrate(int argc, char **argv) {
+    if (argc < 1 || !argv) return cli_zova_usage_error(NULL, "missing zova-migrate action");
+    const char *action = argv[0];
+    bool known_action = strcmp(action, "migrate") == 0 || strcmp(action, "status") == 0 ||
+                        strcmp(action, "rollback") == 0 || strcmp(action, "cleanup") == 0;
+    if (!known_action) return cli_zova_usage_error(action, "unknown zova-migrate action");
+    const char *repo = NULL, *confirmation = NULL;
+    bool json = false;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--json") == 0) {
+            if (json) return cli_zova_usage_error(action, "duplicate --json");
+            json = true;
+        } else if (strcmp(argv[i], "--repo-path") == 0) {
+            if (repo || i + 1 >= argc || strncmp(argv[i + 1], "--", 2) == 0)
+                return cli_zova_usage_error(action, "invalid or duplicate --repo-path");
+            repo = argv[++i];
+        } else if (strcmp(argv[i], "--confirm-workspace") == 0) {
+            if (confirmation || i + 1 >= argc || strncmp(argv[i + 1], "--", 2) == 0)
+                return cli_zova_usage_error(action,
+                                            "invalid or duplicate --confirm-workspace");
+            confirmation = argv[++i];
+        } else {
+            return cli_zova_usage_error(action, "unknown zova-migrate flag");
+        }
+    }
+    if (!repo || !json) return cli_zova_usage_error(action, "--repo-path and --json are required");
+    if (strcmp(action, "cleanup") == 0) {
+        if (!cli_zova_workspace_confirmation_valid(confirmation))
+            return cli_zova_usage_error(action, "cleanup requires an exact workspace ID");
+    } else if (confirmation) {
+        return cli_zova_usage_error(action, "--confirm-workspace is cleanup-only");
+    }
+    char canonical[CLI_BUF_2K];
+#ifdef _WIN32
+    if (!_fullpath(canonical, repo, sizeof(canonical)))
+#else
+    if (!realpath(repo, canonical))
+#endif
+        return cli_zova_usage_error(action, "repository path does not exist");
+    struct stat repo_stat;
+    if (stat(canonical, &repo_stat) != 0 || !S_ISDIR(repo_stat.st_mode))
+        return cli_zova_usage_error(action, "repository path is not a directory");
+    char source_db[CLI_BUF_2K] = {0}, source_zova[CLI_BUF_2K] = {0};
+    char target_zova[CLI_BUF_2K] = {0};
+    int discovered = cbm_cli_zova_migration_discover(
+        canonical, source_db, sizeof(source_db), source_zova, sizeof(source_zova), target_zova,
+        sizeof(target_zova));
+    if (discovered != 0)
+        (void)cbm_zova_workspace_registry_path(target_zova, sizeof(target_zova));
+    if (discovered != 0 && strcmp(action, "status") != 0) {
+        cli_zova_print_report(action, canonical, NULL, NULL, target_zova,
+                              CBM_ZOVA_MIGRATION_SOURCE_MISSING, NULL);
+        return 1;
+    }
+    cbm_zova_migration_request_t request = {
+        .source_db_path = source_db[0] ? source_db : NULL,
+        .source_zova_path = source_zova[0] ? source_zova : NULL,
+        .target_zova_path = target_zova,
+        .canonical_root = canonical,
+    };
+    cbm_zova_migration_report_t report = {0};
+    cbm_zova_migration_code_t code = CBM_ZOVA_MIGRATION_INVALID;
+    if (strcmp(action, "migrate") == 0) code = cbm_zova_migration_run(&request, &report);
+    else if (strcmp(action, "status") == 0) code = cbm_zova_migration_status(&request, &report);
+    else if (strcmp(action, "rollback") == 0) code = cbm_zova_migration_rollback(&request, &report);
+    else code = cbm_zova_migration_cleanup(&request, confirmation, &report);
+    cli_zova_print_report(action, canonical, source_db, source_zova, target_zova, code, &report);
+    return code == CBM_ZOVA_MIGRATION_OK || code == CBM_ZOVA_MIGRATION_NOOP ? 0 : 1;
+}
+
+static const char *cli_zova_health_name(cbm_zova_health_class_t health) {
+    switch (health) {
+        case CBM_ZOVA_HEALTH_OK: return "healthy";
+        case CBM_ZOVA_HEALTH_WORKSPACE_REBUILD: return "workspace_rebuild";
+        case CBM_ZOVA_HEALTH_WHOLE_FILE_RECOVERY: return "whole_file_recovery";
+    }
+    return "unknown";
+}
+
+static void cli_zova_ops_print_report(const char *action, const char *database_path,
+                                      const char *input_path, const char *output_path,
+                                      const char *repo_path, const char *workspace_id,
+                                      bool has_health, cbm_zova_health_class_t health,
+                                      cbm_zova_operation_code_t code,
+                                      const cbm_zova_operation_report_t *report) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "action", action ? action : "");
+    yyjson_mut_obj_add_bool(doc, root, "success",
+                           code == CBM_ZOVA_OPERATION_OK || code == CBM_ZOVA_OPERATION_NOOP);
+    yyjson_mut_obj_add_int(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "name", cbm_zova_operation_code_name(code));
+    yyjson_mut_obj_add_str(doc, root, "reason", report ? report->reason : "invalid_argument");
+    yyjson_mut_obj_add_int(doc, root, "schema_version",
+                           report ? report->schema_version : 0);
+    yyjson_mut_obj_add_int(doc, root, "archive_version",
+                           report ? report->archive_version : 0);
+    yyjson_mut_obj_add_str(doc, root, "database_path", database_path ? database_path : "");
+    yyjson_mut_obj_add_str(doc, root, "input_path", input_path ? input_path : "");
+    yyjson_mut_obj_add_str(doc, root, "output_path", output_path ? output_path : "");
+    yyjson_mut_obj_add_str(doc, root, "repo_path", repo_path ? repo_path : "");
+    yyjson_mut_obj_add_str(doc, root, "workspace_id",
+                           report && report->workspace_id[0]
+                               ? report->workspace_id
+                               : (workspace_id ? workspace_id : ""));
+    yyjson_mut_obj_add_sint(doc, root, "generation", report ? report->generation : 0);
+    yyjson_mut_obj_add_uint(doc, root, "database_bytes",
+                            report ? report->database_bytes : 0);
+    yyjson_mut_obj_add_uint(doc, root, "wal_bytes", report ? report->wal_bytes : 0);
+    yyjson_mut_obj_add_uint(doc, root, "free_bytes", report ? report->free_bytes : 0);
+    yyjson_mut_obj_add_uint(doc, root, "reclaimable_bytes",
+                            report ? report->reclaimable_bytes : 0);
+    yyjson_mut_obj_add_uint(doc, root, "page_size", report ? report->page_size : 0);
+    yyjson_mut_obj_add_uint(doc, root, "page_count", report ? report->page_count : 0);
+    yyjson_mut_obj_add_uint(doc, root, "freelist_count",
+                            report ? report->freelist_count : 0);
+    yyjson_mut_obj_add_real(doc, root, "elapsed_ms", report ? report->elapsed_ms : 0.0);
+    if (has_health)
+        yyjson_mut_obj_add_str(doc, root, "health_classification",
+                               cli_zova_health_name(health));
+    else
+        yyjson_mut_obj_add_null(doc, root, "health_classification");
+    char *json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    if (json) {
+        printf("%s\n", json);
+        free(json);
+    } else {
+        printf("{\"action\":\"\",\"success\":false,\"code\":-1,"
+               "\"name\":\"invalid\",\"reason\":\"json_failed\"}\n");
+    }
+    yyjson_mut_doc_free(doc);
+}
+
+static int cli_zova_ops_usage_error(const char *action, const char *message) {
+    cbm_zova_operation_report_t report = {0};
+    report.code = CBM_ZOVA_OPERATION_INVALID;
+    snprintf(report.operation, sizeof(report.operation), "%s", action ? action : "zova_ops");
+    snprintf(report.reason, sizeof(report.reason), "%s", message ? message : "invalid_argument");
+    (void)fprintf(stderr, "error: %s\n", message ? message : "invalid zova-ops arguments");
+    cli_zova_ops_print_report(action, NULL, NULL, NULL, NULL, NULL, false,
+                              CBM_ZOVA_HEALTH_OK, CBM_ZOVA_OPERATION_INVALID, &report);
+    return 2;
+}
+
+static bool cli_zova_ops_action_known(const char *action) {
+    static const char *const actions[] = {
+        "status",          "backup",          "restore",         "export-database",
+        "import-database", "export-workspace", "import-workspace", "delete-workspace",
+        "compact",         "health",          "recover-workspace",
+    };
+    if (!action) return false;
+    for (size_t i = 0; i < sizeof(actions) / sizeof(actions[0]); i++)
+        if (strcmp(action, actions[i]) == 0) return true;
+    return false;
+}
+
+int cbm_cmd_zova_ops(int argc, char **argv) {
+    if (argc < 1 || !argv || !argv[0] || strncmp(argv[0], "--", 2) == 0)
+        return cli_zova_ops_usage_error(NULL, "missing zova-ops action");
+    const char *action = argv[0];
+    if (!cli_zova_ops_action_known(action))
+        return cli_zova_ops_usage_error(action, "unknown zova-ops action");
+
+    const char *input = NULL, *output = NULL, *workspace = NULL;
+    const char *confirmation = NULL, *repo = NULL;
+    bool json = false, confirm_replace = false, replace = false;
+    for (int i = 1; i < argc; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--json") == 0) {
+            if (json) return cli_zova_ops_usage_error(action, "duplicate --json");
+            json = true;
+        } else if (strcmp(arg, "--confirm-replace") == 0) {
+            if (confirm_replace)
+                return cli_zova_ops_usage_error(action, "duplicate --confirm-replace");
+            confirm_replace = true;
+        } else if (strcmp(arg, "--replace") == 0) {
+            if (replace) return cli_zova_ops_usage_error(action, "duplicate --replace");
+            replace = true;
+        } else {
+            const char **target = NULL;
+            if (strcmp(arg, "--input") == 0) target = &input;
+            else if (strcmp(arg, "--output") == 0) target = &output;
+            else if (strcmp(arg, "--workspace-id") == 0) target = &workspace;
+            else if (strcmp(arg, "--confirm-workspace") == 0) target = &confirmation;
+            else if (strcmp(arg, "--repo-path") == 0) target = &repo;
+            else return cli_zova_ops_usage_error(action, "unknown zova-ops flag");
+            if (*target || i + 1 >= argc || strncmp(argv[i + 1], "--", 2) == 0)
+                return cli_zova_ops_usage_error(action, "missing or duplicate flag value");
+            *target = argv[++i];
+        }
+    }
+    if (!json) return cli_zova_ops_usage_error(action, "--json is required");
+    if (workspace && !cli_zova_workspace_confirmation_valid(workspace))
+        return cli_zova_ops_usage_error(action, "invalid --workspace-id");
+    if (confirmation && !cli_zova_workspace_confirmation_valid(confirmation))
+        return cli_zova_ops_usage_error(action, "invalid --confirm-workspace");
+
+    bool valid = false;
+    if (strcmp(action, "status") == 0 || strcmp(action, "compact") == 0)
+        valid = !input && !output && !workspace && !confirmation && !repo &&
+                !confirm_replace && !replace;
+    else if (strcmp(action, "backup") == 0 || strcmp(action, "export-database") == 0)
+        valid = output && !input && !workspace && !confirmation && !repo &&
+                !confirm_replace && !replace;
+    else if (strcmp(action, "restore") == 0 || strcmp(action, "import-database") == 0)
+        valid = input && confirm_replace && !output && !workspace && !confirmation && !repo &&
+                !replace;
+    else if (strcmp(action, "export-workspace") == 0)
+        valid = workspace && output && !input && !confirmation && !repo &&
+                !confirm_replace && !replace;
+    else if (strcmp(action, "import-workspace") == 0)
+        valid = input && !output && !workspace && !confirmation && !repo && !confirm_replace;
+    else if (strcmp(action, "delete-workspace") == 0)
+        valid = workspace && confirmation && !input && !output && !repo &&
+                !confirm_replace && !replace;
+    else if (strcmp(action, "health") == 0)
+        valid = !input && !output && !confirmation && !repo && !confirm_replace && !replace;
+    else if (strcmp(action, "recover-workspace") == 0)
+        valid = workspace && repo && !input && !output && !confirmation &&
+                !confirm_replace && !replace;
+    if (!valid) return cli_zova_ops_usage_error(action, "invalid flags for zova-ops action");
+
+    char database_path[CLI_BUF_2K] = {0};
+    cbm_zova_operation_report_t report = {0};
+    cbm_zova_operation_code_t code = CBM_ZOVA_OPERATION_INVALID;
+    cbm_zova_health_class_t health = CBM_ZOVA_HEALTH_OK;
+    bool is_health = strcmp(action, "health") == 0;
+    bool read_only = strcmp(action, "status") == 0 || is_health;
+    if (cbm_zova_workspace_registry_path(database_path, sizeof(database_path)) != 0) {
+        snprintf(report.reason, sizeof(report.reason), "%s", "database_path_failed");
+    } else if (!read_only && !cbm_zova_single_file_experimental_enabled()) {
+        code = CBM_ZOVA_OPERATION_INCOMPATIBLE;
+        report.code = code;
+        snprintf(report.operation, sizeof(report.operation), "%s", action);
+        snprintf(report.reason, sizeof(report.reason), "%s", "experimental_route_required");
+    } else if (strcmp(action, "status") == 0) {
+        code = cbm_zova_database_status(database_path, &report);
+    } else if (strcmp(action, "backup") == 0) {
+        code = cbm_zova_database_backup(database_path, output, &report);
+    } else if (strcmp(action, "restore") == 0) {
+        code = cbm_zova_database_restore(database_path, input, true, &report);
+    } else if (strcmp(action, "export-database") == 0) {
+        code = cbm_zova_database_export(database_path, output, &report);
+    } else if (strcmp(action, "import-database") == 0) {
+        code = cbm_zova_database_import(database_path, input, true, &report);
+    } else if (strcmp(action, "export-workspace") == 0) {
+        code = cbm_zova_workspace_export(database_path, workspace, output, &report);
+    } else if (strcmp(action, "import-workspace") == 0) {
+        code = cbm_zova_workspace_import(database_path, input, replace, &report);
+    } else if (strcmp(action, "delete-workspace") == 0) {
+        code = cbm_zova_workspace_delete(database_path, workspace, confirmation, &report);
+    } else if (strcmp(action, "compact") == 0) {
+        code = cbm_zova_database_compact(database_path, &report);
+    } else if (is_health) {
+        code = cbm_zova_database_health(database_path, workspace, &health, &report);
+    } else {
+        code = cbm_zova_workspace_recover(database_path, workspace, repo, &report);
+    }
+    report.code = code;
+    cli_zova_ops_print_report(action, database_path, input, output, repo, workspace, is_health,
+                              health, code, &report);
+    return code == CBM_ZOVA_OPERATION_OK || code == CBM_ZOVA_OPERATION_NOOP ? 0 : 1;
+}
 
 struct cbm_config {
     sqlite3 *db;

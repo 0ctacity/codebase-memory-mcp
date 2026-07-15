@@ -2634,9 +2634,43 @@ TEST(cypher_wide_return_projection_bounded) {
 #endif
 }
 
+TEST(cypher_classify_native_relationship) {
+    cbm_query_t *q = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (a)-[:CALLS]->(b) RETURN a,b", &q, &error), 0);
+    const char *reason = NULL;
+    ASSERT_EQ(cbm_cypher_classify_plan(q, &reason), CBM_CYPHER_ROUTE_NATIVE_GRAPH);
+    ASSERT_NOT_NULL(reason);
+    cbm_query_free(q);
+    free(error);
+    PASS();
+}
+
+TEST(cypher_classify_rich_query_in_database) {
+    cbm_query_t *q = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (n:Function) WHERE n.name =~ '.*run.*' RETURN n.name ORDER BY n.name LIMIT 2", &q, &error), 0);
+    const char *reason = NULL;
+    ASSERT_EQ(cbm_cypher_classify_plan(q, &reason), CBM_CYPHER_ROUTE_IN_DATABASE_COMPAT);
+    ASSERT_NOT_NULL(reason);
+    cbm_query_free(q);
+    free(error);
+    PASS();
+}
+
+TEST(cypher_classify_null_plan_unsupported) {
+    const char *reason = NULL;
+    ASSERT_EQ(cbm_cypher_classify_plan(NULL, &reason), CBM_CYPHER_ROUTE_UNSUPPORTED);
+    ASSERT_NOT_NULL(reason);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
+    RUN_TEST(cypher_classify_native_relationship);
+    RUN_TEST(cypher_classify_rich_query_in_database);
+    RUN_TEST(cypher_classify_null_plan_unsupported);
     /* Lexer */
     RUN_TEST(cypher_lex_simple_match);
     RUN_TEST(cypher_lex_relationship);

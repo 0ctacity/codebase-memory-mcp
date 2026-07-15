@@ -4464,6 +4464,27 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
 /* ── Main entry point ─────────────────────────────────────────── */
 
+cbm_cypher_route_t cbm_cypher_classify_plan(const cbm_query_t *query,
+                                            const char **reason) {
+    if (!query || query->pattern_count <= 0 || !query->patterns) {
+        if (reason) *reason = "missing logical plan";
+        return CBM_CYPHER_ROUTE_UNSUPPORTED;
+    }
+
+    /* Native traversal is deliberately narrow: the graph supplies topology,
+     * while predicates, aggregation and presentation remain with the existing
+     * relational executor in cbm.zova. */
+    const cbm_pattern_t *pattern = &query->patterns[0];
+    if (query->pattern_count == 1 && pattern->rel_count > 0 && !query->where &&
+        !query->with_clause && !query->union_next && !query->unwind_expr) {
+        if (reason) *reason = "relationship topology supported by native graph";
+        return CBM_CYPHER_ROUTE_NATIVE_GRAPH;
+    }
+
+    if (reason) *reason = "rich semantics execute in database";
+    return CBM_CYPHER_ROUTE_IN_DATABASE_COMPAT;
+}
+
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));

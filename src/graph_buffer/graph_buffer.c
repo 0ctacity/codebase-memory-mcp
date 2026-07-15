@@ -125,7 +125,14 @@ struct cbm_gbuf {
     int zova_dump_node_count;
     CBMDumpEdge *zova_dump_edges;
     int zova_dump_edge_count;
+
+    /* The SQLite writer and experimental user-local publisher must describe
+     * the same indexed generation. Keep the timestamp produced for the dump
+     * so publication does not create a second, later timestamp. */
+    char indexed_at[CBM_SZ_64];
 };
+
+static void free_retained_dump_edges(CBMDumpEdge *edges, int edge_count);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -485,7 +492,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
     }
 
     free(gb->zova_dump_nodes);
-    free(gb->zova_dump_edges);
+    free_retained_dump_edges(gb->zova_dump_edges, gb->zova_dump_edge_count);
 
     /* Free each individually-allocated node */
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -1685,6 +1692,34 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
+static void free_retained_dump_edges(CBMDumpEdge *edges, int edge_count) {
+    if (!edges) return;
+    for (int i = 0; i < edge_count; i++) {
+        free((void *)edges[i].url_path);
+        free((void *)edges[i].local_name);
+    }
+    free(edges);
+}
+
+static int retain_dump_edge_strings(CBMDumpEdge *edges, int edge_count) {
+    for (int i = 0; i < edge_count; i++) {
+        char *owned_url_path = strdup(edges[i].url_path ? edges[i].url_path : "");
+        char *owned_local_name = strdup(edges[i].local_name ? edges[i].local_name : "");
+        if (!owned_url_path || !owned_local_name) {
+            free(owned_url_path);
+            free(owned_local_name);
+            for (int j = 0; j < i; j++) {
+                free((void *)edges[j].url_path);
+                free((void *)edges[j].local_name);
+            }
+            return -1;
+        }
+        edges[i].url_path = owned_url_path;
+        edges[i].local_name = owned_local_name;
+    }
+    return 0;
+}
+
 static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
                                 CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
                                 int64_t *temp_to_final) {
@@ -1728,7 +1763,7 @@ static void release_and_remap_vectors(cbm_gbuf_t *gb, const int64_t *temp_to_fin
 }
 
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
-    if (!gb || !path) {
+    if (!gb) {
         return CBM_NOT_FOUND;
     }
 
@@ -1759,8 +1794,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     release_gbuf_indexes(gb);
     CBM_PROF_END("dump", "4_release_gbuf_indexes", t_release_idx);
 
-    char indexed_at[CBM_SZ_64];
-    generate_iso_timestamp(indexed_at, sizeof(indexed_at));
+    generate_iso_timestamp(gb->indexed_at, sizeof(gb->indexed_at));
 
     /* Stream node rows to the DB in partitions. Under memory pressure, free each
      * partition's heavy properties_json once persisted — the heavy column is
@@ -1768,8 +1802,8 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * The DB output is identical whether or not freeing engages, so non-pressure
      * runs (and tests) leave the gbuf intact (the budget>0 guard keeps an
      * uninitialized budget from ever triggering the free). */
-    cbm_db_writer_t *w = cbm_writer_open(path);
-    if (!w) {
+    cbm_db_writer_t *w = path ? cbm_writer_open(path) : NULL;
+    if (path && !w) {
         free(src_nodes);
         free(dump_nodes);
         free(temp_to_final);
@@ -1785,7 +1819,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         if (chunk > DUMP_PARTITION_NODES) {
             chunk = DUMP_PARTITION_NODES;
         }
-        rc = cbm_writer_append_nodes(w, &dump_nodes[off], chunk);
+        rc = w ? cbm_writer_append_nodes(w, &dump_nodes[off], chunk) : 0;
         if (rc != 0) {
             break;
         }
@@ -1816,17 +1850,23 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     /* Finalize: nodes-table interior + edges/vectors/metadata/indexes/sqlite_master.
      * Frees w and closes the file; handles a prior append error cleanly. */
     CBM_PROF_START(t_finalize);
-    int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
-                                  dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
-                                  gb->dump_token_vecs, gb->dump_token_vec_count);
+    int frc = w ? cbm_writer_finalize(w, gb->project, gb->root_path, gb->indexed_at, dump_nodes,
+                                      node_idx, dump_edges, edge_idx, gb->dump_vectors,
+                                      gb->dump_vector_count, gb->dump_token_vecs,
+                                      gb->dump_token_vec_count)
+                : 0;
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
     }
 
+    if (rc == 0 && retain_dump_edge_strings(dump_edges, edge_idx) != 0) {
+        rc = CBM_NOT_FOUND;
+    }
+
     if (rc == 0) {
         free(gb->zova_dump_nodes);
-        free(gb->zova_dump_edges);
+        free_retained_dump_edges(gb->zova_dump_edges, gb->zova_dump_edge_count);
         gb->zova_dump_nodes = dump_nodes;
         gb->zova_dump_node_count = node_idx;
         gb->zova_dump_edges = dump_edges;
@@ -1841,19 +1881,65 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     return rc;
 }
 
+int cbm_gbuf_prepare_zova_dump(cbm_gbuf_t *gb) {
+    return cbm_gbuf_dump_to_sqlite(gb, NULL);
+}
+
 int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
+    int rc;
     if (gb->zova_dump_nodes || gb->zova_dump_node_count == 0) {
-        return cbm_zova_after_sqlite_dump_workspace_direct(
+        rc = cbm_zova_after_sqlite_dump_workspace_direct(
             path, gb->root_path, gb->project, gb->zova_dump_nodes, gb->zova_dump_node_count,
             gb->zova_dump_edges, gb->zova_dump_edge_count, gb->dump_vectors,
             gb->dump_vector_count, gb->dump_token_vecs, gb->dump_token_vec_count, CBM_SEM_DIM);
+    } else {
+        rc = cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
+            path, gb->root_path, gb->project, gb->dump_vectors, gb->dump_vector_count,
+            gb->dump_token_vecs, gb->dump_token_vec_count, CBM_SEM_DIM);
     }
-    return cbm_zova_after_sqlite_dump_workspace_with_i8_vectors(
-        path, gb->root_path, gb->project, gb->dump_vectors, gb->dump_vector_count,
-        gb->dump_token_vecs, gb->dump_token_vec_count, CBM_SEM_DIM);
+    return rc;
+}
+
+int cbm_gbuf_publish_zova_user_database(
+    const cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
+    int file_hash_count, const cbm_zova_project_summary_input_t *project_summary,
+    cbm_zova_workspace_generation_result_t *out_result) {
+    if (!gb || !out_result || file_hash_count < 0 ||
+        (file_hash_count > 0 && !file_hashes)) {
+        return CBM_NOT_FOUND;
+    }
+    char user_database_path[CBM_SZ_1K];
+    if (cbm_zova_workspace_registry_path(user_database_path, sizeof(user_database_path)) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    char indexed_at[CBM_SZ_64];
+    if (gb->indexed_at[0] != '\0') {
+        snprintf(indexed_at, sizeof(indexed_at), "%s", gb->indexed_at);
+    } else {
+        generate_iso_timestamp(indexed_at, sizeof(indexed_at));
+    }
+    cbm_zova_workspace_generation_input_t input = {
+        .root_path = gb->root_path,
+        .project = gb->project,
+        .indexed_at = indexed_at,
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = CBM_SEM_DIM,
+        .nodes = gb->zova_dump_nodes,
+        .node_count = gb->zova_dump_node_count,
+        .edges = gb->zova_dump_edges,
+        .edge_count = gb->zova_dump_edge_count,
+        .node_vectors = gb->dump_vectors,
+        .node_vector_count = gb->dump_vector_count,
+        .token_vectors = gb->dump_token_vecs,
+        .token_vector_count = gb->dump_token_vec_count,
+        .file_hashes = file_hashes,
+        .file_hash_count = file_hash_count,
+        .project_summary = project_summary ? *project_summary : (cbm_zova_project_summary_input_t){0},
+    };
+    return cbm_zova_user_database_publish_workspace(user_database_path, &input, out_result);
 }
 
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
