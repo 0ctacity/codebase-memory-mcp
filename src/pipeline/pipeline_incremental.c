@@ -845,7 +845,8 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
                             const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path) {
+                            const char *repo_path,
+                            cbm_zova_workspace_snapshot_t *before) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -854,8 +855,9 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
             cbm_log_error("incremental.err", "phase", "zova_prepare");
             return CBM_NOT_FOUND;
         }
-        if (cbm_pipeline_publish_zova_user_database(pipeline, gbuf, files, file_count,
-                                                    mode_skipped, mode_skipped_count) != 0) {
+        if (cbm_pipeline_publish_zova_user_database_delta(
+                pipeline, gbuf, files, file_count, mode_skipped, mode_skipped_count,
+                before) != 0) {
             cbm_log_error("incremental.err", "phase", "zova_single_file");
             return CBM_NOT_FOUND;
         }
@@ -919,10 +921,25 @@ typedef struct {
     int64_t graph_id;
 } cbm_incremental_node_id_map_t;
 
+typedef struct {
+    uint64_t source_ordinal;
+    int snapshot_index;
+} cbm_incremental_node_order_t;
+
 static int compare_incremental_node_ids(const void *left, const void *right) {
     const cbm_incremental_node_id_map_t *a = left;
     const cbm_incremental_node_id_map_t *b = right;
     return (a->snapshot_id > b->snapshot_id) - (a->snapshot_id < b->snapshot_id);
+}
+
+static int compare_incremental_node_order(const void *left, const void *right) {
+    const cbm_incremental_node_order_t *a = left;
+    const cbm_incremental_node_order_t *b = right;
+    if (a->source_ordinal != b->source_ordinal)
+        return (a->source_ordinal > b->source_ordinal) -
+               (a->source_ordinal < b->source_ordinal);
+    return (a->snapshot_index > b->snapshot_index) -
+           (a->snapshot_index < b->snapshot_index);
 }
 
 static int64_t incremental_graph_id_for_snapshot_id(const cbm_incremental_node_id_map_t *map,
@@ -937,21 +954,32 @@ static int load_zova_snapshot_graph(cbm_gbuf_t *gbuf,
                                     const cbm_zova_workspace_snapshot_t *snapshot) {
     cbm_incremental_node_id_map_t *map =
         snapshot->node_count > 0 ? calloc((size_t)snapshot->node_count, sizeof(*map)) : NULL;
-    if (snapshot->node_count > 0 && !map) {
+    cbm_incremental_node_order_t *order =
+        snapshot->node_count > 0 ? calloc((size_t)snapshot->node_count, sizeof(*order)) : NULL;
+    if (snapshot->node_count > 0 && (!map || !order || !snapshot->node_source_ordinals)) {
+        free(map);
+        free(order);
         return CBM_NOT_FOUND;
     }
     for (int i = 0; i < snapshot->node_count; i++) {
-        const CBMDumpNode *node = &snapshot->nodes[i];
+        order[i] = (cbm_incremental_node_order_t){
+            .source_ordinal = snapshot->node_source_ordinals[i], .snapshot_index = i};
+    }
+    qsort(order, (size_t)snapshot->node_count, sizeof(*order), compare_incremental_node_order);
+    for (int i = 0; i < snapshot->node_count; i++) {
+        const CBMDumpNode *node = &snapshot->nodes[order[i].snapshot_index];
         int64_t graph_id = cbm_gbuf_upsert_node(
             gbuf, node->label, node->name, node->qualified_name, node->file_path,
             node->start_line, node->end_line, node->properties);
         if (graph_id <= 0) {
             free(map);
+            free(order);
             return CBM_NOT_FOUND;
         }
         map[i] = (cbm_incremental_node_id_map_t){.snapshot_id = node->id,
                                                 .graph_id = graph_id};
     }
+    free(order);
     qsort(map, (size_t)snapshot->node_count, sizeof(*map), compare_incremental_node_ids);
     for (int i = 0; i < snapshot->edge_count; i++) {
         const CBMDumpEdge *edge = &snapshot->edges[i];
@@ -999,7 +1027,7 @@ static int copy_zova_snapshot_hashes(const char *project,
 }
 
 static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                           int file_count, const cbm_zova_workspace_snapshot_t *snapshot) {
+                           int file_count, cbm_zova_workspace_snapshot_t *snapshot) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -1226,7 +1254,7 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
     int persist_rc = dump_and_persist(p, existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cbm_pipeline_repo_path(p));
+                                      mode_skipped_count, cbm_pipeline_repo_path(p), snapshot);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
     if (persist_rc != 0) {
@@ -1244,7 +1272,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
 int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
                                       cbm_file_info_t *files, int file_count,
-                                      const cbm_zova_workspace_snapshot_t *snapshot) {
+                                      cbm_zova_workspace_snapshot_t *snapshot) {
     if (!snapshot) {
         return CBM_NOT_FOUND;
     }

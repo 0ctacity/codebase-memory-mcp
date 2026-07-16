@@ -72,3 +72,5 @@ __pycache__/
 
 # Miscellaneous
 .docs/
+notes/
+.superpowers/

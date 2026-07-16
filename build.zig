@@ -99,12 +99,14 @@ fn checkZovaInputs(b: *std.Build, cfg: Config) void {
     const header = b.build_root.handle.readFileAlloc(b.graph.io, header_path, b.allocator, .limited(1024 * 1024)) catch {
         std.debug.panic("error: unable to read Zova C ABI header: {s}", .{header_path});
     };
-    if (!std.mem.containsAtLeast(u8, header, 1, "Zova C ABI, v0.22.0 pre-1.0") or
+    if (!std.mem.containsAtLeast(u8, header, 1, "Zova C ABI, v0.23.0 pre-1.0") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_database_register_function") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_in") or
-        !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_by_id_in"))
+        !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_by_id_in") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_edge_delete_many") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_vector_delete_many"))
     {
-        std.debug.panic("error: Zova C ABI 0.22.0 header with SQL callbacks and candidate vector search is required: {s}", .{header_path});
+        std.debug.panic("error: Zova C ABI 0.23.0 format-8 header with SQL callbacks, candidate vector search, and batch deletion is required: {s}", .{header_path});
     }
 }
 
@@ -441,9 +443,12 @@ const native_sources = [_][]const u8{
     "src/foundation/sha256.c",
     "src/store/store.c",
     "src/zova/cbm_zova.c",
+    "src/zova/cbm_zova_publish_model.c",
+    "src/zova/cbm_zova_delta.c",
     "src/zova/cbm_zova_operations.c",
     "src/zova/cbm_zova_migration.c",
     "src/zova/cbm_zova_legacy_snapshot.c",
+    "src/zova/cbm_zova_v5_snapshot.c",
     "src/zova/cbm_zova_writer_gate.c",
     "src/zova/cbm_zova_route.c",
     "src/zova/cbm_zova_repository.c",

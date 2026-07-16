@@ -26,6 +26,12 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 typedef struct cbm_pipeline cbm_pipeline_t;
 
+typedef enum {
+    CBM_PIPELINE_ROUTE_UNKNOWN = 0,
+    CBM_PIPELINE_ROUTE_FULL = 1,
+    CBM_PIPELINE_ROUTE_INCREMENTAL = 2,
+} cbm_pipeline_route_t;
+
 /* ── Index mode ─────────────────────────────────────────────────── */
 
 #ifndef CBM_INDEX_MODE_T_DEFINED
@@ -82,6 +88,39 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
 /* Elapsed time of the opt-in user-local Zova publication from the last run,
  * or 0 when publication was disabled or did not complete. */
 double cbm_pipeline_get_zova_publish_ms(const cbm_pipeline_t *p);
+
+/* Actual route selected by the most recent cbm_pipeline_run(). This is
+ * independent from cbm_index_mode_t: both full and incremental runs use the
+ * same extraction breadth, while the route describes persistence behavior. */
+cbm_pipeline_route_t cbm_pipeline_get_last_route(const cbm_pipeline_t *p);
+
+typedef struct {
+    bool completed;
+    bool delta;
+    uint64_t full_clear_count;
+    uint64_t unchanged_rewrite_count;
+    uint64_t nodes_inserted;
+    uint64_t nodes_updated;
+    uint64_t nodes_deleted;
+    uint64_t edges_inserted;
+    uint64_t edges_deleted;
+    uint64_t node_vectors_upserted;
+    uint64_t node_vectors_deleted;
+    uint64_t token_vectors_upserted;
+    uint64_t token_vectors_deleted;
+    bool snapshot_completed;
+    double snapshot_base_ms;
+    double snapshot_optional_ms;
+    uint32_t snapshot_hydrated_components;
+    uint64_t snapshot_topology_rows;
+    uint64_t snapshot_node_vector_rows;
+    uint64_t snapshot_token_vector_rows;
+    int64_t snapshot_generation;
+} cbm_pipeline_zova_publish_stats_t;
+
+/* Copy exact counters from the last successful authoritative Zova publish. */
+bool cbm_pipeline_get_zova_publish_stats(
+    const cbm_pipeline_t *p, cbm_pipeline_zova_publish_stats_t *out_stats);
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 

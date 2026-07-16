@@ -11,6 +11,8 @@
 #include "foundation/constants.h"
 #include "semantic/semantic.h"
 #include "zova/cbm_zova.h"
+#include "zova/cbm_zova_publish_model.h"
+#include "zova/cbm_zova_delta.h"
 
 enum {
     GB_ERR = -1,
@@ -1939,7 +1941,57 @@ int cbm_gbuf_publish_zova_user_database(
         .file_hash_count = file_hash_count,
         .project_summary = project_summary ? *project_summary : (cbm_zova_project_summary_input_t){0},
     };
-    return cbm_zova_user_database_publish_workspace(user_database_path, &input, out_result);
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    cbm_zova_publish_model_t *model = NULL;
+    if (cbm_zova_workspace_id_for_root(input.root_path, workspace_id,
+                                        sizeof(workspace_id)) != 0 ||
+        cbm_zova_publish_model_build(workspace_id, &input, &model) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_zova_user_database_publish_model(user_database_path, model, out_result);
+    cbm_zova_publish_model_free(model);
+    return rc;
+}
+
+int cbm_gbuf_publish_zova_user_database_delta(
+    const cbm_gbuf_t *gb, cbm_zova_workspace_snapshot_t *before,
+    const cbm_zova_file_hash_input_t *file_hashes, int file_hash_count,
+    const cbm_zova_project_summary_input_t *project_summary,
+    cbm_zova_workspace_generation_result_t *out_result) {
+    if (!gb || !before || !out_result || file_hash_count < 0 ||
+        (file_hash_count > 0 && !file_hashes)) return CBM_NOT_FOUND;
+    char user_database_path[CBM_SZ_1K];
+    if (cbm_zova_workspace_registry_path(user_database_path, sizeof(user_database_path)) != 0)
+        return CBM_NOT_FOUND;
+    char indexed_at[CBM_SZ_64];
+    if (gb->indexed_at[0] != '\0') snprintf(indexed_at, sizeof(indexed_at), "%s", gb->indexed_at);
+    else generate_iso_timestamp(indexed_at, sizeof(indexed_at));
+    cbm_zova_workspace_generation_input_t input = {
+        .root_path=gb->root_path,.project=gb->project,.indexed_at=indexed_at,
+        .model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,.vector_dimensions=CBM_SEM_DIM,
+        .nodes=gb->zova_dump_nodes,.node_count=gb->zova_dump_node_count,
+        .edges=gb->zova_dump_edges,.edge_count=gb->zova_dump_edge_count,
+        .node_vectors=gb->dump_vectors,.node_vector_count=gb->dump_vector_count,
+        .token_vectors=gb->dump_token_vecs,.token_vector_count=gb->dump_token_vec_count,
+        .file_hashes=file_hashes,.file_hash_count=file_hash_count,
+        .project_summary=project_summary?*project_summary:(cbm_zova_project_summary_input_t){0},
+    };
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    cbm_zova_publish_model_t *model=NULL;
+    cbm_zova_workspace_delta_t *delta=NULL;
+    int rc=cbm_zova_workspace_id_for_root(input.root_path,workspace_id,sizeof(workspace_id));
+    if(rc==0&&strcmp(workspace_id,before->workspace_id)!=0)rc=-1;
+    if(rc==0)rc=cbm_zova_publish_model_build(workspace_id,&input,&model);
+    cbm_zova_snapshot_components_t required=CBM_ZOVA_SNAPSHOT_COMPONENT_NONE;
+    if(rc==0)rc=cbm_zova_workspace_delta_required_components(before,model,&required);
+    if(rc==0&&required!=CBM_ZOVA_SNAPSHOT_COMPONENT_NONE)
+        rc=cbm_zova_repository_hydrate_incremental_components(
+            user_database_path,workspace_id,before->generation,required,before);
+    if(rc==0)rc=cbm_zova_workspace_delta_build(before,model,&delta);
+    if(rc==0)rc=cbm_zova_user_database_publish_delta(user_database_path,model,delta,out_result);
+    cbm_zova_workspace_delta_free(delta);
+    cbm_zova_publish_model_free(model);
+    return rc;
 }
 
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {

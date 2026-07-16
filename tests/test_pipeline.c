@@ -5735,7 +5735,8 @@ done:
 static int pipeline_zova_sidecar_workspace_id(const char *sidecar_path, const char *project,
                                               char *out, size_t out_size) {
     const char *sql =
-        "SELECT workspace_id FROM cbm_zova_trace_nodes_v1 WHERE project=?1 "
+        "SELECT workspace_id FROM cbm_zova_generation_integrity_v1 "
+        "WHERE project=?1 AND workspace_id<>'' "
         "ORDER BY workspace_id LIMIT 1";
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
@@ -5868,40 +5869,32 @@ static int pipeline_zova_trace_node_exists(const char *db_path, const char *proj
                                            const char *qualified_name, bool *out_exists) {
     char sidecar_path[1024];
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
     char node_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
-    sqlite3 *db = NULL;
-    sqlite3_stmt *stmt = NULL;
+    zova_database *db = NULL;
+    zova_message error = {0};
     int rc = -1;
     *out_exists = false;
     if (!db_path || !project || !label || !file_path || !qualified_name || !out_exists ||
         cbm_zova_sidecar_path(db_path, sidecar_path, sizeof(sidecar_path)) != 0 ||
         pipeline_zova_sidecar_workspace_id(sidecar_path, project, workspace_id,
                                            sizeof(workspace_id)) != 0 ||
+        cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)) != 0 ||
         cbm_zova_workspace_node_id_v1(workspace_id, label, file_path, qualified_name, "named",
                                       node_id, sizeof(node_id)) != 0 ||
-        sqlite3_open_v2(sidecar_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(db,
-                           "SELECT 1 FROM cbm_zova_trace_nodes_v1 "
-                           "WHERE workspace_id=?1 AND node_id=?2 LIMIT 1",
-                           -1, &stmt, NULL) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
-        sqlite3_bind_text(stmt, 2, node_id, -1, SQLITE_STATIC) != SQLITE_OK) {
+        zova_database_open(&(zova_database_open_request){
+            .path=sidecar_path,.out_db=&db,.out_error_message=&error}) != ZOVA_OK) {
         goto done;
     }
-    int step = sqlite3_step(stmt);
-    if (step == SQLITE_ROW) {
-        *out_exists = true;
-        rc = 0;
-    } else if (step == SQLITE_DONE) {
+    uint8_t exists = 0;
+    if (zova_graph_node_exists(&(zova_graph_node_exists_request){
+            .db=db,.graph_name=graph_name,.node_id=node_id,.out_exists=&exists}) == ZOVA_OK) {
+        *out_exists = exists != 0;
         rc = 0;
     }
 done:
-    if (stmt) {
-        sqlite3_finalize(stmt);
-    }
-    if (db) {
-        sqlite3_close(db);
-    }
+    if (db) (void)zova_database_close(db);
+    zova_message_free(&error);
     return rc;
 }
 #endif
@@ -5947,6 +5940,7 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
     cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(initial);
     ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    ASSERT_EQ(cbm_pipeline_get_last_route(initial), CBM_PIPELINE_ROUTE_FULL);
     char *project = strdup(cbm_pipeline_project_name(initial));
     ASSERT_NOT_NULL(project);
     cbm_pipeline_free(initial);
@@ -5964,12 +5958,14 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
     cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, incremental_db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(incremental);
     ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    ASSERT_EQ(cbm_pipeline_get_last_route(incremental), CBM_PIPELINE_ROUTE_INCREMENTAL);
     ASSERT_STR_EQ(cbm_pipeline_project_name(incremental), project);
     cbm_pipeline_free(incremental);
 
     cbm_pipeline_t *control = cbm_pipeline_new(g_incr_tmpdir, full_db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(control);
     ASSERT_EQ(cbm_pipeline_run(control), 0);
+    ASSERT_EQ(cbm_pipeline_get_last_route(control), CBM_PIPELINE_ROUTE_FULL);
     ASSERT_STR_EQ(cbm_pipeline_project_name(control), project);
     cbm_pipeline_free(control);
 
@@ -6081,6 +6077,10 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     cbm_pipeline_t *full = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(full);
     ASSERT_EQ(cbm_pipeline_run(full), 0);
+    cbm_pipeline_zova_publish_stats_t full_stats = {0};
+    ASSERT_TRUE(cbm_pipeline_get_zova_publish_stats(full, &full_stats));
+    ASSERT_FALSE(full_stats.delta);
+    ASSERT_EQ(full_stats.full_clear_count, 1);
     cbm_pipeline_free(full);
     ASSERT_TRUE(pipeline_single_file_generation_exists(user_db_path));
 
@@ -6102,7 +6102,7 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     ASSERT_NOT_NULL(helper);
     fprintf(helper, "package main\n\nfunc Helper() string {\n\treturn \"single-file-edit\"\n}\n");
     fclose(helper);
-    cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", "user_before_commit", 1);
+    cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", "user_delta_before_commit", 1);
     cbm_pipeline_t *failed_incremental = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(failed_incremental);
     ASSERT_EQ(cbm_pipeline_run(failed_incremental), -1);
@@ -6125,6 +6125,13 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     cbm_pipeline_t *incremental = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(incremental);
     ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    cbm_pipeline_zova_publish_stats_t incremental_stats = {0};
+    ASSERT_TRUE(cbm_pipeline_get_zova_publish_stats(incremental, &incremental_stats));
+    ASSERT_TRUE(incremental_stats.delta);
+    ASSERT_TRUE(incremental_stats.snapshot_completed);
+    ASSERT_EQ(incremental_stats.snapshot_generation, first_generation);
+    ASSERT_EQ(incremental_stats.full_clear_count, 0);
+    ASSERT_EQ(incremental_stats.unchanged_rewrite_count, 0);
     cbm_pipeline_free(incremental);
 
     ASSERT_EQ(sqlite3_open_v2(user_db_path, &user_db, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);

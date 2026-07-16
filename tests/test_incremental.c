@@ -16,6 +16,10 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <zova/cbm_zova.h>
+#include <zova/cbm_zova_repository.h>
+#include <zova/cbm_zova_route.h>
+#include <sqlite3.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
@@ -203,10 +207,17 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
+    /* A local source clone keeps the suite reproducible offline while still
+     * giving every run a disposable worktree that the tests may mutate. */
     char cmd[1024];
-    if (getenv("CI")) {
+    const char *local_source = getenv("CBM_INCREMENTAL_SOURCE_REPO");
+    if (local_source && local_source[0]) {
+        snprintf(cmd, sizeof(cmd),
+                 "git clone --local --no-hardlinks --quiet '%s' '%s' 2>&1",
+                 local_source, g_repodir);
+    } else if (getenv("CI")) {
+        /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
+         * Cuts indexing time roughly in half on slow shared runners. */
         snprintf(cmd, sizeof(cmd),
                  "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
                  "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
@@ -2918,6 +2929,123 @@ TEST(tool_delete_and_verify) {
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
+
+TEST(incr_zova_native_baseline_round_trips_without_project_db) {
+    char base[256] = "/tmp/cbm_incr_native_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+    char repo_path[512], source_path[640], cache_path[512], user_path[640], project_db[640];
+    snprintf(repo_path, sizeof(repo_path), "%s/repo", base);
+    snprintf(source_path, sizeof(source_path), "%s/main.c", repo_path);
+    snprintf(cache_path, sizeof(cache_path), "%s/cache", base);
+    ASSERT_TRUE(cbm_mkdir_p(repo_path, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(cache_path, 0700));
+
+    FILE *source = fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    const char *initial = "int alpha(void){return 1;}\n";
+    ASSERT_EQ(fwrite(initial, 1, strlen(initial), source), strlen(initial));
+    ASSERT_EQ(fclose(source), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(pipeline, "incr-native"));
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    ASSERT_EQ(cbm_zova_user_database_path(user_path, sizeof(user_path)), 0);
+    snprintf(project_db, sizeof(project_db), "%s/incr-native.db", cache_path);
+    ASSERT_NEQ(access(user_path, F_OK), -1);
+    ASSERT_EQ(access(project_db, F_OK), -1);
+    cbm_zova_repository_t *repository = cbm_zova_repository_open(user_path, "incr-native");
+    ASSERT_NOT_NULL(repository);
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    snprintf(workspace_id, sizeof(workspace_id), "%s",
+             cbm_zova_repository_workspace_id(repository));
+    cbm_zova_repository_close(repository);
+    cbm_zova_workspace_snapshot_t before = {0};
+    ASSERT_EQ(cbm_zova_repository_export_snapshot(user_path, workspace_id, &before), 0);
+    ASSERT_GT(before.generation, 0);
+    ASSERT_EQ(before.node_vector_count, (int)before.integrity.node_vectors);
+    ASSERT_EQ(before.token_vector_count, (int)before.integrity.token_vectors);
+
+    source = fopen(source_path, "ab");
+    ASSERT_NOT_NULL(source);
+    const char *changed = "int beta(void){return alpha();}\n";
+    ASSERT_EQ(fwrite(changed, 1, strlen(changed), source), strlen(changed));
+    ASSERT_EQ(fclose(source), 0);
+
+    cbm_zova_publish_test_metrics_reset();
+
+    pipeline = cbm_pipeline_new(repo_path, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_TRUE(cbm_pipeline_set_project_name(pipeline, "incr-native"));
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_zova_publish_stats_t incremental_stats = {0};
+    ASSERT_TRUE(cbm_pipeline_get_zova_publish_stats(pipeline, &incremental_stats));
+    ASSERT_TRUE(incremental_stats.delta);
+    ASSERT_TRUE(incremental_stats.snapshot_completed);
+    ASSERT_EQ(incremental_stats.snapshot_generation, before.generation);
+    ASSERT_EQ(incremental_stats.full_clear_count, 0);
+    ASSERT_EQ(incremental_stats.unchanged_rewrite_count, 0);
+    cbm_pipeline_free(pipeline);
+    cbm_zova_publish_test_metrics_t delta_publish_metrics = {0};
+    cbm_zova_publish_test_metrics_get(&delta_publish_metrics);
+    ASSERT_EQ(delta_publish_metrics.transaction_count, 1);
+    ASSERT_EQ(delta_publish_metrics.full_clear_count, 0);
+    ASSERT_EQ(delta_publish_metrics.integrity_writes, 1);
+    ASSERT_GT(delta_publish_metrics.delta_authoritative_rows_touched, 0);
+    ASSERT_EQ(delta_publish_metrics.delta_clear_violation_count, 0);
+    ASSERT_EQ(access(project_db, F_OK), -1);
+
+    repository = cbm_zova_repository_open(user_path, "incr-native");
+    ASSERT_NOT_NULL(repository);
+    cbm_zova_repository_close(repository);
+    cbm_zova_workspace_snapshot_t after = {0};
+    ASSERT_EQ(cbm_zova_repository_export_snapshot(user_path, workspace_id, &after), 0);
+    ASSERT_GT(after.generation, before.generation);
+    ASSERT_EQ(after.node_vector_count, (int)after.integrity.node_vectors);
+    ASSERT_EQ(after.token_vector_count, (int)after.integrity.token_vectors);
+    ASSERT_GT(after.node_count, before.node_count);
+
+    sqlite3 *database = NULL;
+    sqlite3_stmt *statement = NULL;
+    ASSERT_EQ(sqlite3_open_v2(user_path, &database, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  database,
+                  "SELECT count(*) FROM sqlite_master WHERE name IN "
+                  "('cbm_node_vectors_compat_v1','cbm_token_vectors_compat_v1')",
+                  -1, &statement, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(statement, 0), 0);
+    sqlite3_finalize(statement);
+    sqlite3_close(database);
+
+    cbm_zova_workspace_snapshot_free(&after);
+    cbm_zova_workspace_snapshot_free(&before);
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    free(saved_flag_copy);
+    free(saved_cache_copy);
+    cbm_unlink(user_path);
+    cbm_unlink(source_path);
+    (void)rmdir(repo_path);
+    (void)rmdir(cache_path);
+    (void)rmdir(base);
+    PASS();
+}
+
+SUITE(zova_incremental_native) {
+    RUN_TEST(incr_zova_native_baseline_round_trips_without_project_db);
+}
 
 SUITE(incremental) {
     if (incremental_setup() != 0) {

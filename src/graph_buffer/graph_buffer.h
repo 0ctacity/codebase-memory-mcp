@@ -21,6 +21,7 @@ typedef struct cbm_gbuf cbm_gbuf_t;
 
 /* Forward declare store for dump path */
 typedef struct cbm_store cbm_store_t;
+typedef struct cbm_zova_workspace_snapshot cbm_zova_workspace_snapshot_t;
 
 /* ── Node / Edge structs (owned by the buffer) ───────────────────── */
 
@@ -189,6 +190,11 @@ int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path);
 int cbm_gbuf_publish_zova_user_database(
     const cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
     int file_hash_count, const cbm_zova_project_summary_input_t *project_summary,
+    cbm_zova_workspace_generation_result_t *out_result);
+int cbm_gbuf_publish_zova_user_database_delta(
+    const cbm_gbuf_t *gb, cbm_zova_workspace_snapshot_t *before,
+    const cbm_zova_file_hash_input_t *file_hashes, int file_hash_count,
+    const cbm_zova_project_summary_input_t *project_summary,
     cbm_zova_workspace_generation_result_t *out_result);
 
 /* Flush the buffer to an existing store via the store API.

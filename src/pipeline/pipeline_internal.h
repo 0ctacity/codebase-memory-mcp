@@ -142,6 +142,10 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 int cbm_pipeline_publish_zova_user_database(
     cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
     const cbm_file_hash_t *mode_skipped, int mode_skipped_count);
+int cbm_pipeline_publish_zova_user_database_delta(
+    cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
+    const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+    cbm_zova_workspace_snapshot_t *before);
 void cbm_pipeline_capture_project_summary(cbm_pipeline_t *p, cbm_store_t *store);
 
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
@@ -622,7 +626,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                  int file_count);
 int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
                                       cbm_file_info_t *files, int file_count,
-                                      const cbm_zova_workspace_snapshot_t *snapshot);
+                                      cbm_zova_workspace_snapshot_t *snapshot);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

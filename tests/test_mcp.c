@@ -959,24 +959,28 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
                                   .target_id = 2, .type = "CALLS", .properties = "{}"},
                                  {.id = 2, .project = "fixture", .source_id = 2,
                                   .target_id = 1, .type = "DEFINES", .properties = "{}"}};
-    int8_t alpha_vector[2] = {10, 0};
-    int8_t beta_vector[2] = {0, 10};
-    int8_t aardvark_vector[2] = {7, 7};
+    int8_t alpha_vector[768] = {0};
+    int8_t beta_vector[768] = {0};
+    int8_t aardvark_vector[768] = {0};
+    alpha_vector[0] = 10;
+    beta_vector[1] = 10;
+    aardvark_vector[0] = 7;
+    aardvark_vector[1] = 7;
     const CBMDumpVector node_vectors[] = {
-        {.node_id = 1, .project = "fixture", .vector = (uint8_t *)alpha_vector, .vector_len = 2},
-        {.node_id = 2, .project = "fixture", .vector = (uint8_t *)beta_vector, .vector_len = 2},
+        {.node_id = 1, .project = "fixture", .vector = (uint8_t *)alpha_vector, .vector_len = 768},
+        {.node_id = 2, .project = "fixture", .vector = (uint8_t *)beta_vector, .vector_len = 768},
         {.node_id = 3, .project = "fixture", .vector = (uint8_t *)aardvark_vector,
-         .vector_len = 2},
+         .vector_len = 768},
     };
     const CBMDumpTokenVec token_vectors[] = {
         {.id = 1, .project = "fixture", .token = "alpha", .vector = (uint8_t *)alpha_vector,
-         .vector_len = 2, .idf = 1.0f},
+         .vector_len = 768, .idf = 1.0f},
     };
     cbm_zova_workspace_generation_input_t published = {
         .root_path = repo_root, .project = "fixture",
         .indexed_at = "2026-07-13T00:00:00Z",
         .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
-        .vector_dimensions = 2, .nodes = nodes, .node_count = 4,
+        .vector_dimensions = 768, .nodes = nodes, .node_count = 4,
         .edges = edges, .edge_count = 2,
         .node_vectors = node_vectors, .node_vector_count = 3,
         .token_vectors = token_vectors, .token_vector_count = 1,
@@ -1103,7 +1107,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
                                  -1, &vector_stmt, NULL),
               SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_alpha_id), SQLITE_OK);
-    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, alpha_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, alpha_vector, 768, SQLITE_STATIC), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
     sqlite3_finalize(vector_stmt);
     ASSERT_EQ(sqlite3_prepare_v2(baseline_db,
@@ -1111,7 +1115,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
                                  -1, &vector_stmt, NULL),
               SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_aardvark_id), SQLITE_OK);
-    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, aardvark_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, aardvark_vector, 768, SQLITE_STATIC), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
     sqlite3_finalize(vector_stmt);
     ASSERT_EQ(sqlite3_prepare_v2(baseline_db,
@@ -1119,7 +1123,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
                                  -1, &vector_stmt, NULL),
               SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_int64(vector_stmt, 1, baseline_beta_id), SQLITE_OK);
-    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, beta_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 2, beta_vector, 768, SQLITE_STATIC), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
     sqlite3_finalize(vector_stmt);
     ASSERT_EQ(sqlite3_prepare_v2(
@@ -1127,7 +1131,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
                   "INSERT INTO token_vectors VALUES(1,'fixture','alpha',?1,1)",
                   -1, &vector_stmt, NULL),
               SQLITE_OK);
-    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 1, alpha_vector, 2, SQLITE_STATIC), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_blob(vector_stmt, 1, alpha_vector, 768, SQLITE_STATIC), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(vector_stmt), SQLITE_DONE);
     sqlite3_finalize(vector_stmt);
     cbm_mcp_server_set_project(baseline_srv, "fixture");
@@ -1715,7 +1719,7 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
-TEST(tool_trace_call_path_graph_read_matches_sqlite) {
+TEST(tool_trace_call_path_projection_free_sidecar_falls_back_to_sqlite) {
 #if !CBM_WITH_ZOVA
     PASS();
 #else
@@ -1798,8 +1802,7 @@ TEST(tool_trace_call_path_graph_read_matches_sqlite) {
         if (strcmp(directions[i], "both") == 0) {
             cbm_zova_graph_metrics_t metrics = {0};
             cbm_store_zova_graph_last_metrics(cbm_mcp_server_store(srv), &metrics);
-            ASSERT_FALSE(metrics.fallback);
-            ASSERT_EQ(metrics.walk_count, 2);
+            ASSERT_TRUE(metrics.fallback);
         }
         free(zova_text);
         free(zova_result);
@@ -1817,8 +1820,7 @@ TEST(tool_trace_call_path_graph_read_matches_sqlite) {
     ASSERT_NOT_NULL(default_result);
     cbm_zova_graph_metrics_t default_metrics = {0};
     cbm_store_zova_graph_last_metrics(cbm_mcp_server_store(srv), &default_metrics);
-    ASSERT_FALSE(default_metrics.fallback);
-    ASSERT_EQ(default_metrics.walk_count, 1);
+    ASSERT_TRUE(default_metrics.fallback);
     free(default_result);
 
     cbm_mcp_server_free(srv);
@@ -6017,7 +6019,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
-    RUN_TEST(tool_trace_call_path_graph_read_matches_sqlite);
+    RUN_TEST(tool_trace_call_path_projection_free_sidecar_falls_back_to_sqlite);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);

@@ -238,6 +238,7 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
+extern void suite_zova_incremental_native(void);
 extern void suite_semantic(void);
 extern void suite_ast_profile(void);
 extern void suite_slab_alloc(void);
@@ -450,6 +451,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_g);
 
     RUN_SELECTED_SUITE(incremental);
+    RUN_SELECTED_SUITE(zova_incremental_native);
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

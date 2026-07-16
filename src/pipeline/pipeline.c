@@ -110,6 +110,8 @@ struct cbm_pipeline {
     int committed_nodes;
     int committed_edges;
     double zova_publish_ms;
+    cbm_pipeline_route_t last_route;
+    cbm_pipeline_zova_publish_stats_t zova_publish_stats;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -334,6 +336,17 @@ void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int 
 
 double cbm_pipeline_get_zova_publish_ms(const cbm_pipeline_t *p) {
     return p ? p->zova_publish_ms : 0.0;
+}
+
+cbm_pipeline_route_t cbm_pipeline_get_last_route(const cbm_pipeline_t *p) {
+    return p ? p->last_route : CBM_PIPELINE_ROUTE_UNKNOWN;
+}
+
+bool cbm_pipeline_get_zova_publish_stats(
+    const cbm_pipeline_t *p, cbm_pipeline_zova_publish_stats_t *out_stats) {
+    if (!p || !out_stats || !p->zova_publish_stats.completed) return false;
+    *out_stats = p->zova_publish_stats;
+    return true;
 }
 
 void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) {
@@ -961,6 +974,8 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
+enum { PIPELINE_INCREMENTAL_FATAL = -2 };
+
 /* Try incremental pipeline or delete old DB for reindex.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
@@ -988,10 +1003,11 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                          * read transaction before publishing the next generation,
                          * otherwise it pins the old WAL and prevents checkpointing. */
                         cbm_zova_repository_close(repo);
+                        p->last_route = CBM_PIPELINE_ROUTE_INCREMENTAL;
                         int rc = cbm_pipeline_run_incremental_zova(p, zova_path, files, file_count,
                                                                    &snapshot);
                         cbm_zova_workspace_snapshot_free(&snapshot);
-                        return rc;
+                        return rc == 0 ? 0 : PIPELINE_INCREMENTAL_FATAL;
                     }
                     if (hash_count > 0) {
                         cbm_log_info("pipeline.route", "path", "mode_change_reindex",
@@ -1024,6 +1040,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
+            p->last_route = CBM_PIPELINE_ROUTE_INCREMENTAL;
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
             free(db_path);
             return rc;
@@ -1076,14 +1093,16 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #endif
 }
 
-int cbm_pipeline_publish_zova_user_database(
+static int pipeline_publish_zova_user_database(
     cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
-    const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
+    const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+    cbm_zova_workspace_snapshot_t *before) {
     if (!p || !gbuf || file_count < 0 || mode_skipped_count < 0 ||
         (file_count > 0 && !files) || (mode_skipped_count > 0 && !mode_skipped)) {
         return CBM_NOT_FOUND;
     }
     p->zova_publish_ms = 0.0;
+    memset(&p->zova_publish_stats, 0, sizeof(p->zova_publish_stats));
     if (!cbm_zova_single_file_experimental_enabled()) return 0;
     int capacity = file_count + mode_skipped_count;
     cbm_zova_file_hash_input_t *hashes =
@@ -1117,7 +1136,9 @@ int cbm_pipeline_publish_zova_user_database(
         summary.updated_at = p->saved_summary.updated_at;
     }
     cbm_zova_workspace_generation_result_t result = {0};
-    int rc = cbm_gbuf_publish_zova_user_database(gbuf, hashes, count, &summary, &result);
+    int rc = before
+        ? cbm_gbuf_publish_zova_user_database_delta(gbuf, before, hashes, count, &summary, &result)
+        : cbm_gbuf_publish_zova_user_database(gbuf, hashes, count, &summary, &result);
     free(hashes);
     if (rc != 0) {
         cbm_log_error("zova.single_file_publish", "project", p->project_name,
@@ -1125,10 +1146,60 @@ int cbm_pipeline_publish_zova_user_database(
         return rc;
     }
     p->zova_publish_ms = result.publish_ms;
+    p->zova_publish_stats = (cbm_pipeline_zova_publish_stats_t){
+        .completed = true,
+        .delta = result.publication_mode == CBM_ZOVA_PUBLICATION_MODE_DELTA,
+        .full_clear_count = result.full_clear_count,
+        .unchanged_rewrite_count = result.unchanged_rewrite_count,
+        .nodes_inserted = result.nodes_inserted,
+        .nodes_updated = result.nodes_updated,
+        .nodes_deleted = result.nodes_deleted,
+        .edges_inserted = result.edges_inserted,
+        .edges_deleted = result.edges_deleted,
+        .node_vectors_upserted = result.node_vectors_upserted,
+        .node_vectors_deleted = result.node_vectors_deleted,
+        .token_vectors_upserted = result.token_vectors_upserted,
+        .token_vectors_deleted = result.token_vectors_deleted,
+        .snapshot_completed = before != NULL,
+        .snapshot_base_ms = before ? before->metrics.base_ms : 0.0,
+        .snapshot_optional_ms = before ? before->metrics.optional_ms : 0.0,
+        .snapshot_hydrated_components = before ? before->hydrated_components : 0,
+        .snapshot_topology_rows = before ? before->metrics.topology_rows : 0,
+        .snapshot_node_vector_rows = before ? before->metrics.node_vector_rows : 0,
+        .snapshot_token_vector_rows = before ? before->metrics.token_vector_rows : 0,
+        .snapshot_generation = before ? before->generation : 0,
+    };
+    char generation_text[32], publish_ms_text[32], inserted_text[32], updated_text[32], deleted_text[32];
+    snprintf(generation_text,sizeof(generation_text),"%lld",(long long)result.generation);
+    snprintf(publish_ms_text,sizeof(publish_ms_text),"%.3f",result.publish_ms);
+    snprintf(inserted_text,sizeof(inserted_text),"%llu",(unsigned long long)result.inserted_count);
+    snprintf(updated_text,sizeof(updated_text),"%llu",(unsigned long long)result.updated_count);
+    snprintf(deleted_text,sizeof(deleted_text),"%llu",(unsigned long long)result.deleted_count);
     cbm_log_info("zova.single_file_publish", "project", p->project_name,
-                 "generation", itoa_buf((int)result.generation),
-                 "publish_ms", itoa_buf((int)result.publish_ms));
+                 "generation", generation_text,
+                 "publish_ms", publish_ms_text,
+                 "publication_mode",
+                 result.publication_mode == CBM_ZOVA_PUBLICATION_MODE_DELTA ? "delta" : "full",
+                 "inserted", inserted_text,
+                 "updated", updated_text,
+                 "deleted", deleted_text);
     return 0;
+}
+
+int cbm_pipeline_publish_zova_user_database(
+    cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
+    const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
+    return pipeline_publish_zova_user_database(p,gbuf,files,file_count,mode_skipped,
+                                               mode_skipped_count,NULL);
+}
+
+int cbm_pipeline_publish_zova_user_database_delta(
+    cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,
+    const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+    cbm_zova_workspace_snapshot_t *before) {
+    if(!before)return CBM_NOT_FOUND;
+    return pipeline_publish_zova_user_database(p,gbuf,files,file_count,mode_skipped,
+                                               mode_skipped_count,before);
 }
 
 void cbm_pipeline_capture_project_summary(cbm_pipeline_t *p, cbm_store_t *store) {
@@ -1416,6 +1487,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
+    p->last_route = CBM_PIPELINE_ROUTE_UNKNOWN;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -1463,11 +1535,16 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Check for existing DB → try incremental or delete for reindex */
     rc = try_incremental_or_delete_db(p, files, file_count);
+    if (rc == PIPELINE_INCREMENTAL_FATAL) {
+        cbm_discover_free(files, file_count);
+        return CBM_NOT_FOUND;
+    }
     if (rc >= 0) {
         cbm_discover_free(files, file_count);
         return rc;
     }
     cbm_log_info("pipeline.route", "path", "full");
+    p->last_route = CBM_PIPELINE_ROUTE_FULL;
 
     /* Phase 2: Create graph buffer and registry */
     p->gbuf = cbm_gbuf_new(p->project_name, p->repo_path);

@@ -467,9 +467,9 @@ codebase-memory-mcp zova-ops recover-workspace --workspace-id WORKSPACE_ID --rep
 ```
 
 Full-database archives contain a versioned manifest and verified `data.zova`.
-Workspace archives contain one workspace's metadata, FTS, graph, compatibility
-vector payload, file hashes, summary, generation, and integrity digests; import
-rebuilds and verifies native graph/vector objects. Restore and database import
+Workspace archives contain one workspace's metadata, canonical FTS, native
+graph and vector payloads, file hashes, summary, generation, and integrity
+digests; import rebuilds and verifies the native objects. Restore and database import
 require the literal `--confirm-replace` flag. Workspace deletion requires the
 exact target ID as `--confirm-workspace`.
 
@@ -503,15 +503,16 @@ CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 scripts/zova-single-file-validation.sh
 It retains only a JSON report on success; normal indexing and the default
 `.db`/sidecar authority are unchanged.
 
-Exact opt-in reports for CBM, motive, rvault, and tops are retained at
-`build/zova-single-file-multi/<repository>/latest-report.json`. They cover rich
-SQL rows, 20 FTS/BM25 queries, sampled native graph degree/neighbors/walks,
-compatibility and public native raw-i8 bytes, single/multi-query rankings,
-atomic fault phases, and reader visibility. The dedicated Section 9 promotion
-gate subsequently passed three fresh full/incremental attempts on TOPS, motive,
-rvault, and CBM with exact parity, zero unexpected fallback, and accepted read,
-ingestion, and storage ratios. The flag remains opt-in: compatibility-write
-retirement and the final Section 10 one-file cutover remain separate work.
+The current flagged schema is CBM v6 on Zova format v8. It removes projection
+tables, duplicate workspace FTS/rowmaps, compatibility-vector tables, and the
+separate native norm table. Full publication uses one normalized model;
+`CBM_MODE_INCREMENTAL` computes and commits an atomic delta without clearing
+the workspace or rewriting unchanged rows. Migration from v5/v7 uses a
+verified temporary database and resumable atomic replacement. The flag remains
+opt-in. The final same-binary TOPS → motive → rvault → CBM optimization gate
+passes; storage is 45.0%–60.1% lower than the documented pre-v6 Zova baseline,
+and true incremental publication performs no full clear or unchanged-row
+rewrite. This evidence does not make the route the Section 10 default.
 
 ### Reproducible Zova development builds
 
