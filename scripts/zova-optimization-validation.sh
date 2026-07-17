@@ -10,6 +10,7 @@ BASELINE=${CBM_ZOVA_OPTIMIZATION_BASELINE:-}
 BASELINE_CAPTURE=${CBM_ZOVA_OPTIMIZATION_BASELINE_CAPTURE:-0}
 ATTEMPT=${CBM_ZOVA_OPTIMIZATION_ATTEMPT:-0}
 MUTATION=${CBM_ZOVA_OPTIMIZATION_MUTATION:-}
+BENCHMARK_KIND=${CBM_ZOVA_OPTIMIZATION_BENCHMARK_KIND:-lazy-hydration}
 BUILD=${CBM_ZOVA_OPTIMIZATION_BUILD_BINARY:-"$ROOT/build/c/codebase-memory-mcp"}
 TEST_RUNNER=${CBM_ZOVA_OPTIMIZATION_TEST_RUNNER:-"$ROOT/build/c/test-runner"}
 RUN_TESTS=${CBM_ZOVA_OPTIMIZATION_RUN_TESTS:-"$ROOT/scripts/zova-run-tests.sh"}
@@ -22,6 +23,9 @@ fail() { echo "error: $*" >&2; exit 1; }
 case "$NAME" in tops|motive|rvault|CBM) ;; *) fail "invalid repository name: $NAME";; esac
 case "$MUTATION" in digest-stable|source-change) ;;
   *) fail "mutation must be digest-stable or source-change";;
+esac
+case "$BENCHMARK_KIND" in storage-ingestion|lazy-hydration) ;;
+  *) fail "benchmark kind must be storage-ingestion or lazy-hydration";;
 esac
 [[ "$BASELINE_CAPTURE" == 0 || "$BASELINE_CAPTURE" == 1 ]] ||
   fail "baseline capture must be 0 or 1"
@@ -120,11 +124,12 @@ run_state single incremental "$SINGLE_CACHE" "$SINGLE_INCREMENTAL" \
   "$RUN_ROOT/single-incremental.log"
 
 python3 - "$PURE_FULL" "$SINGLE_FULL" "$PURE_INCREMENTAL" "$SINGLE_INCREMENTAL" \
-  "$REPORT" "$NAME" "$SOURCE_COMMIT" "$BUILD_SHA" "$RUN_ID" "$MUTATION" <<'PY'
+  "$REPORT" "$NAME" "$SOURCE_COMMIT" "$BUILD_SHA" "$RUN_ID" "$MUTATION" \
+  "$BENCHMARK_KIND" <<'PY'
 import json, os, pathlib, sys
 state_paths = [pathlib.Path(value) for value in sys.argv[1:5]]
 output = pathlib.Path(sys.argv[5])
-name, source_commit, build_sha256, run_id, mutation = sys.argv[6:]
+name, source_commit, build_sha256, run_id, mutation, benchmark_kind = sys.argv[6:]
 states = [json.loads(path.read_text()) for path in state_paths]
 expected = [
     ("pure", "full", "CBM_MODE_FULL"),
@@ -140,7 +145,7 @@ for index, (route, workload, mode) in enumerate(expected):
         raise SystemExit(f"state {index} route/workload/mode mismatch")
 report = {
     "schema_version": 1,
-    "benchmark_kind": "lazy-hydration",
+    "benchmark_kind": benchmark_kind,
     "repository": name,
     "source_commit": source_commit,
     "build_sha256": build_sha256,

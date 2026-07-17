@@ -41,7 +41,7 @@ if [[ -e "$test_home_first" || -e "$test_cache_first" ]]; then
 fi
 echo "PASS: zova test workflow builds once and runs requested suites directly"
 
-grep -q 'Zova C ABI, v0.23.0 pre-1.0' "$ROOT/build.zig"
+grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ROOT/build.zig"
 grep -q 'zova_graph_edge_delete_many' "$ROOT/build.zig"
 grep -q 'zova_vector_delete_many' "$ROOT/build.zig"
 echo "PASS: CBM build guard requires the format-8 Zova ABI surface"
@@ -60,8 +60,8 @@ printf 'archive-v1\n' > "$FAKE_ZOVA/zig-out/lib/libzova_c.a"
 printf 'root-v1\n' > "$FAKE_ZOVA/src/root.zig"
 printf 'dependency-v1\n' > "$FAKE_ZOVA/src/zova.zig"
 cat > "$FAKE_ZOVA/src/version.zig" <<'EOF'
-pub const package_version = "0.23.0";
-pub const abi_version_string = "0.23.0";
+pub const package_version = "0.24.0";
+pub const abi_version_string = "0.24.0";
 pub const format_version = "8";
 EOF
 git -C "$FAKE_ZOVA" init -q
@@ -82,7 +82,7 @@ grep -qx 'root-v1' "$PINNED_ZOVA/src/root.zig"
 grep -qx 'dependency-v1' "$PINNED_ZOVA/src/zova.zig"
 grep -qx "source_commit=$FAKE_COMMIT" "$PINNED_ZOVA/manifest.txt"
 grep -qx 'format_version=8' "$PINNED_ZOVA/manifest.txt"
-grep -qx 'abi_version=0.23.0' "$PINNED_ZOVA/manifest.txt"
+grep -qx 'abi_version=0.24.0' "$PINNED_ZOVA/manifest.txt"
 grep -qx 'graph_edge_delete_many_symbol=zova_graph_edge_delete_many' "$PINNED_ZOVA/manifest.txt"
 grep -qx 'vector_delete_many_symbol=zova_vector_delete_many' "$PINNED_ZOVA/manifest.txt"
 expected_header_hash=$(shasum -a 256 "$FAKE_ZOVA/include/zova.h" | awk '{print $1}')

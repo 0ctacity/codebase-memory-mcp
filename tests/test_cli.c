@@ -10,6 +10,8 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/sha256.h"
+#include "../src/foundation/sha256_backend.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -3146,6 +3148,99 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+TEST(cli_sha256_update_fragmentation_matches_one_shot) {
+    static const size_t boundary_sizes[] = {0, 55, 56, 63, 64, 65, 127, 128, 129};
+    uint8_t boundary_data[129];
+    for (size_t i = 0; i < sizeof(boundary_data); i++) {
+        boundary_data[i] = (uint8_t)((i * 37U + 11U) & 0xffU);
+    }
+
+    cbm_sha256_ctx empty;
+    uint8_t empty_digest[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_init(&empty);
+    cbm_sha256_update(&empty, NULL, 0);
+    cbm_sha256_final(&empty, empty_digest);
+    static const uint8_t expected_empty[CBM_SHA256_DIGEST_LEN] = {
+        0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14,
+        0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24,
+        0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c,
+        0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55,
+    };
+    ASSERT_TRUE(memcmp(empty_digest, expected_empty, sizeof(empty_digest)) == 0);
+
+    for (size_t size_index = 0;
+         size_index < sizeof(boundary_sizes) / sizeof(boundary_sizes[0]); size_index++) {
+        const size_t size = boundary_sizes[size_index];
+        uint8_t expected[CBM_SHA256_DIGEST_LEN];
+        cbm_sha256_ctx one_shot;
+        cbm_sha256_init(&one_shot);
+        cbm_sha256_update(&one_shot, boundary_data, size);
+        cbm_sha256_final(&one_shot, expected);
+
+        for (size_t split = 0; split <= size; split++) {
+            uint8_t actual[CBM_SHA256_DIGEST_LEN];
+            cbm_sha256_ctx fragmented;
+            cbm_sha256_init(&fragmented);
+            cbm_sha256_update(&fragmented, boundary_data, split);
+            cbm_sha256_update(&fragmented, boundary_data + split, size - split);
+            cbm_sha256_final(&fragmented, actual);
+            ASSERT_TRUE(memcmp(actual, expected, sizeof(actual)) == 0);
+        }
+    }
+
+    const size_t large_size = 2U * 1024U * 1024U + 129U;
+    uint8_t *large_data = malloc(large_size);
+    ASSERT_NOT_NULL(large_data);
+    for (size_t i = 0; i < large_size; i++) {
+        large_data[i] = (uint8_t)((i * 13U + i / 251U) & 0xffU);
+    }
+    uint8_t expected[CBM_SHA256_DIGEST_LEN];
+    uint8_t actual[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx one_shot;
+    cbm_sha256_ctx fragmented;
+    cbm_sha256_init(&one_shot);
+    cbm_sha256_update(&one_shot, large_data, large_size);
+    cbm_sha256_final(&one_shot, expected);
+    cbm_sha256_init(&fragmented);
+    for (size_t offset = 0, chunk = 1; offset < large_size; chunk = chunk % 127U + 1U) {
+        size_t take = chunk < large_size - offset ? chunk : large_size - offset;
+        cbm_sha256_update(&fragmented, large_data + offset, take);
+        offset += take;
+    }
+    cbm_sha256_final(&fragmented, actual);
+    free(large_data);
+    ASSERT_TRUE(memcmp(actual, expected, sizeof(actual)) == 0);
+    PASS();
+}
+
+TEST(cli_sha256_accelerated_backend_matches_portable) {
+    const size_t size = 2U * 1024U * 1024U + 129U;
+    uint8_t *data = malloc(size);
+    ASSERT_NOT_NULL(data);
+    for (size_t i = 0; i < size; i++) data[i] = (uint8_t)((i * 29U + 7U) & 0xffU);
+
+    uint8_t expected[CBM_SHA256_DIGEST_LEN];
+    uint8_t actual[CBM_SHA256_DIGEST_LEN];
+    cbm_sha256_ctx portable;
+    cbm_sha256_backend_ctx backend;
+    cbm_sha256_init(&portable);
+    cbm_sha256_update(&portable, data, size);
+    cbm_sha256_final(&portable, expected);
+    cbm_sha256_backend_init(&backend);
+    for (size_t offset = 0, chunk = 1; offset < size; chunk = chunk % 4099U + 1U) {
+        size_t take = chunk < size - offset ? chunk : size - offset;
+        cbm_sha256_backend_update(&backend, data + offset, take);
+        offset += take;
+    }
+    cbm_sha256_backend_final(&backend, actual);
+    free(data);
+    ASSERT_TRUE(memcmp(actual, expected, sizeof(actual)) == 0);
+#if defined(__APPLE__)
+    ASSERT_TRUE(cbm_sha256_backend_is_accelerated());
+#endif
+    PASS();
+}
+
 TEST(cli_zova_migrate_strict_action_parser_and_exit_mapping) {
     char root[256], cache[256];
     snprintf(root, sizeof(root), "/tmp/cbm-cli-zova repo-%d", (int)getpid());
@@ -3415,6 +3510,8 @@ SUITE(cli) {
     RUN_TEST(cli_zova_migrate_strict_action_parser_and_exit_mapping);
     RUN_TEST(cli_zova_migrate_discovers_exact_cache_source_only);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_sha256_update_fragmentation_matches_one_shot);
+    RUN_TEST(cli_sha256_accelerated_backend_matches_portable);
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);

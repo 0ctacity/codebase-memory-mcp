@@ -885,15 +885,21 @@ cbm_store_t *cbm_store_open_zova_workspace_query(const char *db_path,
     int n = snprintf(
         sql, sizeof(sql),
         "CREATE TEMP VIEW projects AS SELECT project AS name,indexed_at,root_path "
-        "FROM cbm_projects_v1 WHERE workspace_id='%s';"
-        "CREATE TEMP VIEW nodes AS SELECT cbm_stable_numeric_id(node_id) AS id,project,label,"
-        "name,qualified_name,file_path,start_line,end_line,properties "
-        "FROM cbm_nodes_v1 WHERE workspace_id='%s';"
-        "CREATE TEMP VIEW edges AS SELECT cbm_stable_numeric_id(edge_id) AS id,"
-        "(SELECT project FROM cbm_projects_v1 p WHERE p.workspace_id=cbm_edges_v1.workspace_id) AS project,"
-        "cbm_stable_numeric_id(source_node_id) AS source_id,"
-        "cbm_stable_numeric_id(target_node_id) AS target_id,edge_type AS type,properties "
-        "FROM cbm_edges_v1 WHERE workspace_id='%s';",
+        "FROM cbm_projects_v1 p JOIN cbm_workspace_registry r USING(workspace_key) "
+        "WHERE r.workspace_id='%s';"
+        "CREATE TEMP VIEW nodes AS SELECT cbm_stable_numeric_id(n.node_id) AS id,p.project,"
+        "n.label,n.name,n.qualified_name,f.file_path,n.start_line,n.end_line,n.properties "
+        "FROM cbm_nodes_v1 n JOIN cbm_files_v1 f USING(file_key) "
+        "JOIN cbm_projects_v1 p USING(workspace_key) "
+        "JOIN cbm_workspace_registry r USING(workspace_key) WHERE r.workspace_id='%s';"
+        "CREATE TEMP VIEW edges AS SELECT cbm_stable_numeric_id(e.edge_id) AS id,p.project,"
+        "cbm_stable_numeric_id(src.node_id) AS source_id,"
+        "cbm_stable_numeric_id(dst.node_id) AS target_id,e.edge_type AS type,e.properties "
+        "FROM cbm_edges_v1 e JOIN cbm_nodes_v1 src ON src.node_key=e.source_node_key "
+        "JOIN cbm_nodes_v1 dst ON dst.node_key=e.target_node_key "
+        "JOIN cbm_projects_v1 p ON p.workspace_key=e.workspace_key "
+        "JOIN cbm_workspace_registry r ON r.workspace_key=e.workspace_key "
+        "WHERE r.workspace_id='%s';",
         workspace_id, workspace_id, workspace_id);
     if (n < 0 || (size_t)n >= sizeof(sql) || sqlite3_exec(s->db, sql, NULL, NULL, NULL) != SQLITE_OK) {
         cbm_store_close(s);
@@ -1726,7 +1732,9 @@ static int store_zova_workspace_edges(cbm_store_t *s, int64_t node_numeric_id,
         return CBM_STORE_NOT_FOUND;
     *out = NULL; *count = 0;
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,"SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+    if (sqlite3_prepare_v2(s->db,"SELECT n.node_id FROM cbm_nodes_v1 n "
+                                "JOIN cbm_workspace_registry r USING(workspace_key) "
+                                "WHERE r.workspace_id=?1 "
                                 "AND cbm_stable_numeric_id(node_id)=?2",-1,&stmt,NULL)!=SQLITE_OK)
         return CBM_STORE_ERR;
     bind_text(stmt,1,s->zova_graph_workspace_id);sqlite3_bind_int64(stmt,2,node_numeric_id);
@@ -2105,7 +2113,9 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
         char graph[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
         if (!s->zova_graph_session ||
             sqlite3_prepare_v2(s->db,
-                               "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+                               "SELECT n.node_id FROM cbm_nodes_v1 n "
+                               "JOIN cbm_workspace_registry r USING(workspace_key) "
+                               "WHERE r.workspace_id=?1 "
                                "AND cbm_stable_numeric_id(node_id)=?2",
                                -1, &stmt, NULL) != SQLITE_OK) {
             return;
@@ -3043,9 +3053,11 @@ static int store_find_cached_zova_workspace_node(cbm_store_t *s, int64_t node_nu
     }
     sqlite3_stmt *stmt = NULL;
     const char *sql =
-        "SELECT cbm_stable_numeric_id(node_id),project,label,name,qualified_name,"
-        "file_path,start_line,end_line,properties FROM cbm_nodes_v1 "
-        "WHERE workspace_id=?1 AND node_id=?2";
+        "SELECT cbm_stable_numeric_id(n.node_id),p.project,n.label,n.name,n.qualified_name,"
+        "f.file_path,n.start_line,n.end_line,n.properties FROM cbm_nodes_v1 n "
+        "JOIN cbm_files_v1 f USING(file_key) JOIN cbm_projects_v1 p USING(workspace_key) "
+        "JOIN cbm_workspace_registry r USING(workspace_key) "
+        "WHERE r.workspace_id=?1 AND n.node_id=?2";
     if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
     }
@@ -3074,7 +3086,8 @@ static int store_zova_workspace_bfs(cbm_store_t *s, int64_t start_id, const char
     } else {
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db,
-                "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id=?1 "
+                "SELECT n.node_id FROM cbm_nodes_v1 n "
+                "JOIN cbm_workspace_registry r USING(workspace_key) WHERE r.workspace_id=?1 "
                 "AND cbm_stable_numeric_id(node_id)=?2", -1, &stmt, NULL) != SQLITE_OK)
             return CBM_STORE_ERR;
         bind_text(stmt, 1, s->zova_graph_workspace_id);
@@ -6550,7 +6563,8 @@ static int vs_workspace_vector_state(cbm_store_t *s, const char *project,
             s->db,
             "SELECT s.model_fingerprint,s.vector_dimensions,s.generation "
             "FROM cbm_workspace_index_state_v1 s INNER JOIN cbm_projects_v1 p "
-            "ON p.workspace_id=s.workspace_id WHERE s.workspace_id=?1 AND p.project=?2 "
+            "ON p.workspace_key=s.workspace_key JOIN cbm_workspace_registry r "
+            "ON r.workspace_key=s.workspace_key WHERE r.workspace_id=?1 AND p.project=?2 "
             "AND s.generation>0",
             -1, &stmt, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
@@ -7167,9 +7181,11 @@ static int vs_try_zova_workspace_native_vector_search(
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(
             s->db,
-            "SELECT cbm_stable_numeric_id(node_id),name,qualified_name,file_path,label "
-            "FROM cbm_nodes_v1 WHERE workspace_id=?1 AND node_id=?2 "
-            "AND label IN ('Function','Method','Class')",
+            "SELECT cbm_stable_numeric_id(n.node_id),n.name,n.qualified_name,f.file_path,n.label "
+            "FROM cbm_nodes_v1 n JOIN cbm_files_v1 f USING(file_key) "
+            "JOIN cbm_workspace_registry r USING(workspace_key) "
+            "WHERE r.workspace_id=?1 AND n.node_id=?2 "
+            "AND n.label IN ('Function','Method','Class')",
             -1, &stmt, NULL) != SQLITE_OK) {
         cbm_zova_vector_hits_free(hits, hit_count);
         return CBM_STORE_ERR;

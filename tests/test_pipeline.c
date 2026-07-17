@@ -54,10 +54,11 @@ TEST(pipeline_migration_route_states_are_operator_explicit) {
                   db,
                   "INSERT INTO cbm_workspace_registry(workspace_id,canonical_root,"
                   "id_format_version,active_generation) VALUES('w:v1:pipeline','/tmp/pipeline',2,0);"
-                  "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+                  "INSERT INTO cbm_workspace_migrations_v1(workspace_key,migration_version,project,"
                   "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
                   "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
-                  "token_vector_sha256,prepared_at) VALUES('w:v1:pipeline',1,'pipeline-route',"
+                  "token_vector_sha256,prepared_at) VALUES((SELECT workspace_key FROM "
+                  "cbm_workspace_registry WHERE workspace_id='w:v1:pipeline'),1,'pipeline-route',"
                   "'/tmp/pipeline','source.db','source.zova',1,0,'rolled_back','m','f','t','n','v',"
                   "CURRENT_TIMESTAMP)",
                   NULL, NULL, NULL),
@@ -5507,7 +5508,8 @@ static int pipeline_single_file_summary_row(const char *path, const char *worksp
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
         sqlite3_prepare_v2(db,
                            "SELECT summary,source_hash,created_at,updated_at "
-                           "FROM cbm_project_summaries_v2 WHERE workspace_id=?1",
+                           "FROM cbm_project_summaries_v2 WHERE workspace_key=(SELECT "
+                           "workspace_key FROM cbm_workspace_registry WHERE workspace_id=?1)",
                            -1, &stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK) {
         if (stmt) sqlite3_finalize(stmt);
@@ -6081,6 +6083,38 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     ASSERT_TRUE(cbm_pipeline_get_zova_publish_stats(full, &full_stats));
     ASSERT_FALSE(full_stats.delta);
     ASSERT_EQ(full_stats.full_clear_count, 1);
+    ASSERT_GT(full_stats.route_ms, 0.0);
+    ASSERT_TRUE(isfinite(full_stats.normalization_ms) && full_stats.normalization_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_nodes_ms) && full_stats.model_nodes_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edges_ms) && full_stats.model_edges_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_hashes_ms) && full_stats.model_hashes_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_vectors_ms) && full_stats.model_vectors_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_digests_ms) && full_stats.model_digests_ms >= 0.0);
+    ASSERT_TRUE(full_stats.normalization_ms + 0.001 >=
+                full_stats.model_nodes_ms + full_stats.model_edges_ms +
+                full_stats.model_hashes_ms + full_stats.model_vectors_ms +
+                full_stats.model_digests_ms);
+    ASSERT_TRUE(full_stats.route_ms + 0.001 >=
+                cbm_pipeline_get_zova_publish_ms(full) + full_stats.normalization_ms);
+    ASSERT_TRUE(full_stats.writer_guard_ms >= 0.0);
+    ASSERT_TRUE(full_stats.database_init_ms >= 0.0);
+    ASSERT_TRUE(full_stats.database_open_ms >= 0.0);
+    ASSERT_TRUE(full_stats.transaction_begin_ms >= 0.0);
+    ASSERT_TRUE(full_stats.transaction_body_ms >= 0.0);
+    ASSERT_TRUE(full_stats.transaction_commit_ms >= 0.0);
+    ASSERT_TRUE(full_stats.database_close_ms >= 0.0);
+    ASSERT_TRUE(full_stats.clear_ms >= 0.0);
+    ASSERT_TRUE(full_stats.finalize_ms >= 0.0);
+    ASSERT_TRUE(full_stats.native_graph_materialize_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_reset_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_nodes_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_edges_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_validate_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_cleanup_ms >= 0.0);
+    ASSERT_TRUE(full_stats.native_graph_materialize_ms + full_stats.native_graph_reset_ms +
+                    full_stats.native_graph_nodes_ms + full_stats.native_graph_edges_ms +
+                    full_stats.native_graph_validate_ms + full_stats.native_graph_cleanup_ms <=
+                full_stats.native_graph_ms + 1.0);
     cbm_pipeline_free(full);
     ASSERT_TRUE(pipeline_single_file_generation_exists(user_db_path));
 
@@ -6201,8 +6235,9 @@ TEST(pipeline_single_file_preserves_and_removes_exact_project_summary) {
     ASSERT_EQ(sqlite3_prepare_v2(
                   source,
                   "INSERT OR REPLACE INTO cbm_project_summaries_v2 "
-                  "(workspace_id,summary,source_hash,created_at,updated_at) "
-                  "VALUES(?1,?2,?3,?4,?5)",
+                  "(workspace_key,summary,source_hash,created_at,updated_at) "
+                  "SELECT workspace_key,?2,?3,?4,?5 FROM cbm_workspace_registry "
+                  "WHERE workspace_id=?1",
                   -1, &stmt, NULL),
               SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);
@@ -6245,7 +6280,9 @@ TEST(pipeline_single_file_preserves_and_removes_exact_project_summary) {
     source = NULL;
     stmt = NULL;
     ASSERT_EQ(sqlite3_open_v2(user_db_path, &source, SQLITE_OPEN_READWRITE, NULL), SQLITE_OK);
-    ASSERT_EQ(sqlite3_prepare_v2(source, "DELETE FROM cbm_project_summaries_v2 WHERE workspace_id=?1", -1,
+    ASSERT_EQ(sqlite3_prepare_v2(source, "DELETE FROM cbm_project_summaries_v2 WHERE "
+                                 "workspace_key=(SELECT workspace_key FROM "
+                                 "cbm_workspace_registry WHERE workspace_id=?1)", -1,
                                  &stmt, NULL),
               SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_text(stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);

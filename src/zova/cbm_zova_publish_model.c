@@ -1,6 +1,7 @@
 #include "cbm_zova_publish_model.h"
 
 #include "foundation/sha256.h"
+#include "foundation/sha256_backend.h"
 #include "foundation/compat.h"
 
 #include <math.h>
@@ -89,6 +90,12 @@ void cbm_zova_publish_model_test_reset_build_count(void) {
 
 uint64_t cbm_zova_publish_model_test_build_count(void) {
     return model_build_count;
+}
+
+static double model_elapsed_ms(const struct timespec *started,
+                               const struct timespec *finished) {
+    return (double)(finished->tv_sec - started->tv_sec) * 1000.0 +
+           (double)(finished->tv_nsec - started->tv_nsec) / 1000000.0;
 }
 
 static char *model_dup(const char *value) {
@@ -270,23 +277,23 @@ static const char *model_lookup(const cbm_zova_publish_model_t *model, int64_t d
     return NULL;
 }
 
-static void model_digest_text(cbm_sha256_ctx *context, const char *value) {
+static void model_digest_text(cbm_sha256_backend_ctx *context, const char *value) {
     const char *text = value ? value : "";
-    cbm_sha256_update(context, text, strlen(text));
-    cbm_sha256_update(context, "\0", 1);
+    cbm_sha256_backend_update(context, text, strlen(text));
+    cbm_sha256_backend_update(context, "\0", 1);
 }
 
-static void model_digest_i64(cbm_sha256_ctx *context, int64_t value) {
+static void model_digest_i64(cbm_sha256_backend_ctx *context, int64_t value) {
     uint8_t bytes[8];
     for (size_t i = 0; i < sizeof(bytes); i++) bytes[i] = (uint8_t)((uint64_t)value >> (i * 8));
-    cbm_sha256_update(context, bytes, sizeof(bytes));
+    cbm_sha256_backend_update(context, bytes, sizeof(bytes));
 }
 
-static void model_digest_finish(cbm_sha256_ctx *context,
+static void model_digest_finish(cbm_sha256_backend_ctx *context,
                                 char output[CBM_ZOVA_DIGEST_HEX_SIZE]) {
     uint8_t digest[CBM_SHA256_DIGEST_LEN];
     static const char digits[] = "0123456789abcdef";
-    cbm_sha256_final(context, digest);
+    cbm_sha256_backend_final(context, digest);
     for (size_t i = 0; i < CBM_SHA256_DIGEST_LEN; i++) {
         output[i * 2] = digits[digest[i] >> 4];
         output[i * 2 + 1] = digits[digest[i] & 0x0f];
@@ -499,12 +506,12 @@ static int model_build_vectors(cbm_zova_publish_model_t *model) {
 }
 
 static void model_build_digests(cbm_zova_publish_model_t *model) {
-    cbm_sha256_ctx metadata, fts, topology, nodes, tokens;
-    cbm_sha256_init(&metadata);
-    cbm_sha256_init(&fts);
-    cbm_sha256_init(&topology);
-    cbm_sha256_init(&nodes);
-    cbm_sha256_init(&tokens);
+    cbm_sha256_backend_ctx metadata, fts, topology, nodes, tokens;
+    cbm_sha256_backend_init(&metadata);
+    cbm_sha256_backend_init(&fts);
+    cbm_sha256_backend_init(&topology);
+    cbm_sha256_backend_init(&nodes);
+    cbm_sha256_backend_init(&tokens);
     for (int i = 0; i < model->node_count; i++) {
         const model_node_t *row = &model->nodes[i];
         const CBMDumpNode *node = row->value.source;
@@ -556,14 +563,16 @@ static void model_build_digests(cbm_zova_publish_model_t *model) {
     for (int i = 0; i < model->node_vector_count; i++) {
         const cbm_zova_publish_node_vector_t *row = &model->node_vectors[i].value;
         model_digest_text(&nodes, row->stable_id);
-        cbm_sha256_update(&nodes, row->source->vector, (size_t)row->source->vector_len);
+        cbm_sha256_backend_update(&nodes, row->source->vector,
+                                  (size_t)row->source->vector_len);
     }
     for (int i = 0; i < model->token_vector_count; i++) {
         const cbm_zova_publish_token_vector_t *row = &model->token_vectors[i].value;
         model_digest_text(&tokens, row->token_id);
         model_digest_text(&tokens, row->source->token);
-        cbm_sha256_update(&tokens, &row->source->idf, sizeof(row->source->idf));
-        cbm_sha256_update(&tokens, row->source->vector, (size_t)row->source->vector_len);
+        cbm_sha256_backend_update(&tokens, &row->source->idf, sizeof(row->source->idf));
+        cbm_sha256_backend_update(&tokens, row->source->vector,
+                                  (size_t)row->source->vector_len);
     }
     model_digest_finish(&metadata, model->digests.metadata_sha256);
     model_digest_finish(&fts, model->digests.fts_sha256);
@@ -585,7 +594,7 @@ static void model_build_digests(cbm_zova_publish_model_t *model) {
 int cbm_zova_publish_model_build(
     const char *workspace_id, const cbm_zova_workspace_generation_input_t *input,
     cbm_zova_publish_model_t **out_model) {
-    struct timespec started = {0}, finished = {0};
+    struct timespec started = {0}, phase_started = {0}, finished = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &started);
     if (!out_model) return -1;
     *out_model = NULL;
@@ -595,16 +604,39 @@ int cbm_zova_publish_model_build(
     if (!model) return -1;
     snprintf(model->workspace_id, sizeof(model->workspace_id), "%s", workspace_id);
     model->input = *input;
-    if (model_build_nodes(model) != 0 || model_build_edges(model) != 0 ||
-        model_build_hashes(model) != 0 || model_build_vectors(model) != 0) {
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_started);
+    if (model_build_nodes(model) != 0) {
         cbm_zova_publish_model_free(model);
         return -1;
     }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
+    model->metrics.nodes_ms = model_elapsed_ms(&phase_started, &finished);
+    phase_started = finished;
+    if (model_build_edges(model) != 0) {
+        cbm_zova_publish_model_free(model);
+        return -1;
+    }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
+    model->metrics.edges_ms = model_elapsed_ms(&phase_started, &finished);
+    phase_started = finished;
+    if (model_build_hashes(model) != 0) {
+        cbm_zova_publish_model_free(model);
+        return -1;
+    }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
+    model->metrics.hashes_ms = model_elapsed_ms(&phase_started, &finished);
+    phase_started = finished;
+    if (model_build_vectors(model) != 0) {
+        cbm_zova_publish_model_free(model);
+        return -1;
+    }
+    cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
+    model->metrics.vectors_ms = model_elapsed_ms(&phase_started, &finished);
+    phase_started = finished;
     model_build_digests(model);
     cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
-    model->metrics.normalization_ms =
-        (double)(finished.tv_sec - started.tv_sec) * 1000.0 +
-        (double)(finished.tv_nsec - started.tv_nsec) / 1000000.0;
+    model->metrics.digests_ms = model_elapsed_ms(&phase_started, &finished);
+    model->metrics.normalization_ms = model_elapsed_ms(&started, &finished);
     model_build_count++;
     *out_model = model;
     return 0;

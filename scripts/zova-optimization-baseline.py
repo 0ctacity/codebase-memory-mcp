@@ -23,7 +23,13 @@ def mib_bytes(value: str) -> int:
 
 
 def extract(root: pathlib.Path) -> dict[str, dict]:
-    baseline_path = root / "docs/benchmarks/zova-pre-v6-baseline.md"
+    configured = os.environ.get("CBM_ZOVA_OPTIMIZATION_BASELINE_DOCUMENT")
+    if configured:
+        baseline_path = pathlib.Path(configured)
+        if not baseline_path.is_absolute():
+            baseline_path = root / baseline_path
+    else:
+        baseline_path = root / "notes/benchmarks/zova-pre-v6-baseline.md"
     baseline_text = baseline_path.read_text()
     baseline_source = {
         "path": str(baseline_path.relative_to(root)),

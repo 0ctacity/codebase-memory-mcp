@@ -15,6 +15,7 @@ struct cbm_zova_repository {
     zova_database *db;
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
     char project[256];
+    int64_t workspace_key;
     int64_t generation;
 };
 
@@ -109,12 +110,13 @@ cbm_zova_repository_t *cbm_zova_repository_open(const char *path, const char *pr
     }
     zova_statement *stmt = NULL;
     const char *sql =
-        "SELECT p.workspace_id,g.generation FROM cbm_projects_v1 p "
-        "JOIN cbm_database_generation_v1 g ON g.workspace_id=p.workspace_id "
+        "SELECT r.workspace_id,p.workspace_key,g.generation FROM cbm_projects_v1 p "
+        "JOIN cbm_workspace_registry r ON r.workspace_key=p.workspace_key "
+        "JOIN cbm_database_generation_v1 g ON g.workspace_key=p.workspace_key "
         "WHERE p.project=?1 AND g.state='ready' AND g.generation=(SELECT MAX(g2.generation) "
-        "FROM cbm_database_generation_v1 g2 WHERE g2.workspace_id=p.workspace_id "
+        "FROM cbm_database_generation_v1 g2 WHERE g2.workspace_key=p.workspace_key "
         "AND g2.state='ready') AND NOT EXISTS (SELECT 1 FROM cbm_workspace_health_v1 h "
-        "WHERE h.workspace_id=p.workspace_id AND h.state='rebuild_required')";
+        "WHERE h.workspace_key=p.workspace_key AND h.state='rebuild_required')";
     if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, project) != 0) {
         if (stmt) (void)zova_statement_finalize(stmt);
         cbm_zova_repository_close(repo);
@@ -123,7 +125,10 @@ cbm_zova_repository_t *cbm_zova_repository_open(const char *path, const char *pr
     zova_step_result step = ZOVA_STEP_DONE;
     int ok = repo_step(stmt, &step) == 0 && step == ZOVA_STEP_ROW;
     char *workspace = ok ? repo_column_text(stmt, 0) : NULL;
-    if (ok) repo->generation = repo_column_i64(stmt, 1);
+    if (ok) {
+        repo->workspace_key = repo_column_i64(stmt, 1);
+        repo->generation = repo_column_i64(stmt, 2);
+    }
     zova_step_result second = ZOVA_STEP_DONE;
     if (ok && repo_step(stmt, &second) != 0) ok = 0;
     if (second == ZOVA_STEP_ROW) ok = 0;
@@ -164,11 +169,12 @@ static int hydrate_node(cbm_zova_repository_t *repo, const char *workspace_id,
     if (repo_workspace_required(repo, workspace_id) != CBM_STORE_OK || !value || !out)
         return CBM_STORE_ERR;
     char sql[512];
-    snprintf(sql, sizeof(sql), "SELECT node_id,project,label,name,qualified_name,file_path,"
-             "start_line,end_line,properties FROM cbm_nodes_v1 WHERE workspace_id=?1 AND %s=?2",
-             column);
+    snprintf(sql, sizeof(sql), "SELECT n.node_id,n.label,n.name,n.qualified_name,f.file_path,"
+             "n.start_line,n.end_line,n.properties FROM cbm_nodes_v1 n "
+             "JOIN cbm_files_v1 f ON f.file_key=n.file_key "
+             "WHERE n.workspace_key=?1 AND n.%s=?2", column);
     zova_statement *stmt = NULL;
-    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, repo->workspace_id) != 0 ||
+    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_i64(stmt, 1, repo->workspace_key) != 0 ||
         repo_bind_text(stmt, 2, value) != 0) goto error;
     zova_step_result step = ZOVA_STEP_DONE;
     if (repo_step(stmt, &step) != 0 || step != ZOVA_STEP_ROW) {
@@ -179,14 +185,14 @@ static int hydrate_node(cbm_zova_repository_t *repo, const char *workspace_id,
     memset(out, 0, sizeof(*out));
     out->id = stable_numeric_id(stable);
     free(stable);
-    out->project = repo_column_text(stmt, 1);
-    out->label = repo_column_text(stmt, 2);
-    out->name = repo_column_text(stmt, 3);
-    out->qualified_name = repo_column_text(stmt, 4);
-    out->file_path = repo_column_text(stmt, 5);
-    out->start_line = (int)repo_column_i64(stmt, 6);
-    out->end_line = (int)repo_column_i64(stmt, 7);
-    out->properties_json = repo_column_text(stmt, 8);
+    out->project = repo_dup((const uint8_t *)repo->project, strlen(repo->project));
+    out->label = repo_column_text(stmt, 1);
+    out->name = repo_column_text(stmt, 2);
+    out->qualified_name = repo_column_text(stmt, 3);
+    out->file_path = repo_column_text(stmt, 4);
+    out->start_line = (int)repo_column_i64(stmt, 5);
+    out->end_line = (int)repo_column_i64(stmt, 6);
+    out->properties_json = repo_column_text(stmt, 7);
     (void)zova_statement_finalize(stmt);
     return CBM_STORE_OK;
 error:
@@ -211,8 +217,8 @@ int cbm_zova_repository_get_project(cbm_zova_repository_t *repo, const char *wor
         return CBM_STORE_ERR;
     zova_statement *stmt = NULL;
     if (repo_prepare(repo, "SELECT project,indexed_at,root_path FROM cbm_projects_v1 "
-                           "WHERE workspace_id=?1", &stmt) != 0 ||
-        repo_bind_text(stmt, 1, repo->workspace_id) != 0) goto error;
+                           "WHERE workspace_key=?1", &stmt) != 0 ||
+        repo_bind_i64(stmt, 1, repo->workspace_key) != 0) goto error;
     zova_step_result step = ZOVA_STEP_DONE;
     if (repo_step(stmt, &step) != 0 || step != ZOVA_STEP_ROW) goto error;
     memset(out, 0, sizeof(*out));
@@ -247,10 +253,10 @@ int cbm_zova_repository_counts(cbm_zova_repository_t *repo, const char *workspac
         return CBM_STORE_ERR;
     zova_statement *stmt = NULL;
     if (repo_prepare(repo,
-                     "SELECT (SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id=?1),"
-                     "(SELECT count(*) FROM cbm_edges_v1 WHERE workspace_id=?1)",
+                     "SELECT (SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_key=?1),"
+                     "(SELECT count(*) FROM cbm_edges_v1 WHERE workspace_key=?1)",
                      &stmt) != 0 ||
-        repo_bind_text(stmt, 1, repo->workspace_id) != 0) goto error;
+        repo_bind_i64(stmt, 1, repo->workspace_key) != 0) goto error;
     zova_step_result step = ZOVA_STEP_DONE;
     if (repo_step(stmt, &step) != 0 || step != ZOVA_STEP_ROW) goto error;
     *nodes = (int)repo_column_i64(stmt, 0);
@@ -270,8 +276,8 @@ int cbm_zova_repository_project_summary(cbm_zova_repository_t *repo,
     memset(out, 0, sizeof(*out));
     zova_statement *stmt = NULL;
     if (repo_prepare(repo, "SELECT summary,source_hash,created_at,updated_at "
-                           "FROM cbm_project_summaries_v2 WHERE workspace_id=?1", &stmt) != 0 ||
-        repo_bind_text(stmt, 1, repo->workspace_id) != 0) goto error;
+                           "FROM cbm_project_summaries_v2 WHERE workspace_key=?1", &stmt) != 0 ||
+        repo_bind_i64(stmt, 1, repo->workspace_key) != 0) goto error;
     zova_step_result step = ZOVA_STEP_DONE;
     if (repo_step(stmt, &step) != 0) goto error;
     if (step == ZOVA_STEP_DONE) { (void)zova_statement_finalize(stmt); return CBM_STORE_NOT_FOUND; }
@@ -292,14 +298,19 @@ int cbm_zova_repository_find_edges(cbm_zova_repository_t *repo, const char *work
         !out_count) return CBM_STORE_ERR;
     *out = NULL; *out_count = 0;
     const char *predicate = !direction || strcmp(direction, "any") == 0
-                                ? "(source_node_id=?2 OR target_node_id=?2)"
-                                : strcmp(direction, "inbound") == 0 ? "target_node_id=?2"
-                                                                    : "source_node_id=?2";
-    char sql[512];
-    snprintf(sql, sizeof(sql), "SELECT edge_id,source_node_id,target_node_id,edge_type,properties "
-             "FROM cbm_edges_v1 WHERE workspace_id=?1 AND %s ORDER BY edge_id", predicate);
+                                ? "(e.source_node_key=q.node_key OR e.target_node_key=q.node_key)"
+                                : strcmp(direction, "inbound") == 0
+                                      ? "e.target_node_key=q.node_key"
+                                      : "e.source_node_key=q.node_key";
+    char sql[768];
+    snprintf(sql, sizeof(sql),
+             "SELECT e.edge_id,s.node_id,t.node_id,e.edge_type,e.properties "
+             "FROM cbm_nodes_v1 q JOIN cbm_edges_v1 e ON e.workspace_key=q.workspace_key "
+             "JOIN cbm_nodes_v1 s ON s.node_key=e.source_node_key "
+             "JOIN cbm_nodes_v1 t ON t.node_key=e.target_node_key "
+             "WHERE q.workspace_key=?1 AND q.node_id=?2 AND %s ORDER BY e.edge_id", predicate);
     zova_statement *stmt = NULL;
-    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, repo->workspace_id) != 0 ||
+    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_i64(stmt, 1, repo->workspace_key) != 0 ||
         repo_bind_text(stmt, 2, stable_id) != 0) goto error;
     int cap = 8, count = 0;
     cbm_edge_t *edges = calloc((size_t)cap, sizeof(*edges));
@@ -337,17 +348,18 @@ int cbm_zova_repository_search_fts(cbm_zova_repository_t *repo, const char *work
     memset(out, 0, sizeof(*out));
     if (limit <= 0) limit = 10;
     zova_statement *stmt = NULL;
-    const char *sql = "SELECT n.node_id,n.project,n.label,n.name,n.qualified_name,n.file_path,"
+    const char *sql = "SELECT n.node_id,n.label,n.name,n.qualified_name,p.file_path,"
         "n.start_line,n.end_line,n.properties,(bm25(cbm_nodes_fts_v1)-CASE "
         "WHEN n.label IN ('Function','Method') THEN 10.0 WHEN n.label='Route' THEN 8.0 "
         "WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 ELSE 0.0 END) AS rank "
         "FROM cbm_nodes_fts_v1 f "
-        "JOIN cbm_nodes_v1 n ON n.workspace_id=f.workspace_id AND n.node_id=f.node_id "
-        "WHERE f.workspace_id=?1 AND cbm_nodes_fts_v1 MATCH ?2 "
+        "JOIN cbm_nodes_v1 n ON n.node_key=f.rowid "
+        "JOIN cbm_files_v1 p ON p.file_key=n.file_key "
+        "WHERE n.workspace_key=?1 AND cbm_nodes_fts_v1 MATCH ?2 "
         "AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
-        "AND (?3 IS NULL OR n.file_path GLOB ?3) "
+        "AND (?3 IS NULL OR p.file_path GLOB ?3) "
         "ORDER BY rank,n.qualified_name,n.node_id LIMIT ?4 OFFSET ?5";
-    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, repo->workspace_id) != 0 ||
+    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_i64(stmt, 1, repo->workspace_key) != 0 ||
         repo_bind_text(stmt, 2, query) != 0) goto error;
     zova_status bst = file_pattern && file_pattern[0]
                           ? zova_statement_bind_text(&(zova_statement_bind_text_request){
@@ -368,11 +380,12 @@ int cbm_zova_repository_search_fts(cbm_zova_repository_t *repo, const char *work
             if (!g) { cbm_store_search_free(&(cbm_search_output_t){.results=results,.count=count}); goto error; }
             results=g; memset(results+count,0,(size_t)(cap-count)*sizeof(*results)); }
         cbm_node_t *n=&results[count].node; char *sid=repo_column_text(stmt,0); n->id=stable_numeric_id(sid); free(sid);
-        n->project=repo_column_text(stmt,1); n->label=repo_column_text(stmt,2); n->name=repo_column_text(stmt,3);
-        n->qualified_name=repo_column_text(stmt,4); n->file_path=repo_column_text(stmt,5);
-        n->start_line=(int)repo_column_i64(stmt,6); n->end_line=(int)repo_column_i64(stmt,7);
-        n->properties_json=repo_column_text(stmt,8);
-        results[count].rank=repo_column_double(stmt,9);
+        n->project=repo_dup((const uint8_t *)repo->project,strlen(repo->project));
+        n->label=repo_column_text(stmt,1); n->name=repo_column_text(stmt,2);
+        n->qualified_name=repo_column_text(stmt,3); n->file_path=repo_column_text(stmt,4);
+        n->start_line=(int)repo_column_i64(stmt,5); n->end_line=(int)repo_column_i64(stmt,6);
+        n->properties_json=repo_column_text(stmt,7);
+        results[count].rank=repo_column_double(stmt,8);
         count++;
     }
     (void)zova_statement_finalize(stmt); out->results=results; out->count=count; out->total=count; return CBM_STORE_OK;
@@ -387,30 +400,31 @@ int cbm_zova_repository_search(cbm_zova_repository_t *repo, const char *workspac
         return CBM_STORE_ERR;
     memset(out, 0, sizeof(*out));
     char sql[4096] =
-        "SELECT n.node_id,n.project,n.label,n.name,n.qualified_name,n.file_path,"
+        "SELECT n.node_id,n.label,n.name,n.qualified_name,f.file_path,"
         "n.start_line,n.end_line,n.properties,"
-        "(SELECT count(*) FROM cbm_edges_v1 e WHERE e.workspace_id=n.workspace_id AND e.target_node_id=n.node_id AND e.edge_type IN ('CALLS','USAGE','INHERITS','IMPLEMENTS')),"
-        "(SELECT count(*) FROM cbm_edges_v1 e WHERE e.workspace_id=n.workspace_id AND e.source_node_id=n.node_id AND e.edge_type IN ('CALLS','USAGE','INHERITS','IMPLEMENTS')),"
-        "count(*) OVER() FROM cbm_nodes_v1 n WHERE n.workspace_id=?1";
+        "(SELECT count(*) FROM cbm_edges_v1 e WHERE e.workspace_key=n.workspace_key AND e.target_node_key=n.node_key AND e.edge_type IN ('CALLS','USAGE','INHERITS','IMPLEMENTS')),"
+        "(SELECT count(*) FROM cbm_edges_v1 e WHERE e.workspace_key=n.workspace_key AND e.source_node_key=n.node_key AND e.edge_type IN ('CALLS','USAGE','INHERITS','IMPLEMENTS')),"
+        "count(*) OVER() FROM cbm_nodes_v1 n JOIN cbm_files_v1 f ON f.file_key=n.file_key "
+        "WHERE n.workspace_key=?1";
     const char *binds[6] = {0}; int bind_count = 0;
 #define REPO_FILTER(clause, value) do { if ((value) && (value)[0]) { strncat(sql, (clause), sizeof(sql)-strlen(sql)-1); binds[bind_count++]=(value); } } while (0)
     REPO_FILTER(" AND n.label=?", params->label);
     REPO_FILTER(" AND regexp(?,n.name)", params->name_pattern);
     REPO_FILTER(" AND regexp(?,n.qualified_name)", params->qn_pattern);
-    REPO_FILTER(" AND n.file_path GLOB ?", params->file_pattern);
-    REPO_FILTER(" AND EXISTS(SELECT 1 FROM cbm_edges_v1 er WHERE er.workspace_id=n.workspace_id AND (er.source_node_id=n.node_id OR er.target_node_id=n.node_id) AND er.edge_type=?)", params->relationship);
+    REPO_FILTER(" AND f.file_path GLOB ?", params->file_pattern);
+    REPO_FILTER(" AND EXISTS(SELECT 1 FROM cbm_edges_v1 er WHERE er.workspace_key=n.workspace_key AND (er.source_node_key=n.node_key OR er.target_node_key=n.node_key) AND er.edge_type=?)", params->relationship);
 #undef REPO_FILTER
-    if (params->exclude_entry_points) strncat(sql, " AND NOT (NOT EXISTS(SELECT 1 FROM cbm_edges_v1 ei WHERE ei.workspace_id=n.workspace_id AND ei.target_node_id=n.node_id AND ei.edge_type='CALLS') AND EXISTS(SELECT 1 FROM cbm_edges_v1 eo WHERE eo.workspace_id=n.workspace_id AND eo.source_node_id=n.node_id AND eo.edge_type='CALLS'))", sizeof(sql)-strlen(sql)-1);
+    if (params->exclude_entry_points) strncat(sql, " AND NOT (NOT EXISTS(SELECT 1 FROM cbm_edges_v1 ei WHERE ei.workspace_key=n.workspace_key AND ei.target_node_key=n.node_key AND ei.edge_type='CALLS') AND EXISTS(SELECT 1 FROM cbm_edges_v1 eo WHERE eo.workspace_key=n.workspace_key AND eo.source_node_key=n.node_key AND eo.edge_type='CALLS'))", sizeof(sql)-strlen(sql)-1);
     strncat(sql, " ORDER BY n.name,n.qualified_name,n.node_id LIMIT ? OFFSET ?", sizeof(sql)-strlen(sql)-1);
     zova_statement *stmt=NULL;
-    if (repo_prepare(repo,sql,&stmt)!=0 || repo_bind_text(stmt,1,repo->workspace_id)!=0) goto regular_error;
+    if (repo_prepare(repo,sql,&stmt)!=0 || repo_bind_i64(stmt,1,repo->workspace_key)!=0) goto regular_error;
     int idx=2;
     for(int i=0;i<bind_count;i++) if(repo_bind_text(stmt,idx++,binds[i])!=0) goto regular_error;
     if(repo_bind_i64(stmt,idx++,params->limit>0?params->limit:10)!=0 || repo_bind_i64(stmt,idx,params->offset)!=0) goto regular_error;
     int cap=8,count=0; cbm_search_result_t *results=calloc((size_t)cap,sizeof(*results)); if(!results) goto regular_error;
     for(;;){zova_step_result step=ZOVA_STEP_DONE; if(repo_step(stmt,&step)!=0){cbm_store_search_free(&(cbm_search_output_t){.results=results,.count=count});goto regular_error;} if(step==ZOVA_STEP_DONE)break;
         if(count==cap){cap*=2;cbm_search_result_t*g=realloc(results,(size_t)cap*sizeof(*g));if(!g){cbm_store_search_free(&(cbm_search_output_t){.results=results,.count=count});goto regular_error;}results=g;memset(results+count,0,(size_t)(cap-count)*sizeof(*results));}
-        cbm_node_t*n=&results[count].node;char*sid=repo_column_text(stmt,0);n->id=stable_numeric_id(sid);free(sid);n->project=repo_column_text(stmt,1);n->label=repo_column_text(stmt,2);n->name=repo_column_text(stmt,3);n->qualified_name=repo_column_text(stmt,4);n->file_path=repo_column_text(stmt,5);n->start_line=(int)repo_column_i64(stmt,6);n->end_line=(int)repo_column_i64(stmt,7);n->properties_json=repo_column_text(stmt,8);results[count].in_degree=(int)repo_column_i64(stmt,9);results[count].out_degree=(int)repo_column_i64(stmt,10);if(count==0)out->total=(int)repo_column_i64(stmt,11);count++;}
+        cbm_node_t*n=&results[count].node;char*sid=repo_column_text(stmt,0);n->id=stable_numeric_id(sid);free(sid);n->project=repo_dup((const uint8_t *)repo->project,strlen(repo->project));n->label=repo_column_text(stmt,1);n->name=repo_column_text(stmt,2);n->qualified_name=repo_column_text(stmt,3);n->file_path=repo_column_text(stmt,4);n->start_line=(int)repo_column_i64(stmt,5);n->end_line=(int)repo_column_i64(stmt,6);n->properties_json=repo_column_text(stmt,7);results[count].in_degree=(int)repo_column_i64(stmt,8);results[count].out_degree=(int)repo_column_i64(stmt,9);if(count==0)out->total=(int)repo_column_i64(stmt,10);count++;}
     (void)zova_statement_finalize(stmt);out->results=results;out->count=count;return CBM_STORE_OK;
 regular_error: if(stmt)(void)zova_statement_finalize(stmt);return CBM_STORE_ERR;
 }
@@ -479,7 +493,7 @@ void cbm_zova_workspace_snapshot_free(cbm_zova_workspace_snapshot_t *snapshot) {
 static int snapshot_count(cbm_zova_repository_t *repo, const char *sql) {
     zova_statement *statement = NULL;
     if (repo_prepare(repo, sql, &statement) != 0 ||
-        repo_bind_text(statement, 1, repo->workspace_id) != 0) {
+        repo_bind_i64(statement, 1, repo->workspace_key) != 0) {
         if (statement) (void)zova_statement_finalize(statement);
         return -1;
     }
@@ -491,38 +505,66 @@ static int snapshot_count(cbm_zova_repository_t *repo, const char *sql) {
     return count;
 }
 
-static int64_t snapshot_map_node(const CBMHashTable *node_ids, const char *stable_id) {
-    return (int64_t)(intptr_t)cbm_ht_get(node_ids, stable_id);
+typedef struct {
+    int64_t node_key;
+    int64_t snapshot_id;
+} snapshot_node_key_ref_t;
+
+static int snapshot_node_key_ref_compare(const void *left_ptr, const void *right_ptr) {
+    const snapshot_node_key_ref_t *left = left_ptr;
+    const snapshot_node_key_ref_t *right = right_ptr;
+    return (left->node_key > right->node_key) - (left->node_key < right->node_key);
+}
+
+static int64_t snapshot_map_node_key(const snapshot_node_key_ref_t *refs, int count,
+                                     int64_t node_key) {
+    int low = 0, high = count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if (refs[mid].node_key == node_key) return refs[mid].snapshot_id;
+        if (refs[mid].node_key < node_key) low = mid + 1;
+        else high = mid;
+    }
+    return -1;
 }
 
 static int snapshot_read_nodes(cbm_zova_repository_t *repo,
                                cbm_zova_workspace_snapshot_t *snapshot,
-                               char ***out_stable_ids) {
+                               char ***out_stable_ids,
+                               snapshot_node_key_ref_t **out_node_keys) {
     int count = snapshot_count(repo,
-        "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id=?1");
+        "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_key=?1");
     if (count < 0) return -1;
     snapshot->node_count = count;
     snapshot->nodes = count ? calloc((size_t)count, sizeof(*snapshot->nodes)) : NULL;
     char **stable_ids = count ? calloc((size_t)count, sizeof(*stable_ids)) : NULL;
+    snapshot_node_key_ref_t *node_keys =
+        count ? calloc((size_t)count, sizeof(*node_keys)) : NULL;
     snapshot->node_source_ordinals =
         count ? calloc((size_t)count, sizeof(*snapshot->node_source_ordinals)) : NULL;
-    if (count && (!snapshot->nodes || !stable_ids || !snapshot->node_source_ordinals)) {
+    if (count && (!snapshot->nodes || !stable_ids || !node_keys ||
+                  !snapshot->node_source_ordinals)) {
         free(stable_ids);
+        free(node_keys);
         return -1;
     }
     zova_statement *statement = NULL;
     int rc = repo_prepare(repo,
-        "SELECT n.node_id,n.project,n.label,n.name,n.qualified_name,n.file_path,n.start_line,"
+        "SELECT n.node_key,n.node_id,n.label,n.name,n.qualified_name,f.file_path,n.start_line,"
         "n.end_line,n.properties,n.source_ordinal FROM cbm_nodes_v1 n "
-        "WHERE n.workspace_id=?1 ORDER BY n.node_id", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "JOIN cbm_files_v1 f ON f.file_key=n.file_key "
+        "WHERE n.workspace_key=?1 ORDER BY n.node_id", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     for (int i = 0; rc == 0 && i < count; i++) {
         zova_step_result step = ZOVA_STEP_DONE;
         if (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW) { rc = -1; break; }
         CBMDumpNode *node = &snapshot->nodes[i];
         node->id = i + 1;
-        stable_ids[i] = repo_column_text(statement, 0);
-        node->project = repo_column_text(statement, 1);
+        node_keys[i] = (snapshot_node_key_ref_t){
+            .node_key = repo_column_i64(statement, 0), .snapshot_id = node->id};
+        stable_ids[i] = repo_column_text(statement, 1);
+        node->project = repo_dup((const uint8_t *)snapshot->project,
+                                 strlen(snapshot->project));
         node->label = repo_column_text(statement, 2);
         node->name = repo_column_text(statement, 3);
         node->qualified_name = repo_column_text(statement, 4);
@@ -532,24 +574,29 @@ static int snapshot_read_nodes(cbm_zova_repository_t *repo,
         node->properties = repo_column_text(statement, 8);
         snapshot->node_source_ordinals[i] = (uint64_t)repo_column_i64(statement, 9);
         if (!stable_ids[i] || !node->project || !node->label || !node->name ||
-            !node->qualified_name || !node->file_path || !node->properties) rc = -1;
+            !node->qualified_name || !node->file_path || !node->properties ||
+            node_keys[i].node_key <= 0) rc = -1;
     }
     if (statement) (void)zova_statement_finalize(statement);
     if (rc != 0) {
         for (int i = 0; i < count; i++) free(stable_ids[i]);
         free(stable_ids);
+        free(node_keys);
         return -1;
     }
+    if (count > 1)
+        qsort(node_keys, (size_t)count, sizeof(*node_keys), snapshot_node_key_ref_compare);
     snapshot->node_stable_ids = stable_ids;
     *out_stable_ids = stable_ids;
+    *out_node_keys = node_keys;
     return 0;
 }
 
 static int snapshot_read_edges(cbm_zova_repository_t *repo,
                                cbm_zova_workspace_snapshot_t *snapshot,
-                               const CBMHashTable *node_ids) {
+                               const snapshot_node_key_ref_t *node_keys) {
     int count = snapshot_count(repo,
-        "SELECT count(*) FROM cbm_edges_v1 WHERE workspace_id=?1");
+        "SELECT count(*) FROM cbm_edges_v1 WHERE workspace_key=?1");
     if (count < 0) return -1;
     snapshot->edge_count = count;
     snapshot->edges = count ? calloc((size_t)count, sizeof(*snapshot->edges)) : NULL;
@@ -557,25 +604,25 @@ static int snapshot_read_edges(cbm_zova_repository_t *repo,
     if (count && (!snapshot->edges || !snapshot->edge_ids)) return -1;
     zova_statement *statement = NULL;
     int rc = repo_prepare(repo,
-        "SELECT edge_id,source_node_id,target_node_id,edge_type,properties,url_path,local_name "
-        "FROM cbm_edges_v1 WHERE workspace_id=?1 ORDER BY edge_id", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "SELECT e.edge_id,e.source_node_key,e.target_node_key,e.edge_type,e.properties,"
+        "e.url_path,e.local_name FROM cbm_edges_v1 e "
+        "WHERE e.workspace_key=?1 ORDER BY e.edge_id", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     for (int i = 0; rc == 0 && i < count; i++) {
         zova_step_result step = ZOVA_STEP_DONE;
         if (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW) { rc = -1; break; }
         snapshot->edge_ids[i] = repo_column_text(statement, 0);
-        char *source = repo_column_text(statement, 1);
-        char *target = repo_column_text(statement, 2);
         CBMDumpEdge *edge = &snapshot->edges[i];
         edge->id = i + 1;
         edge->project = repo_dup((const uint8_t *)snapshot->project, strlen(snapshot->project));
-        edge->source_id = source ? snapshot_map_node(node_ids, source) : -1;
-        edge->target_id = target ? snapshot_map_node(node_ids, target) : -1;
+        edge->source_id = snapshot_map_node_key(
+            node_keys, snapshot->node_count, repo_column_i64(statement, 1));
+        edge->target_id = snapshot_map_node_key(
+            node_keys, snapshot->node_count, repo_column_i64(statement, 2));
         edge->type = repo_column_text(statement, 3);
         edge->properties = repo_column_text(statement, 4);
         edge->url_path = repo_column_text(statement, 5);
         edge->local_name = repo_column_text(statement, 6);
-        free(source); free(target);
         if (!snapshot->edge_ids[i] || !edge->project || edge->source_id <= 0 ||
             edge->target_id <= 0 || !edge->type ||
             !edge->properties || !edge->url_path || !edge->local_name) rc = -1;
@@ -753,8 +800,8 @@ static int snapshot_read_token_vectors(cbm_zova_repository_t *repo,
     zova_statement *statement = NULL;
     if (rc == 0) rc = repo_prepare(repo,
         "SELECT token_id,token,idf FROM cbm_token_vector_metadata_v1 "
-        "WHERE workspace_id=?1 ORDER BY token_id", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "WHERE workspace_key=?1 ORDER BY token_id", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     int token_written = 0;
     for (; rc == 0 && token_written < token_count; token_written++) {
         zova_step_result step = ZOVA_STEP_DONE;
@@ -798,16 +845,18 @@ static int snapshot_read_token_vectors(cbm_zova_repository_t *repo,
 static int snapshot_read_hashes_summary(cbm_zova_repository_t *repo,
                                         cbm_zova_workspace_snapshot_t *snapshot) {
     int count = snapshot_count(repo,
-        "SELECT count(*) FROM cbm_file_hashes_v1 WHERE workspace_id=?1");
+        "SELECT count(*) FROM cbm_file_hashes_v1 h JOIN cbm_files_v1 f "
+        "ON f.file_key=h.file_key WHERE f.workspace_key=?1");
     if (count < 0) return -1;
     snapshot->file_hash_count = count;
     snapshot->file_hashes = count ? calloc((size_t)count, sizeof(*snapshot->file_hashes)) : NULL;
     if (count && !snapshot->file_hashes) return -1;
     zova_statement *statement = NULL;
     int rc = repo_prepare(repo,
-        "SELECT file_path,content_hash,mtime_ns,size_bytes FROM cbm_file_hashes_v1 "
-        "WHERE workspace_id=?1 ORDER BY file_path", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "SELECT f.file_path,h.content_hash,h.mtime_ns,h.size_bytes FROM cbm_file_hashes_v1 h "
+        "JOIN cbm_files_v1 f ON f.file_key=h.file_key "
+        "WHERE f.workspace_key=?1 ORDER BY f.file_path", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     for (int i = 0; rc == 0 && i < count; i++) {
         zova_step_result step = ZOVA_STEP_DONE;
         if (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW) { rc = -1; break; }
@@ -821,8 +870,8 @@ static int snapshot_read_hashes_summary(cbm_zova_repository_t *repo,
     statement = NULL;
     if (rc == 0) rc = repo_prepare(repo,
         "SELECT summary,source_hash,created_at,updated_at FROM cbm_project_summaries_v2 "
-        "WHERE workspace_id=?1", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "WHERE workspace_key=?1", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     zova_step_result step = ZOVA_STEP_DONE;
     if (rc == 0 && repo_step(statement, &step) != 0) rc = -1;
     if (rc == 0 && step == ZOVA_STEP_ROW) {
@@ -842,24 +891,26 @@ static int snapshot_read_header(cbm_zova_repository_t *repo,
                                 cbm_zova_workspace_snapshot_t *snapshot) {
     zova_statement *statement = NULL;
     int rc = repo_prepare(repo,
-        "SELECT r.canonical_root,p.root_path,p.project,p.indexed_at,s.model_fingerprint,"
-        "s.vector_dimensions,r.active_generation FROM cbm_workspace_registry r "
-        "JOIN cbm_projects_v1 p ON p.workspace_id=r.workspace_id "
-        "JOIN cbm_workspace_index_state_v1 s ON s.workspace_id=r.workspace_id "
-        "JOIN cbm_database_generation_v1 g ON g.workspace_id=r.workspace_id "
+        "SELECT r.workspace_key,r.canonical_root,p.root_path,p.project,p.indexed_at,"
+        "s.model_fingerprint,s.vector_dimensions,r.active_generation "
+        "FROM cbm_workspace_registry r "
+        "JOIN cbm_projects_v1 p ON p.workspace_key=r.workspace_key "
+        "JOIN cbm_workspace_index_state_v1 s ON s.workspace_key=r.workspace_key "
+        "JOIN cbm_database_generation_v1 g ON g.workspace_key=r.workspace_key "
         "AND g.generation=r.active_generation AND g.state='ready' "
         "WHERE r.workspace_id=?1 AND s.generation=r.active_generation", &statement);
     if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
     zova_step_result step = ZOVA_STEP_DONE;
     if (rc == 0 && (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW)) rc = -1;
     if (rc == 0) {
-        snapshot->root_path = repo_column_text(statement, 0);
-        char *project_root = repo_column_text(statement, 1);
-        snapshot->project = repo_column_text(statement, 2);
-        snapshot->indexed_at = repo_column_text(statement, 3);
-        snapshot->model_fingerprint = repo_column_text(statement, 4);
-        snapshot->vector_dimensions = (int)repo_column_i64(statement, 5);
-        snapshot->generation = repo_column_i64(statement, 6);
+        repo->workspace_key = repo_column_i64(statement, 0);
+        snapshot->root_path = repo_column_text(statement, 1);
+        char *project_root = repo_column_text(statement, 2);
+        snapshot->project = repo_column_text(statement, 3);
+        snapshot->indexed_at = repo_column_text(statement, 4);
+        snapshot->model_fingerprint = repo_column_text(statement, 5);
+        snapshot->vector_dimensions = (int)repo_column_i64(statement, 6);
+        snapshot->generation = repo_column_i64(statement, 7);
         if (!snapshot->root_path || !snapshot->project || !snapshot->indexed_at ||
             !snapshot->model_fingerprint || snapshot->vector_dimensions <= 0 ||
             snapshot->generation <= 0) rc = -1;
@@ -895,8 +946,8 @@ static int snapshot_read_integrity(cbm_zova_repository_t *repo,
         "metadata_topology_edges,fts_rows,node_vector_rows,token_vector_rows,"
         "node_vectors,token_vectors,metadata_sha256,fts_sha256,topology_sha256,"
         "node_vector_sha256,token_vector_sha256 FROM cbm_generation_integrity_v2 "
-        "WHERE workspace_id=?1 AND generation=?2", &statement);
-    if (rc == 0) rc = repo_bind_text(statement, 1, repo->workspace_id);
+        "WHERE workspace_key=?1 AND generation=?2", &statement);
+    if (rc == 0) rc = repo_bind_i64(statement, 1, repo->workspace_key);
     if (rc == 0) rc = repo_bind_i64(statement, 2, snapshot->generation);
     zova_step_result step = ZOVA_STEP_DONE;
     if (rc == 0 && (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW)) rc = -1;
@@ -982,20 +1033,11 @@ static int repository_export_snapshot(const char *path, const char *workspace_id
                         .db = repo.db, .sql = "PRAGMA query_only=ON;BEGIN"}) != ZOVA_OK)) rc = -1;
     else if (rc == 0) transaction_started = true;
     char **stable_ids = NULL;
-    CBMHashTable *node_ids = NULL;
+    snapshot_node_key_ref_t *node_keys = NULL;
     if (rc == 0) rc = snapshot_read_header(&repo, &snapshot);
     if (rc == 0) rc = snapshot_read_integrity(&repo, &snapshot);
-    if (rc == 0) rc = snapshot_read_nodes(&repo, &snapshot, &stable_ids);
-    if (rc == 0) {
-        node_ids = cbm_ht_create(snapshot.node_count > 0 ? (uint32_t)snapshot.node_count * 2 : 16);
-        if (!node_ids) {
-            rc = -1;
-        } else {
-            for (int i = 0; i < snapshot.node_count; i++)
-                cbm_ht_set(node_ids, stable_ids[i], (void *)(intptr_t)snapshot.nodes[i].id);
-        }
-    }
-    if (rc == 0) rc = snapshot_read_edges(&repo, &snapshot, node_ids);
+    if (rc == 0) rc = snapshot_read_nodes(&repo, &snapshot, &stable_ids, &node_keys);
+    if (rc == 0) rc = snapshot_read_edges(&repo, &snapshot, node_keys);
     if (rc == 0) rc = snapshot_read_hashes_summary(&repo, &snapshot);
     snapshot.metrics.base_ms = repo_elapsed_ms(base_started);
     struct timespec optional_started = {0};
@@ -1026,7 +1068,7 @@ static int repository_export_snapshot(const char *path, const char *workspace_id
         snapshot.metrics.node_vector_rows = (uint64_t)snapshot.node_vector_count;
         snapshot.metrics.token_vector_rows = (uint64_t)snapshot.token_vector_count;
     }
-    cbm_ht_free(node_ids);
+    free(node_keys);
     if (transaction_started) {
         zova_status tx_status = zova_database_exec(&(zova_database_exec_request){
             .db = repo.db, .sql = rc == 0 ? "COMMIT" : "ROLLBACK"});

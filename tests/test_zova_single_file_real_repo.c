@@ -289,8 +289,9 @@ static int single_file_compare_project(sqlite3 *source, sqlite3 *user, const cha
         sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_step(source_stmt) != SQLITE_ROW ||
         sqlite3_prepare_v2(user,
-                           "SELECT project,indexed_at,root_path FROM cbm_projects_v1 "
-                           "WHERE workspace_id=?1",
+                           "SELECT p.project,p.indexed_at,p.root_path FROM cbm_projects_v1 p "
+                           "JOIN cbm_workspace_registry r USING(workspace_key) "
+                           "WHERE r.workspace_id=?1",
                            -1, &user_stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(user_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_step(user_stmt) != SQLITE_ROW) {
@@ -331,8 +332,12 @@ static int single_file_compare_nodes(sqlite3 *source, sqlite3 *user, const char 
         sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_prepare_v2(
             user,
-            "SELECT project,label,name,qualified_name,file_path,start_line,end_line,properties "
-            "FROM cbm_nodes_v1 WHERE workspace_id=?1 AND node_id=?2",
+            "SELECT p.project,n.label,n.name,n.qualified_name,f.file_path,n.start_line,"
+            "n.end_line,n.properties FROM cbm_nodes_v1 n "
+            "JOIN cbm_workspace_registry r USING(workspace_key) "
+            "JOIN cbm_projects_v1 p USING(workspace_key) "
+            "JOIN cbm_files_v1 f ON f.file_key=n.file_key "
+            "WHERE r.workspace_id=?1 AND n.node_id=?2",
             -1, &user_stmt, NULL) != SQLITE_OK) {
         if (source_stmt) sqlite3_finalize(source_stmt);
         if (user_stmt) sqlite3_finalize(user_stmt);
@@ -405,9 +410,13 @@ static int single_file_compare_edges(sqlite3 *source, sqlite3 *user, const char 
         sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_prepare_v2(
             user,
-            "SELECT target_node_id,edge_type,properties,url_path,local_name "
-            "FROM cbm_edges_v1 INDEXED BY cbm_edges_v1_source_type "
-            "WHERE workspace_id=?1 AND source_node_id=?2 AND edge_type=?3",
+            "SELECT target.node_id,e.edge_type,e.properties,e.url_path,e.local_name "
+            "FROM cbm_edges_v1 AS e INDEXED BY cbm_edges_v1_source_type "
+            "JOIN cbm_nodes_v1 target ON target.node_key=e.target_node_key "
+            "WHERE e.workspace_key=(SELECT workspace_key FROM cbm_workspace_registry "
+            "WHERE workspace_id=?1) AND e.source_node_key=(SELECT n.node_key "
+            "FROM cbm_nodes_v1 n JOIN cbm_workspace_registry r USING(workspace_key) "
+            "WHERE r.workspace_id=?1 AND n.node_id=?2) AND e.edge_type=?3",
             -1, &user_stmt, NULL) != SQLITE_OK) {
         if (source_stmt) sqlite3_finalize(source_stmt);
         if (user_stmt) sqlite3_finalize(user_stmt);
@@ -461,8 +470,11 @@ static int single_file_compare_file_hashes(sqlite3 *source, sqlite3 *user, const
                            -1, &source_stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_prepare_v2(user,
-                           "SELECT content_hash,mtime_ns,size_bytes FROM cbm_file_hashes_v1 "
-                           "WHERE workspace_id=?1 AND file_path=?2",
+                           "SELECT h.content_hash,h.mtime_ns,h.size_bytes "
+                           "FROM cbm_file_hashes_v1 h "
+                           "JOIN cbm_files_v1 f USING(file_key) "
+                           "JOIN cbm_workspace_registry r USING(workspace_key) "
+                           "WHERE r.workspace_id=?1 AND f.file_path=?2",
                            -1, &user_stmt, NULL) != SQLITE_OK) {
         if (source_stmt) sqlite3_finalize(source_stmt);
         if (user_stmt) sqlite3_finalize(user_stmt);
@@ -497,8 +509,10 @@ static int single_file_compare_summary(sqlite3 *source, sqlite3 *user, const cha
                            -1, &source_stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_prepare_v2(user,
-                           "SELECT summary,source_hash,created_at,updated_at "
-                           "FROM cbm_project_summaries_v2 WHERE workspace_id=?1",
+                           "SELECT s.summary,s.source_hash,s.created_at,s.updated_at "
+                           "FROM cbm_project_summaries_v2 s "
+                           "JOIN cbm_workspace_registry r USING(workspace_key) "
+                           "WHERE r.workspace_id=?1",
                            -1, &user_stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(user_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK) {
         if (source_stmt) sqlite3_finalize(source_stmt);
@@ -589,9 +603,11 @@ static int single_file_compare_fts(sqlite3 *source, sqlite3 *user, const char *p
              "WHERE nodes_fts MATCH ?1 AND nodes.project=?2 "
              "ORDER BY bm25(nodes_fts),nodes_fts.rowid");
     snprintf(user_sql, sizeof(user_sql),
-             "SELECT f.node_id,bm25(cbm_nodes_fts_v1) FROM cbm_nodes_fts_v1 f "
-             "WHERE f.workspace_id=?2 AND cbm_nodes_fts_v1 MATCH ?1 "
-             "ORDER BY bm25(cbm_nodes_fts_v1),f.node_id");
+             "SELECT n.node_id,bm25(cbm_nodes_fts_v1) FROM cbm_nodes_fts_v1 f "
+             "JOIN cbm_nodes_v1 n ON n.node_key=f.rowid "
+             "JOIN cbm_workspace_registry r ON r.workspace_key=n.workspace_key "
+             "WHERE r.workspace_id=?2 AND cbm_nodes_fts_v1 MATCH ?1 "
+             "ORDER BY bm25(cbm_nodes_fts_v1),n.node_id");
     int mismatches = 0;
     int query_count = 0;
     while (sqlite3_step(term_stmt) == SQLITE_ROW) {
@@ -694,7 +710,9 @@ static int single_file_sql_generation(sqlite3 *db, const char *workspace_id,
     const char *sql =
         "SELECT graph_nodes,graph_edges,metadata_nodes,metadata_edges,fts_rows,"
         "node_vector_rows,token_vector_rows,node_vectors,token_vectors "
-        "FROM cbm_generation_integrity_v2 WHERE workspace_id=?1 AND generation=?2";
+        "FROM cbm_generation_integrity_v2 i "
+        "JOIN cbm_workspace_registry r USING(workspace_key) "
+        "WHERE r.workspace_id=?1 AND i.generation=?2";
     if (!db || !workspace_id || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
         if (stmt) sqlite3_finalize(stmt);
         return -1;
@@ -1202,7 +1220,9 @@ TEST(zova_single_file_real_repo_compact_parity) {
     int64_t generation = 0;
     sqlite3_stmt *generation_stmt = NULL;
     ASSERT_EQ(sqlite3_prepare_v2(user,
-                                 "SELECT generation FROM cbm_workspace_index_state_v1 WHERE workspace_id=?1",
+                                 "SELECT s.generation FROM cbm_workspace_index_state_v1 s "
+                                 "JOIN cbm_workspace_registry r USING(workspace_key) "
+                                 "WHERE r.workspace_id=?1",
                                  -1, &generation_stmt, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_bind_text(generation_stmt, 1, workspace_id, -1, SQLITE_STATIC), SQLITE_OK);
     ASSERT_EQ(sqlite3_step(generation_stmt), SQLITE_ROW);
@@ -1340,10 +1360,12 @@ TEST(zova_single_file_real_repo_compact_parity) {
     }
     int64_t retained_nodes = 0, retained_edges = 0;
     if (single_file_sql_count(user,
-            "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id=?1", workspace_id,
+            "SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_key=(SELECT workspace_key "
+            "FROM cbm_workspace_registry WHERE workspace_id=?1)", workspace_id,
             &retained_nodes) != 0 ||
         single_file_sql_count(user,
-            "SELECT count(*) FROM cbm_edges_v1 WHERE workspace_id=?1", workspace_id,
+            "SELECT count(*) FROM cbm_edges_v1 WHERE workspace_key=(SELECT workspace_key "
+            "FROM cbm_workspace_registry WHERE workspace_id=?1)", workspace_id,
             &retained_edges) != 0 || retained_nodes != source_nodes || retained_edges != source_edges) {
         workspace_b_digest_mismatches++;
     }
@@ -1603,6 +1625,7 @@ typedef struct {
     int64_t db_bytes;
     int64_t zova_bytes;
     cbm_pipeline_zova_publish_stats_t publish_stats;
+    cbm_zova_publish_test_metrics_t statement_metrics;
 } zsp_artifact_t;
 
 typedef struct {
@@ -1753,6 +1776,7 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
 
     struct timespec started = {0}, finished = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &started);
+    cbm_zova_publish_test_metrics_reset();
     cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, artifact->db, CBM_MODE_FULL);
     int rc = pipeline && cbm_pipeline_run(pipeline) == 0 ? 0 : -1;
     cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
@@ -1760,6 +1784,7 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
         artifact->route = cbm_pipeline_get_last_route(pipeline);
         artifact->publish_ms = cbm_pipeline_get_zova_publish_ms(pipeline);
         (void)cbm_pipeline_get_zova_publish_stats(pipeline, &artifact->publish_stats);
+        cbm_zova_publish_test_metrics_get(&artifact->statement_metrics);
         if (rc == 0 && !zsp_route_matches_workload(artifact->route, workload)) rc = -1;
     }
     if (rc == 0) {
@@ -1830,7 +1855,7 @@ static int zsp_workspace_generation(sqlite3 *user, char *workspace_id,
                            "SELECT r.workspace_id,s.generation "
                            "FROM cbm_workspace_registry r "
                            "JOIN cbm_workspace_index_state_v1 s "
-                           "ON s.workspace_id=r.workspace_id LIMIT 1",
+                           "ON s.workspace_key=r.workspace_key LIMIT 1",
                            -1, &stmt, NULL) != SQLITE_OK ||
         sqlite3_step(stmt) != SQLITE_ROW) {
         if (stmt) sqlite3_finalize(stmt);
@@ -2086,7 +2111,8 @@ static int zsp_measure_reads(const zsp_artifact_t *compat,
     int64_t flagged_start_id = 0;
     if (sqlite3_prepare_v2(cbm_store_get_db(flagged_store),
                            "SELECT cbm_stable_numeric_id(node_id) FROM cbm_nodes_v1 "
-                           "WHERE workspace_id=?1 AND node_id=?2",
+                           "WHERE workspace_key=(SELECT workspace_key FROM "
+                           "cbm_workspace_registry WHERE workspace_id=?1) AND node_id=?2",
                            -1, &flagged_id_stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(flagged_id_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
         sqlite3_bind_text(flagged_id_stmt, 2, refs[0].stable_id, -1, SQLITE_STATIC) != SQLITE_OK ||
@@ -2427,11 +2453,45 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             "\"token_vectors_deleted\": %lld\n"
             "  },\n"
             "  \"timing_ms\": {\n"
-            "    \"normalize\": 0.0, \"canonical_nodes\": 0.0, "
-            "\"canonical_edges\": 0.0, \"fts\": 0.0,\n"
-            "    \"native_graph\": 0.0, \"native_vectors\": 0.0, "
-            "\"digests\": 0.0, \"verify\": 0.0,\n"
+            "    \"route\": %.3f, \"normalize\": %.3f, "
+            "\"model_nodes\": %.3f, \"model_edges\": %.3f, "
+            "\"model_hashes\": %.3f, \"model_vectors\": %.3f,\n"
+            "    \"writer_guard\": %.3f, \"database_init\": %.3f, "
+            "\"database_open\": %.3f, \"transaction_begin\": %.3f,\n"
+            "    \"transaction_body\": %.3f, \"transaction_commit\": %.3f, "
+            "\"database_close\": %.3f, \"clear\": %.3f,\n"
+            "    \"canonical_files\": %.3f, "
+            "\"canonical_nodes\": %.3f, \"canonical_edges\": %.3f,\n"
+            "    \"canonical_hashes\": %.3f, \"fts\": %.3f, "
+            "\"token_metadata\": %.3f,\n"
+            "    \"native_graph\": %.3f, \"native_graph_materialize\": %.3f, "
+            "\"native_graph_reset\": %.3f,\n"
+            "    \"native_graph_nodes\": %.3f, \"native_graph_edges\": %.3f, "
+            "\"native_graph_validate\": %.3f, \"native_graph_cleanup\": %.3f,\n"
+            "    \"native_vectors\": %.3f, \"readback\": %.3f, "
+            "\"digests\": %.3f, \"verify\": %.3f,\n"
             "    \"publish\": %.6f, \"pipeline\": %.6f\n"
+            "  },\n"
+            "  \"statement_metrics\": {\n"
+            "    \"canonical_files\": {\"rows\": %llu, \"bind_i64_calls\": %llu, "
+            "\"bind_text_calls\": %llu, \"bind_double_calls\": %llu, "
+            "\"step_calls\": %llu, \"reset_calls\": %llu, \"clear_bindings_calls\": %llu},\n"
+            "    \"canonical_nodes\": {\"rows\": %llu, \"bind_i64_calls\": %llu, "
+            "\"bind_text_calls\": %llu, \"bind_double_calls\": %llu, "
+            "\"step_calls\": %llu, \"reset_calls\": %llu, \"clear_bindings_calls\": %llu},\n"
+            "    \"canonical_edges\": {\"rows\": %llu, \"bind_i64_calls\": %llu, "
+            "\"bind_text_calls\": %llu, \"bind_double_calls\": %llu, "
+            "\"step_calls\": %llu, \"reset_calls\": %llu, \"clear_bindings_calls\": %llu},\n"
+            "    \"canonical_hashes\": {\"rows\": %llu, \"bind_i64_calls\": %llu, "
+            "\"bind_text_calls\": %llu, \"bind_double_calls\": %llu, "
+            "\"step_calls\": %llu, \"reset_calls\": %llu, \"clear_bindings_calls\": %llu},\n"
+            "    \"canonical_token_metadata\": {\"rows\": %llu, \"bind_i64_calls\": %llu, "
+            "\"bind_text_calls\": %llu, \"bind_double_calls\": %llu, "
+            "\"step_calls\": %llu, \"reset_calls\": %llu, \"clear_bindings_calls\": %llu},\n"
+            "    \"full_fts_bulk_statements\": %llu, "
+            "\"full_fts_trigger_rows_avoided\": %llu,\n"
+            "    \"full_node_guard_validation_statements\": %llu, "
+            "\"full_edge_guard_validation_statements\": %llu\n"
             "  },\n"
             "  \"snapshot\": {\n"
             "    \"completed\": %s, \"generation\": %lld,\n"
@@ -2467,7 +2527,77 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             (long long)report->token_vectors_total,
             (long long)report->token_vectors_upserted,
             (long long)report->token_vectors_deleted,
+            selected->publish_stats.route_ms,
+            selected->publish_stats.normalization_ms,
+            selected->publish_stats.model_nodes_ms,
+            selected->publish_stats.model_edges_ms,
+            selected->publish_stats.model_hashes_ms,
+            selected->publish_stats.model_vectors_ms,
+            selected->publish_stats.writer_guard_ms,
+            selected->publish_stats.database_init_ms,
+            selected->publish_stats.database_open_ms,
+            selected->publish_stats.transaction_begin_ms,
+            selected->publish_stats.transaction_body_ms,
+            selected->publish_stats.transaction_commit_ms,
+            selected->publish_stats.database_close_ms,
+            selected->publish_stats.clear_ms,
+            selected->publish_stats.canonical_files_ms,
+            selected->publish_stats.canonical_nodes_ms,
+            selected->publish_stats.canonical_edges_ms,
+            selected->publish_stats.canonical_hashes_ms,
+            selected->publish_stats.fts_ms,
+            selected->publish_stats.token_metadata_ms,
+            selected->publish_stats.native_graph_ms,
+            selected->publish_stats.native_graph_materialize_ms,
+            selected->publish_stats.native_graph_reset_ms,
+            selected->publish_stats.native_graph_nodes_ms,
+            selected->publish_stats.native_graph_edges_ms,
+            selected->publish_stats.native_graph_validate_ms,
+            selected->publish_stats.native_graph_cleanup_ms,
+            selected->publish_stats.native_vectors_ms,
+            selected->publish_stats.readback_ms,
+            selected->publish_stats.model_digests_ms,
+            selected->publish_stats.finalize_ms,
             selected->publish_ms, selected->elapsed_ms,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.rows,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.bind_i64_calls,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.bind_text_calls,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.bind_double_calls,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.step_calls,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.reset_calls,
+            (unsigned long long)selected->statement_metrics.canonical_files_sql.clear_bindings_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.rows,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.bind_i64_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.bind_text_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.bind_double_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.step_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.reset_calls,
+            (unsigned long long)selected->statement_metrics.canonical_nodes_sql.clear_bindings_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.rows,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.bind_i64_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.bind_text_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.bind_double_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.step_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.reset_calls,
+            (unsigned long long)selected->statement_metrics.canonical_edges_sql.clear_bindings_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.rows,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.bind_i64_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.bind_text_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.bind_double_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.step_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.reset_calls,
+            (unsigned long long)selected->statement_metrics.canonical_hashes_sql.clear_bindings_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.rows,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.bind_i64_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.bind_text_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.bind_double_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.step_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.reset_calls,
+            (unsigned long long)selected->statement_metrics.canonical_token_metadata_sql.clear_bindings_calls,
+            (unsigned long long)selected->statement_metrics.full_fts_bulk_statements,
+            (unsigned long long)selected->statement_metrics.full_fts_trigger_rows_avoided,
+            (unsigned long long)selected->statement_metrics.full_node_guard_validation_statements,
+            (unsigned long long)selected->statement_metrics.full_edge_guard_validation_statements,
             selected->publish_stats.snapshot_completed ? "true" : "false",
             (long long)selected->publish_stats.snapshot_generation,
             selected->publish_stats.snapshot_base_ms,
@@ -2569,6 +2699,12 @@ TEST(zova_single_file_optimization_report_uses_actual_route) {
     ASSERT_NOT_NULL(strstr(json, "\"route\": \"single\""));
     ASSERT_NOT_NULL(strstr(json, "\"workload\": \"incremental\""));
     ASSERT_NOT_NULL(strstr(json, "\"pipeline_mode\": \"CBM_MODE_INCREMENTAL\""));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_materialize\":"));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_reset\":"));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_nodes\":"));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_edges\":"));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_validate\":"));
+    ASSERT_NOT_NULL(strstr(json, "\"native_graph_cleanup\":"));
     ASSERT_NULL(strstr(json, "changed_state_full_pipeline"));
     PASS();
 }

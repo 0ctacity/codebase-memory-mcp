@@ -122,11 +122,11 @@ static int operations_verify_database(const char *path, int *out_schema_version)
         operations_query_i64(
             db,
             "SELECT count(*) FROM cbm_workspace_registry w LEFT JOIN "
-            "cbm_database_generation_v1 g ON g.workspace_id=w.workspace_id AND "
+            "cbm_database_generation_v1 g ON g.workspace_key=w.workspace_key AND "
             "g.generation=w.active_generation AND g.state='ready' LEFT JOIN "
-            "cbm_generation_integrity_v2 i ON i.workspace_id=w.workspace_id AND "
+            "cbm_generation_integrity_v2 i ON i.workspace_key=w.workspace_key AND "
             "i.generation=w.active_generation WHERE w.active_generation<=0 OR "
-            "g.workspace_id IS NULL OR i.workspace_id IS NULL",
+            "g.workspace_key IS NULL OR i.workspace_key IS NULL",
             &invalid_generations) == 0 &&
         invalid_generations == 0) {
         rc = 0;
@@ -279,7 +279,7 @@ static int operations_workspace_manifest_query(zova_database *db, zova_statement
                .sql = "SELECT r.workspace_id,r.active_generation,i.metadata_sha256,"
                       "i.fts_sha256,i.topology_sha256,i.node_vector_sha256,"
                       "i.token_vector_sha256 FROM cbm_workspace_registry r JOIN "
-                      "cbm_generation_integrity_v2 i ON i.workspace_id=r.workspace_id AND "
+                      "cbm_generation_integrity_v2 i ON i.workspace_key=r.workspace_key AND "
                       "i.generation=r.active_generation ORDER BY r.workspace_id",
                .out_statement = out}) == ZOVA_OK && *out
                ? 0
@@ -544,9 +544,9 @@ static int operations_single_ready_workspace(const char *data_path,
         rc = zova_database_prepare(&(zova_database_prepare_request){
                  .db = db,
                  .sql = "SELECT r.workspace_id FROM cbm_workspace_registry r "
-                        "JOIN cbm_database_generation_v1 g ON g.workspace_id=r.workspace_id "
+                        "JOIN cbm_database_generation_v1 g ON g.workspace_key=r.workspace_key "
                         "AND g.generation=r.active_generation AND g.state='ready' "
-                        "JOIN cbm_workspace_index_state_v1 s ON s.workspace_id=r.workspace_id "
+                        "JOIN cbm_workspace_index_state_v1 s ON s.workspace_key=r.workspace_key "
                         "AND s.generation=r.active_generation ORDER BY r.workspace_id",
                  .out_statement = &statement}) == ZOVA_OK && statement ? 0 : -1;
     zova_step_result step = ZOVA_STEP_DONE;
@@ -890,11 +890,11 @@ cbm_zova_operation_code_t cbm_zova_database_status(
                            operations_query_i64(
                                db,
                                "SELECT count(*) FROM cbm_workspace_registry w LEFT JOIN "
-                               "cbm_database_generation_v1 g ON g.workspace_id=w.workspace_id "
+                               "cbm_database_generation_v1 g ON g.workspace_key=w.workspace_key "
                                "AND g.generation=w.active_generation AND g.state='ready' LEFT JOIN "
-                               "cbm_generation_integrity_v2 i ON i.workspace_id=w.workspace_id "
+                               "cbm_generation_integrity_v2 i ON i.workspace_key=w.workspace_key "
                                "AND i.generation=w.active_generation WHERE w.active_generation<=0 "
-                               "OR g.workspace_id IS NULL OR i.workspace_id IS NULL",
+                               "OR g.workspace_key IS NULL OR i.workspace_key IS NULL",
                                &invalid_generations) == 0 &&
                            invalid_generations == 0 &&
                            operations_query_i64(db, "PRAGMA page_size", &page_size) == 0 &&
@@ -1292,7 +1292,7 @@ static int operations_workspace_health_row(zova_database *db, const char *worksp
             .db = db,
             .sql = "SELECT r.active_generation,COALESCE(h.state,'healthy') "
                    "FROM cbm_workspace_registry r LEFT JOIN cbm_workspace_health_v1 h "
-                   "ON h.workspace_id=r.workspace_id WHERE r.workspace_id=?1",
+                   "ON h.workspace_key=r.workspace_key WHERE r.workspace_id=?1",
             .out_statement = &statement}) != ZOVA_OK || !statement ||
         zova_statement_bind_text(&(zova_statement_bind_text_request){
             .statement = statement, .index = 1, .data = (const uint8_t *)workspace_id,
@@ -1338,10 +1338,11 @@ static int operations_mark_workspace_rebuild_required(const char *path,
         (zova_database_prepare(&(zova_database_prepare_request){
              .db = db,
              .sql = "INSERT INTO cbm_workspace_health_v1"
-                    "(workspace_id,state,reason,checked_generation,checked_at) "
-                    "VALUES(?1,'rebuild_required',?2,?3,"
-                    "strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
-                    "ON CONFLICT(workspace_id) DO UPDATE SET "
+                    "(workspace_key,state,reason,checked_generation,checked_at) "
+                    "SELECT workspace_key,'rebuild_required',?2,?3,"
+                    "strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "FROM cbm_workspace_registry WHERE workspace_id=?1 "
+                    "ON CONFLICT(workspace_key) DO UPDATE SET "
                     "state=excluded.state,reason=excluded.reason,"
                     "checked_generation=excluded.checked_generation,"
                     "checked_at=excluded.checked_at",
@@ -1390,7 +1391,9 @@ static int operations_workspace_project(const char *path, const char *workspace_
     if (rc == 0 &&
         (zova_database_prepare(&(zova_database_prepare_request){
              .db = db,
-             .sql = "SELECT project FROM cbm_projects_v1 WHERE workspace_id=?1",
+             .sql = "SELECT p.project FROM cbm_projects_v1 p "
+                    "JOIN cbm_workspace_registry r USING(workspace_key) "
+                    "WHERE r.workspace_id=?1",
              .out_statement = &statement}) != ZOVA_OK || !statement))
         rc = -1;
     if (rc == 0 &&

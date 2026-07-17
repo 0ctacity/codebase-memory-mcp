@@ -302,6 +302,35 @@ typedef struct {
     uint64_t deleted_count;
     double normalization_ms;
     double diff_ms;
+    double model_nodes_ms;
+    double model_edges_ms;
+    double model_hashes_ms;
+    double model_vectors_ms;
+    double model_digests_ms;
+    double writer_guard_ms;
+    double database_init_ms;
+    double database_open_ms;
+    double transaction_begin_ms;
+    double transaction_body_ms;
+    double transaction_commit_ms;
+    double database_close_ms;
+    double clear_ms;
+    double finalize_ms;
+    double canonical_files_ms;
+    double canonical_nodes_ms;
+    double canonical_edges_ms;
+    double canonical_hashes_ms;
+    double fts_ms;
+    double token_metadata_ms;
+    double native_graph_ms;
+    double native_graph_materialize_ms;
+    double native_graph_reset_ms;
+    double native_graph_nodes_ms;
+    double native_graph_edges_ms;
+    double native_graph_validate_ms;
+    double native_graph_cleanup_ms;
+    double native_vectors_ms;
+    double readback_ms;
     uint64_t full_clear_count;
     uint64_t unchanged_rewrite_count;
     uint64_t nodes_inserted;
@@ -316,6 +345,18 @@ typedef struct {
 } cbm_zova_workspace_generation_result_t;
 
 typedef struct {
+    uint64_t rows;
+    uint64_t bind_i64_calls;
+    uint64_t bind_text_calls;
+    uint64_t bind_double_calls;
+    uint64_t step_calls;
+    uint64_t reset_calls;
+    uint64_t clear_bindings_calls;
+} cbm_zova_statement_phase_metrics_t;
+
+typedef struct {
+    uint64_t database_open_count;
+    uint64_t database_close_count;
     uint64_t transaction_count;
     uint64_t full_clear_count;
     uint64_t canonical_node_fts_passes;
@@ -327,6 +368,17 @@ typedef struct {
     uint64_t integrity_writes;
     uint64_t delta_authoritative_rows_touched;
     uint64_t delta_clear_violation_count;
+    uint64_t delta_file_key_resolutions;
+    uint64_t delta_endpoint_key_lookups;
+    cbm_zova_statement_phase_metrics_t canonical_files_sql;
+    cbm_zova_statement_phase_metrics_t canonical_nodes_sql;
+    cbm_zova_statement_phase_metrics_t canonical_edges_sql;
+    cbm_zova_statement_phase_metrics_t canonical_hashes_sql;
+    cbm_zova_statement_phase_metrics_t canonical_token_metadata_sql;
+    uint64_t full_fts_bulk_statements;
+    uint64_t full_fts_trigger_rows_avoided;
+    uint64_t full_node_guard_validation_statements;
+    uint64_t full_edge_guard_validation_statements;
 } cbm_zova_publish_test_metrics_t;
 
 void cbm_zova_publish_test_metrics_reset(void);

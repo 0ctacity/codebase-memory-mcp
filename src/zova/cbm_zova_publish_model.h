@@ -40,6 +40,11 @@ typedef struct {
     uint64_t endpoint_lookups;
     uint64_t global_sorts;
     double normalization_ms;
+    double nodes_ms;
+    double edges_ms;
+    double hashes_ms;
+    double vectors_ms;
+    double digests_ms;
 } cbm_zova_publish_model_metrics_t;
 
 int cbm_zova_publish_model_build(

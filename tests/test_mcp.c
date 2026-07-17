@@ -132,10 +132,11 @@ TEST(mcp_migration_route_is_explicit_and_never_fallback) {
                   db,
                   "INSERT INTO cbm_workspace_registry(workspace_id,canonical_root,"
                   "id_format_version,active_generation) VALUES('w:v1:route','/tmp/route-proj',2,0);"
-                  "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+                  "INSERT INTO cbm_workspace_migrations_v1(workspace_key,migration_version,project,"
                   "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
                   "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
-                  "token_vector_sha256,prepared_at) VALUES('w:v1:route',1,'route-proj',"
+                  "token_vector_sha256,prepared_at) VALUES((SELECT workspace_key FROM "
+                  "cbm_workspace_registry WHERE workspace_id='w:v1:route'),1,'route-proj',"
                   "'/tmp/route-proj','source.db','source.zova',1,0,'prepared','m','f','t','n','v',"
                   "CURRENT_TIMESTAMP)",
                   NULL, NULL, NULL),
@@ -1227,13 +1228,14 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
     ASSERT_EQ(sqlite3_open(user_db, &route_db), SQLITE_OK);
     char migration_sql[4096];
     snprintf(migration_sql, sizeof(migration_sql),
-             "INSERT INTO cbm_workspace_migrations_v1(workspace_id,migration_version,project,"
+             "INSERT INTO cbm_workspace_migrations_v1(workspace_key,migration_version,project,"
              "root_path,source_db_path,source_zova_path,source_generation,target_generation,"
              "state,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
-             "token_vector_sha256,prepared_at) VALUES('%s',1,'fixture','%s','%s','source.zova',"
-             "1,%lld,'rolled_back','m','f','t','n','v',CURRENT_TIMESTAMP)",
-             published_result.workspace_id, repo_root, project_db,
-             (long long)published_result.generation);
+             "token_vector_sha256,prepared_at) SELECT workspace_key,1,'fixture','%s','%s',"
+             "'source.zova',1,%lld,'rolled_back','m','f','t','n','v',CURRENT_TIMESTAMP "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s'",
+             repo_root, project_db, (long long)published_result.generation,
+             published_result.workspace_id);
     ASSERT_EQ(sqlite3_exec(route_db, migration_sql, NULL, NULL, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_close(route_db), SQLITE_OK);
     cbm_mcp_server_t *rolled_srv = cbm_mcp_server_new(NULL);

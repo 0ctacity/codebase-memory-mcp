@@ -1104,6 +1104,8 @@ static int pipeline_publish_zova_user_database(
     p->zova_publish_ms = 0.0;
     memset(&p->zova_publish_stats, 0, sizeof(p->zova_publish_stats));
     if (!cbm_zova_single_file_experimental_enabled()) return 0;
+    struct timespec route_started = {0};
+    cbm_clock_gettime(CLOCK_MONOTONIC, &route_started);
     int capacity = file_count + mode_skipped_count;
     cbm_zova_file_hash_input_t *hashes =
         capacity > 0 ? calloc((size_t)capacity, sizeof(*hashes)) : NULL;
@@ -1160,6 +1162,37 @@ static int pipeline_publish_zova_user_database(
         .node_vectors_deleted = result.node_vectors_deleted,
         .token_vectors_upserted = result.token_vectors_upserted,
         .token_vectors_deleted = result.token_vectors_deleted,
+        .route_ms = elapsed_ms(route_started),
+        .normalization_ms = result.normalization_ms,
+        .model_nodes_ms = result.model_nodes_ms,
+        .model_edges_ms = result.model_edges_ms,
+        .model_hashes_ms = result.model_hashes_ms,
+        .model_vectors_ms = result.model_vectors_ms,
+        .model_digests_ms = result.model_digests_ms,
+        .writer_guard_ms = result.writer_guard_ms,
+        .database_init_ms = result.database_init_ms,
+        .database_open_ms = result.database_open_ms,
+        .transaction_begin_ms = result.transaction_begin_ms,
+        .transaction_body_ms = result.transaction_body_ms,
+        .transaction_commit_ms = result.transaction_commit_ms,
+        .database_close_ms = result.database_close_ms,
+        .clear_ms = result.clear_ms,
+        .finalize_ms = result.finalize_ms,
+        .canonical_files_ms = result.canonical_files_ms,
+        .canonical_nodes_ms = result.canonical_nodes_ms,
+        .canonical_edges_ms = result.canonical_edges_ms,
+        .canonical_hashes_ms = result.canonical_hashes_ms,
+        .fts_ms = result.fts_ms,
+        .token_metadata_ms = result.token_metadata_ms,
+        .native_graph_ms = result.native_graph_ms,
+        .native_graph_materialize_ms = result.native_graph_materialize_ms,
+        .native_graph_reset_ms = result.native_graph_reset_ms,
+        .native_graph_nodes_ms = result.native_graph_nodes_ms,
+        .native_graph_edges_ms = result.native_graph_edges_ms,
+        .native_graph_validate_ms = result.native_graph_validate_ms,
+        .native_graph_cleanup_ms = result.native_graph_cleanup_ms,
+        .native_vectors_ms = result.native_vectors_ms,
+        .readback_ms = result.readback_ms,
         .snapshot_completed = before != NULL,
         .snapshot_base_ms = before ? before->metrics.base_ms : 0.0,
         .snapshot_optional_ms = before ? before->metrics.optional_ms : 0.0,

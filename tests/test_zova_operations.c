@@ -559,7 +559,8 @@ static int operations_workspace_public_state_capture(
     char sql[512], stable_id[128] = {0};
     if (rc == 0) {
         snprintf(sql, sizeof(sql),
-                 "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id='%s' "
+                 "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT workspace_key "
+                 "FROM cbm_workspace_registry WHERE workspace_id='%s') "
                  "AND qualified_name='rich.parse::alpha/beta?'",
                  workspace_id);
         rc = operations_text(path, sql, stable_id, sizeof(stable_id));
@@ -695,14 +696,16 @@ static int operations_add_ready_workspace(const char *path) {
         "INSERT INTO cbm_workspace_registry"
         "(workspace_id,canonical_root,id_format_version,active_generation)"
         "VALUES('w1_ops','/tmp/operations-ready',2,7);"
-        "INSERT INTO cbm_database_generation_v1(workspace_id,generation,state)"
-        "VALUES('w1_ops',7,'ready');"
+        "INSERT INTO cbm_database_generation_v1(workspace_key,generation,state)"
+        "SELECT workspace_key,7,'ready' FROM cbm_workspace_registry "
+        "WHERE workspace_id='w1_ops';"
         "INSERT INTO cbm_generation_integrity_v2("
-        "workspace_id,generation,graph_nodes,graph_edges,metadata_nodes,metadata_edges,"
+        "workspace_key,generation,graph_nodes,graph_edges,metadata_nodes,metadata_edges,"
         "metadata_topology_edges,fts_rows,node_vector_rows,token_vector_rows,node_vectors,"
         "token_vectors,metadata_sha256,fts_sha256,topology_sha256,node_vector_sha256,"
-        "token_vector_sha256) VALUES('w1_ops',7,1,2,3,4,5,6,7,8,9,10,"
-        "'metadata','fts','topology','node-vector','token-vector')");
+        "token_vector_sha256) SELECT workspace_key,7,1,2,3,4,5,6,7,8,9,10,"
+        "'metadata','fts','topology','node-vector','token-vector' "
+        "FROM cbm_workspace_registry WHERE workspace_id='w1_ops'");
 }
 
 static int operations_ready_digest(const char *path, char *out, size_t out_size) {
@@ -710,7 +713,8 @@ static int operations_ready_digest(const char *path, char *out, size_t out_size)
         path,
         "SELECT metadata_sha256||'|'||fts_sha256||'|'||topology_sha256||'|'||"
         "node_vector_sha256||'|'||token_vector_sha256 FROM cbm_generation_integrity_v2 "
-        "WHERE workspace_id='w1_ops' AND generation=7",
+        "WHERE workspace_key=(SELECT workspace_key FROM cbm_workspace_registry "
+        "WHERE workspace_id='w1_ops') AND generation=7",
         out, out_size);
 }
 
@@ -840,14 +844,16 @@ TEST(zova_operations_delete_primitive_removes_health_before_registry) {
     ASSERT_EQ(operations_publish_rich_fixture(path, &rich), 0);
     snprintf(sql, sizeof(sql),
              "INSERT INTO cbm_workspace_health_v1"
-             "(workspace_id,state,reason,checked_generation,checked_at) "
-             "VALUES('%s','healthy','checked',1,'2026-07-14T00:00:00Z')",
+             "(workspace_key,state,reason,checked_generation,checked_at) "
+             "SELECT workspace_key,'healthy','checked',1,'2026-07-14T00:00:00Z' "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s'",
              rich.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
 
     ASSERT_EQ(cbm_zova_user_database_delete_workspace(path, rich.workspace_id), 0);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_id='%s'",
+             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s')",
              rich.workspace_id);
     ASSERT_EQ(operations_scalar(path, sql), 0);
     snprintf(sql, sizeof(sql),
@@ -894,10 +900,12 @@ TEST(zova_operations_workspace_delete_is_isolated_reported_and_idempotent) {
                   "{\"summary\":\"keep-b\"}", &rich_b), 0);
     snprintf(sql, sizeof(sql),
              "INSERT INTO cbm_workspace_health_v1"
-             "(workspace_id,state,reason,checked_generation,checked_at) "
-             "VALUES('%s','healthy','checked',1,'2026-07-14T00:00:00Z');"
-             "INSERT INTO cbm_project_summaries_v1(workspace_id,summary,updated_at) "
-             "VALUES('%s','{\"legacy\":true}','2026-07-14T00:00:00Z')",
+             "(workspace_key,state,reason,checked_generation,checked_at) "
+             "SELECT workspace_key,'healthy','checked',1,'2026-07-14T00:00:00Z' "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s';"
+             "INSERT INTO cbm_project_summaries_v1(workspace_key,summary,updated_at) "
+             "SELECT workspace_key,'{\"legacy\":true}','2026-07-14T00:00:00Z' "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s'",
              rich_a.workspace_id, rich_a.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
 
@@ -923,18 +931,7 @@ TEST(zova_operations_workspace_delete_is_isolated_reported_and_idempotent) {
 
     snprintf(sql, sizeof(sql),
              "SELECT (SELECT count(*) FROM cbm_workspace_registry WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_nodes_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_edges_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_file_hashes_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_project_summaries_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_project_summaries_v2 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_nodes_fts_v1 WHERE workspace_id='%s')+"
-             "(SELECT count(*) FROM cbm_token_vector_metadata_v1 WHERE workspace_id='%s')",
-             rich_a.workspace_id, rich_a.workspace_id, rich_a.workspace_id, rich_a.workspace_id,
-             rich_a.workspace_id, rich_a.workspace_id, rich_a.workspace_id, rich_a.workspace_id,
-             rich_a.workspace_id, rich_a.workspace_id);
+             "(SELECT count(*) FROM pragma_foreign_key_check)", rich_a.workspace_id);
     ASSERT_EQ(operations_scalar(path, sql), 0);
     char graph_name[160], node_collection[256], token_collection[256];
     ASSERT_EQ(cbm_zova_workspace_graph_name(rich_a.workspace_id, graph_name,
@@ -1010,10 +1007,12 @@ TEST(zova_operations_database_compact_reclaims_verified_database) {
     ASSERT_EQ(operations_workspace_state_capture(path, rich.workspace_id, &workspace_before), 0);
     snprintf(sql, sizeof(sql),
              "INSERT INTO cbm_workspace_health_v1"
-             "(workspace_id,state,reason,checked_generation,checked_at) "
-             "VALUES('%s','healthy',hex(zeroblob(8388608)),%lld,'2026-07-14T00:00:00Z');"
-             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_id='%s'",
-             rich.workspace_id, (long long)rich.generation, rich.workspace_id);
+             "(workspace_key,state,reason,checked_generation,checked_at) "
+             "SELECT workspace_key,'healthy',hex(zeroblob(8388608)),%lld,"
+             "'2026-07-14T00:00:00Z' FROM cbm_workspace_registry WHERE workspace_id='%s';"
+             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT workspace_key "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s')",
+             (long long)rich.generation, rich.workspace_id, rich.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
     cbm_zova_operation_report_t before = {0}, report = {0}, after = {0};
     ASSERT_EQ(cbm_zova_database_status(path, &before), CBM_ZOVA_OPERATION_OK);
@@ -1043,10 +1042,12 @@ static int operations_make_database_compactable(
     char sql[1024];
     snprintf(sql, sizeof(sql),
              "INSERT INTO cbm_workspace_health_v1"
-             "(workspace_id,state,reason,checked_generation,checked_at) "
-             "VALUES('%s','healthy',hex(zeroblob(8388608)),%lld,'2026-07-14T00:00:00Z');"
-             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_id='%s'",
-             workspace->workspace_id, (long long)workspace->generation,
+             "(workspace_key,state,reason,checked_generation,checked_at) "
+             "SELECT workspace_key,'healthy',hex(zeroblob(8388608)),%lld,"
+             "'2026-07-14T00:00:00Z' FROM cbm_workspace_registry WHERE workspace_id='%s';"
+             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT workspace_key "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s')",
+             (long long)workspace->generation, workspace->workspace_id,
              workspace->workspace_id);
     if (operations_sql(path, sql) != 0) return -1;
     cbm_zova_operation_report_t status = {0};
@@ -1161,16 +1162,18 @@ TEST(zova_operations_database_compact_refuses_checkpoint_blocked_reader_then_ret
     ASSERT_EQ(operations_publish_rich_fixture(path, &rich), 0);
     snprintf(sql, sizeof(sql),
              "INSERT INTO cbm_workspace_health_v1"
-             "(workspace_id,state,reason,checked_generation,checked_at) "
-             "VALUES('%s','healthy',hex(zeroblob(8388608)),%lld,'2026-07-14T00:00:00Z')",
-             rich.workspace_id, (long long)rich.generation);
+             "(workspace_key,state,reason,checked_generation,checked_at) "
+             "SELECT workspace_key,'healthy',hex(zeroblob(8388608)),%lld,"
+             "'2026-07-14T00:00:00Z' FROM cbm_workspace_registry WHERE workspace_id='%s'",
+             (long long)rich.generation, rich.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
     sqlite3 *reader = NULL;
     ASSERT_EQ(sqlite3_open_v2(path, &reader, SQLITE_OPEN_READONLY, NULL), SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(reader, "BEGIN; SELECT reason FROM cbm_workspace_health_v1",
                            NULL, NULL, NULL), SQLITE_OK);
     snprintf(sql, sizeof(sql),
-             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_id='%s'", rich.workspace_id);
+             "DELETE FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT workspace_key "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s')", rich.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
     cbm_zova_operation_report_t report = {0};
     ASSERT_EQ(operations_compact_with_test_space(path, &report), CBM_ZOVA_OPERATION_BUSY);
@@ -1286,7 +1289,8 @@ TEST(zova_operations_health_classifies_workspace_defect_without_cross_workspace_
     ASSERT_EQ(health, CBM_ZOVA_HEALTH_WORKSPACE_REBUILD);
     ASSERT_STR_EQ(report.workspace_id, rich_a.workspace_id);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND state='rebuild_required' AND checked_generation=%lld",
              rich_a.workspace_id, (long long)rich_a.generation);
     ASSERT_EQ(operations_scalar(path, sql), 1);
@@ -1388,8 +1392,9 @@ TEST(zova_operations_health_classifies_foreign_key_violation_as_whole_file) {
                   path,
                   "PRAGMA foreign_keys=OFF;"
                   "INSERT INTO cbm_workspace_health_v1"
-                  "(workspace_id,state,reason,checked_generation,checked_at)"
-                  "VALUES('w1_orphan','healthy','test',1,'2026-07-14T00:00:00Z')"),
+                  "(workspace_key,state,reason,checked_generation,checked_at)"
+                  "VALUES(9223372036854770000,'healthy','test',1,"
+                  "'2026-07-14T00:00:00Z')"),
               0);
 
     cbm_zova_health_class_t health = CBM_ZOVA_HEALTH_OK;
@@ -1442,8 +1447,9 @@ TEST(zova_operations_health_detects_workspace_digest_mismatch) {
     cbm_zova_workspace_generation_result_t rich = {0};
     ASSERT_EQ(operations_publish_rich_fixture(path, &rich), 0);
     snprintf(sql, sizeof(sql),
-             "UPDATE cbm_nodes_v1 SET name='tampered-same-count' "
-             "WHERE workspace_id='%s' AND qualified_name='rich.parse::alpha/beta?'",
+             "UPDATE cbm_nodes_v1 SET properties='{\"tampered\":true}' "
+             "WHERE workspace_key=(SELECT workspace_key FROM cbm_workspace_registry "
+             "WHERE workspace_id='%s') AND qualified_name='rich.parse::alpha/beta?'",
              rich.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
     cbm_zova_health_class_t health = CBM_ZOVA_HEALTH_OK;
@@ -1473,7 +1479,8 @@ TEST(zova_operations_rebuild_health_clears_only_with_successful_publication) {
     ASSERT_EQ(operations_publish_rich_fixture(path, &failed), -1);
     cbm_unsetenv("CBM_ZOVA_TEST_FAIL_PHASE");
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_workspace_health_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND state='rebuild_required'", rich.workspace_id);
     ASSERT_EQ(operations_scalar(path, sql), 1);
     ASSERT_NULL(cbm_zova_repository_open(path, "workspace-rich"));
@@ -1664,7 +1671,7 @@ TEST(zova_operations_empty_bootstrap_creates_exact_v6_health_schema) {
                               "pragma_table_info('cbm_workspace_health_v1')",
                               columns, sizeof(columns)),
               0);
-    ASSERT_STR_EQ(columns, "workspace_id,state,reason,checked_generation,checked_at");
+    ASSERT_STR_EQ(columns, "workspace_key,state,reason,checked_generation,checked_at");
     char ddl[512];
     ASSERT_EQ(operations_text(path,
                               "SELECT sql FROM sqlite_master WHERE type='table' AND "
@@ -2332,7 +2339,8 @@ TEST(zova_operations_workspace_export_is_fresh_rich_and_single_workspace) {
     ASSERT(saw_raw_i8);
 
     char sql[512], source_local_id[128], archive_local_id[128];
-    snprintf(sql, sizeof(sql), "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id='%s' "
+    snprintf(sql, sizeof(sql), "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT "
+                               "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
                                "AND qualified_name='rich.parse::<local>#value'", rich.workspace_id);
     ASSERT_EQ(operations_text(source, sql, source_local_id, sizeof(source_local_id)), 0);
     ASSERT_TRUE(strncmp(source_local_id, "n:v2:", 5) == 0);
@@ -2515,7 +2523,8 @@ TEST(zova_operations_workspace_import_adds_rich_workspace_without_touching_resid
     ASSERT_EQ(cbm_zova_repository_export_snapshot(resident, resident_b.workspace_id, &before_b), 0);
     char b_id_sql[512], b_id_before[128], b_id_after[128];
     snprintf(b_id_sql, sizeof(b_id_sql),
-             "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_id='%s' "
+             "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT workspace_key "
+             "FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND qualified_name='fixture.root_one'", resident_b.workspace_id);
     ASSERT_EQ(operations_text(resident, b_id_sql, b_id_before, sizeof(b_id_before)), 0);
 
@@ -2582,11 +2591,13 @@ TEST(zova_operations_workspace_export_and_empty_import_publish_generation_three_
               CBM_ZOVA_OPERATION_OK);
     snprintf(data, sizeof(data), "%s/data.zova", archive);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s'",
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s')",
              rich.workspace_id);
     ASSERT_EQ(operations_scalar(data, sql), 1);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND generation=3 AND state='ready'",
              rich.workspace_id);
     ASSERT_EQ(operations_scalar(data, sql), 1);
@@ -2597,11 +2608,13 @@ TEST(zova_operations_workspace_export_and_empty_import_publish_generation_three_
     ASSERT_EQ(cbm_zova_workspace_import(target, archive, false, &report),
               CBM_ZOVA_OPERATION_OK);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s'",
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s')",
              rich.workspace_id);
     ASSERT_EQ(operations_scalar(target, sql), 1);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND generation=3 AND state='ready'",
              rich.workspace_id);
     ASSERT_EQ(operations_scalar(target, sql), 1);
@@ -2630,16 +2643,19 @@ TEST(zova_operations_workspace_replace_publishes_only_requested_generation_atomi
     ASSERT_EQ(cbm_zova_workspace_import(target, archive, true, &report),
               CBM_ZOVA_OPERATION_OK);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s'",
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s')",
              archive_a.workspace_id);
     ASSERT_EQ(operations_scalar(target, sql), 2);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND generation=2",
              archive_a.workspace_id);
     ASSERT_EQ(operations_scalar(target, sql), 0);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s' "
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
              "AND generation=3 AND state='ready'",
              archive_a.workspace_id);
     ASSERT_EQ(operations_scalar(target, sql), 1);
@@ -2657,7 +2673,8 @@ TEST(zova_operations_workspace_replace_publishes_only_requested_generation_atomi
     ASSERT_EQ(operations_file_digest(fault_target, after), 0);
     ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
     snprintf(sql, sizeof(sql),
-             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_id='%s'",
+             "SELECT count(*) FROM cbm_database_generation_v1 WHERE workspace_key=(SELECT "
+             "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s')",
              archive_a.workspace_id);
     ASSERT_EQ(operations_scalar(fault_target, sql), 1);
     snprintf(sql, sizeof(sql),
@@ -2692,7 +2709,8 @@ TEST(zova_operations_workspace_export_refuses_missing_and_unready_without_source
     char sql[512];
     snprintf(sql, sizeof(sql),
              "PRAGMA journal_mode=DELETE; UPDATE cbm_database_generation_v1 SET state='building' "
-             "WHERE workspace_id='%s' AND generation=1", rich.workspace_id);
+             "WHERE workspace_key=(SELECT workspace_key FROM cbm_workspace_registry "
+             "WHERE workspace_id='%s') AND generation=1", rich.workspace_id);
     ASSERT_EQ(operations_sql(source, sql), 0);
     ASSERT_EQ(operations_file_digest(source, before), 0);
     ASSERT_EQ(cbm_zova_workspace_export(source, rich.workspace_id, archive, &report),

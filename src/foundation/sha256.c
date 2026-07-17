@@ -2,7 +2,13 @@
  * against the NIST test vectors in tests/test_cli.c. */
 
 #include "foundation/sha256.h"
+#include "foundation/sha256_backend.h"
 
+#if defined(__APPLE__)
+#include <CommonCrypto/CommonDigest.h>
+#endif
+
+#include <limits.h>
 #include <string.h>
 
 static const uint32_t K[64] = {
@@ -73,14 +79,32 @@ void cbm_sha256_init(cbm_sha256_ctx *c) {
 }
 
 void cbm_sha256_update(cbm_sha256_ctx *c, const void *data, size_t len) {
+    if (len == 0) return;
     const uint8_t *p = (const uint8_t *)data;
-    for (size_t i = 0; i < len; i++) {
-        c->buf[c->buflen++] = p[i];
+    if (c->buflen != 0) {
+        size_t take = 64 - c->buflen;
+        if (take > len) take = len;
+        memcpy(c->buf + c->buflen, p, take);
+        c->buflen += take;
+        p += take;
+        len -= take;
         if (c->buflen == 64) {
             sha256_transform(c, c->buf);
             c->bitlen += 512;
             c->buflen = 0;
         }
+    }
+
+    while (len >= 64) {
+        sha256_transform(c, p);
+        c->bitlen += 512;
+        p += 64;
+        len -= 64;
+    }
+
+    if (len != 0) {
+        memcpy(c->buf, p, len);
+        c->buflen = len;
     }
 }
 
@@ -126,4 +150,47 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
         out[i * 2 + 1] = hex[digest[i] & 0x0f];
     }
     out[CBM_SHA256_HEX_LEN] = '\0';
+}
+
+void cbm_sha256_backend_init(cbm_sha256_backend_ctx *c) {
+#if defined(__APPLE__)
+    _Static_assert(sizeof(CC_SHA256_CTX) <= sizeof(c->state.bytes),
+                   "SHA-256 backend storage is too small");
+    (void)CC_SHA256_Init((CC_SHA256_CTX *)c->state.bytes);
+#else
+    cbm_sha256_init((cbm_sha256_ctx *)c->state.bytes);
+#endif
+}
+
+void cbm_sha256_backend_update(cbm_sha256_backend_ctx *c, const void *data, size_t len) {
+#if defined(__APPLE__)
+    const uint8_t *bytes = (const uint8_t *)data;
+    while (len > (size_t)UINT_MAX) {
+        (void)CC_SHA256_Update((CC_SHA256_CTX *)c->state.bytes, bytes, (CC_LONG)UINT_MAX);
+        bytes += UINT_MAX;
+        len -= UINT_MAX;
+    }
+    if (len != 0) {
+        (void)CC_SHA256_Update((CC_SHA256_CTX *)c->state.bytes, bytes, (CC_LONG)len);
+    }
+#else
+    cbm_sha256_update((cbm_sha256_ctx *)c->state.bytes, data, len);
+#endif
+}
+
+void cbm_sha256_backend_final(cbm_sha256_backend_ctx *c,
+                              uint8_t out[CBM_SHA256_DIGEST_LEN]) {
+#if defined(__APPLE__)
+    (void)CC_SHA256_Final(out, (CC_SHA256_CTX *)c->state.bytes);
+#else
+    cbm_sha256_final((cbm_sha256_ctx *)c->state.bytes, out);
+#endif
+}
+
+bool cbm_sha256_backend_is_accelerated(void) {
+#if defined(__APPLE__)
+    return true;
+#else
+    return false;
+#endif
 }

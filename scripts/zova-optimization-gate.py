@@ -40,11 +40,15 @@ ROW_FIELDS = (
 )
 TIMING_FIELDS = (
     "normalize",
+    "canonical_files",
     "canonical_nodes",
     "canonical_edges",
+    "canonical_hashes",
     "fts",
+    "token_metadata",
     "native_graph",
     "native_vectors",
+    "readback",
     "digests",
     "verify",
     "publish",
@@ -68,6 +72,28 @@ ZERO_FIELDS = (
 )
 COUNT_FIELDS = ("full_fallback_count", "full_clear_count", "unchanged_rewrite_count")
 SNAPSHOT_ROW_FIELDS = ("topology_rows", "node_vector_rows", "token_vector_rows")
+STATEMENT_PHASES = (
+    "canonical_files",
+    "canonical_nodes",
+    "canonical_edges",
+    "canonical_hashes",
+    "canonical_token_metadata",
+)
+STATEMENT_FIELDS = (
+    "rows",
+    "bind_i64_calls",
+    "bind_text_calls",
+    "bind_double_calls",
+    "step_calls",
+    "reset_calls",
+    "clear_bindings_calls",
+)
+FULL_STATEMENT_FIELDS = (
+    "full_fts_bulk_statements",
+    "full_fts_trigger_rows_avoided",
+    "full_node_guard_validation_statements",
+    "full_edge_guard_validation_statements",
+)
 
 
 def _mapping(value: Any, path: str) -> dict[str, Any]:
@@ -143,6 +169,24 @@ def _state(value: Any, index: int) -> dict[str, Any]:
     timing = _mapping(state.get("timing_ms"), f"states[{index}].timing_ms")
     for field in TIMING_FIELDS:
         _number(timing.get(field), f"states[{index}].timing_ms.{field}")
+    statement_metrics = _mapping(
+        state.get("statement_metrics"), f"states[{index}].statement_metrics"
+    )
+    for phase in STATEMENT_PHASES:
+        phase_metrics = _mapping(
+            statement_metrics.get(phase),
+            f"states[{index}].statement_metrics.{phase}",
+        )
+        for field in STATEMENT_FIELDS:
+            _integer(
+                phase_metrics.get(field),
+                f"states[{index}].statement_metrics.{phase}.{field}",
+            )
+    for field in FULL_STATEMENT_FIELDS:
+        _integer(
+            statement_metrics.get(field),
+            f"states[{index}].statement_metrics.{field}",
+        )
     snapshot = _mapping(state.get("snapshot"), f"states[{index}].snapshot")
     snapshot_completed = _boolean(snapshot.get("completed"),
                                   f"states[{index}].snapshot.completed")
