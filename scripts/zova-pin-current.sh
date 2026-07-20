@@ -32,15 +32,19 @@ done
 
 format_version=$(sed -n 's/^pub const format_version = "\([^"]*\)";$/\1/p' "$SOURCE_VERSION_ZIG")
 abi_version=$(sed -n 's/^pub const abi_version_string = "\([^"]*\)";$/\1/p' "$SOURCE_VERSION_ZIG")
-if [[ "$format_version" != "8" ]]; then
-  echo "error: current Zova SDK must use format version 8, found: ${format_version:-missing}" >&2
+if [[ "$format_version" != "9" ]]; then
+  echo "error: current Zova SDK must use format version 9, found: ${format_version:-missing}" >&2
   exit 1
 fi
 if [[ -z "$abi_version" ]]; then
   echo "error: current Zova SDK does not declare abi_version_string" >&2
   exit 1
 fi
-for symbol in zova_graph_edge_delete_many zova_vector_delete_many; do
+for symbol in zova_graph_edge_delete_many zova_vector_delete_many zova_graph_build_fresh_keyed \
+              zova_graph_build_fresh_prepared_keyed \
+              zova_graph_build_fresh_prepared_keyed_with_payloads \
+              zova_graph_edge_payload_get_many zova_graph_edge_payload_replace_many \
+              zova_fresh_build_begin; do
   if ! grep -Fq "zova_status $symbol(" "$SOURCE_HEADER"; then
     echo "error: current Zova SDK header is missing required symbol: $symbol" >&2
     exit 1
@@ -99,6 +103,12 @@ format_version=$format_version
 abi_version=$abi_version
 graph_edge_delete_many_symbol=zova_graph_edge_delete_many
 vector_delete_many_symbol=zova_vector_delete_many
+graph_build_fresh_keyed_symbol=zova_graph_build_fresh_keyed
+graph_build_fresh_prepared_keyed_symbol=zova_graph_build_fresh_prepared_keyed
+graph_build_fresh_prepared_keyed_with_payloads_symbol=zova_graph_build_fresh_prepared_keyed_with_payloads
+graph_edge_payload_get_many_symbol=zova_graph_edge_payload_get_many
+graph_edge_payload_replace_many_symbol=zova_graph_edge_payload_replace_many
+fresh_build_begin_symbol=zova_fresh_build_begin
 pinned_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 header_sha256=$header_hash
 library_sha256=$library_hash

@@ -66,17 +66,35 @@ typedef struct {
     char name[CBM_SZ_256];
 } config_entry_t;
 
+static int node_ref_qualified_name_compare(const void *a, const void *b) {
+    const cbm_gbuf_node_t *left = *(const cbm_gbuf_node_t *const *)a;
+    const cbm_gbuf_node_t *right = *(const cbm_gbuf_node_t *const *)b;
+    return strcmp(left->qualified_name, right->qualified_name);
+}
+
+static const cbm_gbuf_node_t **sorted_node_refs(
+    const cbm_gbuf_node_t *const *nodes, int count) {
+    if (!nodes || count <= 0) return NULL;
+    const cbm_gbuf_node_t **sorted = malloc((size_t)count * sizeof(*sorted));
+    if (!sorted) return NULL;
+    memcpy(sorted, nodes, (size_t)count * sizeof(*sorted));
+    qsort(sorted, (size_t)count, sizeof(*sorted), node_ref_qualified_name_compare);
+    return sorted;
+}
+
 /* Collect config Variable nodes with ≥2 tokens, each ≥3 chars. */
 static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_count,
                                   config_entry_t *out, int max_out) {
+    const cbm_gbuf_node_t **sorted = sorted_node_refs(vars, var_count);
+    if (var_count > 0 && !sorted) return 0;
     int n = 0;
     for (int i = 0; i < var_count && n < max_out; i++) {
-        if (!cbm_has_config_extension(vars[i]->file_path)) {
+        if (!cbm_has_config_extension(sorted[i]->file_path)) {
             continue;
         }
 
         char norm[CBM_SZ_256];
-        int tokens = cbm_normalize_config_key(vars[i]->name, norm, sizeof(norm));
+        int tokens = cbm_normalize_config_key(sorted[i]->name, norm, sizeof(norm));
         if (tokens < PAIR_LEN) {
             continue;
         }
@@ -97,11 +115,12 @@ static int collect_config_entries(const cbm_gbuf_node_t *const *vars, int var_co
             continue;
         }
 
-        out[n].node_id = vars[i]->id;
+        out[n].node_id = sorted[i]->id;
         snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
-        snprintf(out[n].name, sizeof(out[n].name), "%s", vars[i]->name);
+        snprintf(out[n].name, sizeof(out[n].name), "%s", sorted[i]->name);
         n++;
     }
+    free(sorted);
     return n;
 }
 
@@ -124,22 +143,25 @@ static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) 
             continue;
         }
 
+        const cbm_gbuf_node_t **sorted = sorted_node_refs(nodes, count);
+        if (count > 0 && !sorted) return n;
+
         for (int i = 0; i < count && n < max_out; i++) {
-            if (cbm_has_config_extension(nodes[i]->file_path)) {
+            if (cbm_has_config_extension(sorted[i]->file_path)) {
                 continue;
             }
 
             char norm[CBM_SZ_256];
-            int tokens = cbm_normalize_config_key(nodes[i]->name, norm, sizeof(norm));
+            int tokens = cbm_normalize_config_key(sorted[i]->name, norm, sizeof(norm));
             if (tokens == 0 || norm[0] == '\0') {
                 continue;
             }
 
-            out[n].node_id = nodes[i]->id;
+            out[n].node_id = sorted[i]->id;
             snprintf(out[n].normalized, sizeof(out[n].normalized), "%s", norm);
             n++;
         }
-        /* gbuf data is borrowed — no free */
+        free(sorted);
     }
     return n;
 }

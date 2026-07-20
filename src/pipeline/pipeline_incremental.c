@@ -28,6 +28,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
+#include "foundation/sha256_backend.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -50,6 +51,92 @@ static double elapsed_ms(struct timespec start) {
     double s = (double)(now.tv_sec - start.tv_sec);
     double ns = (double)(now.tv_nsec - start.tv_nsec);
     return (s * CBM_MS_PER_SEC) + (ns / CBM_NS_PER_MS);
+}
+
+typedef struct {
+    uint64_t xor_words[4];
+    uint64_t sum_words[4];
+    uint64_t count;
+} cbm_incremental_multiset_digest_t;
+
+typedef struct {
+    cbm_incremental_multiset_digest_t input;
+    cbm_incremental_multiset_digest_t config;
+    cbm_incremental_multiset_digest_t similarity;
+    cbm_incremental_multiset_digest_t semantic;
+} cbm_incremental_derived_state_t;
+
+static void derived_hash_text(cbm_sha256_backend_ctx *hash, const char *text) {
+    const char *value = text ? text : "";
+    cbm_sha256_backend_update(hash, value, strlen(value));
+    cbm_sha256_backend_update(hash, "\0", 1);
+}
+
+static void derived_digest_add(cbm_incremental_multiset_digest_t *set,
+                               cbm_sha256_backend_ctx *hash) {
+    uint8_t bytes[CBM_SHA256_DIGEST_LEN];
+    uint64_t words[4];
+    cbm_sha256_backend_final(hash, bytes);
+    memcpy(words, bytes, sizeof(words));
+    for (int i = 0; i < 4; i++) {
+        set->xor_words[i] ^= words[i];
+        set->sum_words[i] += words[i];
+    }
+    set->count++;
+}
+
+static bool derived_digest_equal(const cbm_incremental_multiset_digest_t *left,
+                                 const cbm_incremental_multiset_digest_t *right) {
+    return left->count == right->count &&
+           memcmp(left->xor_words, right->xor_words, sizeof(left->xor_words)) == 0 &&
+           memcmp(left->sum_words, right->sum_words, sizeof(left->sum_words)) == 0;
+}
+
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    cbm_incremental_derived_state_t *state;
+} cbm_incremental_derived_scan_t;
+
+static void derived_node_visitor(const cbm_gbuf_node_t *node, void *userdata) {
+    cbm_incremental_derived_scan_t *scan = userdata;
+    cbm_sha256_backend_ctx hash;
+    cbm_sha256_backend_init(&hash);
+    derived_hash_text(&hash, "node");
+    derived_hash_text(&hash, node->label);
+    derived_hash_text(&hash, node->name);
+    derived_hash_text(&hash, node->qualified_name);
+    derived_hash_text(&hash, node->file_path);
+    cbm_sha256_backend_update(&hash, &node->start_line, sizeof(node->start_line));
+    cbm_sha256_backend_update(&hash, &node->end_line, sizeof(node->end_line));
+    derived_hash_text(&hash, node->properties_json);
+    derived_digest_add(&scan->state->input, &hash);
+}
+
+static void derived_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
+    cbm_incremental_derived_scan_t *scan = userdata;
+    cbm_incremental_multiset_digest_t *target = &scan->state->input;
+    if (strcmp(edge->type, "CONFIGURES") == 0) target = &scan->state->config;
+    else if (strcmp(edge->type, "SIMILAR_TO") == 0) target = &scan->state->similarity;
+    else if (strcmp(edge->type, "SEMANTICALLY_RELATED") == 0)
+        target = &scan->state->semantic;
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(scan->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *destination = cbm_gbuf_find_by_id(scan->gbuf, edge->target_id);
+    cbm_sha256_backend_ctx hash;
+    cbm_sha256_backend_init(&hash);
+    derived_hash_text(&hash, "edge");
+    derived_hash_text(&hash, source ? source->qualified_name : NULL);
+    derived_hash_text(&hash, edge->type);
+    derived_hash_text(&hash, destination ? destination->qualified_name : NULL);
+    derived_hash_text(&hash, edge->properties_json);
+    derived_digest_add(target, &hash);
+}
+
+static cbm_incremental_derived_state_t derived_state(const cbm_gbuf_t *gbuf) {
+    cbm_incremental_derived_state_t state = {0};
+    cbm_incremental_derived_scan_t scan = {.gbuf = gbuf, .state = &state};
+    cbm_gbuf_foreach_node(gbuf, derived_node_visitor, &scan);
+    cbm_gbuf_foreach_edge(gbuf, derived_edge_visitor, &scan);
+    return state;
 }
 
 /* itoa into static buffer — matches pipeline.c helper */
@@ -782,7 +869,9 @@ static void run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *change
 
 /* Run post-extraction passes (tests, decorator tags, configlink). */
 static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
-                           const char *project) {
+                           const char *project,
+                           const cbm_incremental_derived_state_t *before,
+                           bool can_reuse_semantic_vectors) {
     struct timespec t;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -804,10 +893,31 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
     cbm_log_info("pass.timing", "pass", "incr_decorator_tags", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
 
+    /* Restore the final derived node properties before comparing pass inputs.
+     * The semantic and similarity passes ignore these complexity fields, but
+     * reproducing them makes the conservative whole-graph input digest exact. */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_configlink(ctx);
-    cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
+    cbm_pipeline_pass_complexity(ctx);
+    cbm_log_info("pass.timing", "pass", "incr_complexity", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_incremental_derived_state_t after = derived_state(ctx->gbuf);
+    bool input_unchanged = before && derived_digest_equal(&before->input, &after.input);
+    cbm_log_info("incremental.derived_digest", "unchanged",
+                 input_unchanged ? "true" : "false", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
+
+    bool config_unchanged = input_unchanged &&
+        derived_digest_equal(&before->config, &after.config);
+    if (!config_unchanged) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_pipeline_pass_configlink(ctx);
+        cbm_log_info("pass.timing", "pass", "incr_configlink", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+    } else {
+        cbm_log_info("incremental.derived_gate", "component", "configlink", "decision", "reuse");
+    }
 
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
     if (ctx->mode <= CBM_MODE_MODERATE) {
@@ -815,27 +925,32 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
          * this incremental update, so rerunning either pass without first
          * removing its prior output leaves relationships that a clean full
          * index would no longer select after the corpus changed. */
-        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SIMILAR_TO");
-        cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SEMANTICALLY_RELATED");
-        cbm_gbuf_clear_semantic_vectors(ctx->gbuf);
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_similarity(ctx);
-        cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(t)));
+        bool similarity_unchanged = input_unchanged &&
+            derived_digest_equal(&before->similarity, &after.similarity);
+        if (!similarity_unchanged) {
+            cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SIMILAR_TO");
+            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+            cbm_pipeline_pass_similarity(ctx);
+            cbm_log_info("pass.timing", "pass", "incr_similarity", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+        } else {
+            cbm_log_info("incremental.derived_gate", "component", "similarity", "decision", "reuse");
+        }
 
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-        cbm_pipeline_pass_semantic_edges(ctx);
-        cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(t)));
+        bool semantic_unchanged = can_reuse_semantic_vectors && input_unchanged &&
+            derived_digest_equal(&before->semantic, &after.semantic) &&
+            cbm_gbuf_reuse_zova_semantic_vectors(ctx->gbuf) == 0;
+        if (!semantic_unchanged) {
+            cbm_gbuf_delete_edges_by_type(ctx->gbuf, "SEMANTICALLY_RELATED");
+            cbm_gbuf_clear_semantic_vectors(ctx->gbuf);
+            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+            cbm_pipeline_pass_semantic_edges(ctx);
+            cbm_log_info("pass.timing", "pass", "incr_semantic_edges", "elapsed_ms",
+                         itoa_buf((int)elapsed_ms(t)));
+        } else {
+            cbm_log_info("incremental.derived_gate", "component", "semantic", "decision", "reuse");
+        }
     }
-
-    /* Match the full route's final derived-property pass. It runs after
-     * semantic edges so transitive CALLS depth is computed from the complete
-     * mixed graph, not only the edited-file slice. */
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_pipeline_pass_complexity(ctx);
-    cbm_log_info("pass.timing", "pass", "incr_complexity", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t)));
 }
 /* Delete old DB and dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
@@ -851,7 +966,7 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
     if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
-        if (cbm_gbuf_prepare_zova_dump(gbuf) != 0) {
+        if (cbm_gbuf_prepare_zova_dump_delta(gbuf) != 0) {
             cbm_log_error("incremental.err", "phase", "zova_prepare");
             return CBM_NOT_FOUND;
         }
@@ -916,87 +1031,6 @@ static int dump_and_persist(cbm_pipeline_t *pipeline, cbm_gbuf_t *gbuf, const ch
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
 
-typedef struct {
-    int64_t snapshot_id;
-    int64_t graph_id;
-} cbm_incremental_node_id_map_t;
-
-typedef struct {
-    uint64_t source_ordinal;
-    int snapshot_index;
-} cbm_incremental_node_order_t;
-
-static int compare_incremental_node_ids(const void *left, const void *right) {
-    const cbm_incremental_node_id_map_t *a = left;
-    const cbm_incremental_node_id_map_t *b = right;
-    return (a->snapshot_id > b->snapshot_id) - (a->snapshot_id < b->snapshot_id);
-}
-
-static int compare_incremental_node_order(const void *left, const void *right) {
-    const cbm_incremental_node_order_t *a = left;
-    const cbm_incremental_node_order_t *b = right;
-    if (a->source_ordinal != b->source_ordinal)
-        return (a->source_ordinal > b->source_ordinal) -
-               (a->source_ordinal < b->source_ordinal);
-    return (a->snapshot_index > b->snapshot_index) -
-           (a->snapshot_index < b->snapshot_index);
-}
-
-static int64_t incremental_graph_id_for_snapshot_id(const cbm_incremental_node_id_map_t *map,
-                                                     int count, int64_t snapshot_id) {
-    cbm_incremental_node_id_map_t key = {.snapshot_id = snapshot_id};
-    const cbm_incremental_node_id_map_t *match =
-        bsearch(&key, map, (size_t)count, sizeof(*map), compare_incremental_node_ids);
-    return match ? match->graph_id : 0;
-}
-
-static int load_zova_snapshot_graph(cbm_gbuf_t *gbuf,
-                                    const cbm_zova_workspace_snapshot_t *snapshot) {
-    cbm_incremental_node_id_map_t *map =
-        snapshot->node_count > 0 ? calloc((size_t)snapshot->node_count, sizeof(*map)) : NULL;
-    cbm_incremental_node_order_t *order =
-        snapshot->node_count > 0 ? calloc((size_t)snapshot->node_count, sizeof(*order)) : NULL;
-    if (snapshot->node_count > 0 && (!map || !order || !snapshot->node_source_ordinals)) {
-        free(map);
-        free(order);
-        return CBM_NOT_FOUND;
-    }
-    for (int i = 0; i < snapshot->node_count; i++) {
-        order[i] = (cbm_incremental_node_order_t){
-            .source_ordinal = snapshot->node_source_ordinals[i], .snapshot_index = i};
-    }
-    qsort(order, (size_t)snapshot->node_count, sizeof(*order), compare_incremental_node_order);
-    for (int i = 0; i < snapshot->node_count; i++) {
-        const CBMDumpNode *node = &snapshot->nodes[order[i].snapshot_index];
-        int64_t graph_id = cbm_gbuf_upsert_node(
-            gbuf, node->label, node->name, node->qualified_name, node->file_path,
-            node->start_line, node->end_line, node->properties);
-        if (graph_id <= 0) {
-            free(map);
-            free(order);
-            return CBM_NOT_FOUND;
-        }
-        map[i] = (cbm_incremental_node_id_map_t){.snapshot_id = node->id,
-                                                .graph_id = graph_id};
-    }
-    free(order);
-    qsort(map, (size_t)snapshot->node_count, sizeof(*map), compare_incremental_node_ids);
-    for (int i = 0; i < snapshot->edge_count; i++) {
-        const CBMDumpEdge *edge = &snapshot->edges[i];
-        int64_t source_id =
-            incremental_graph_id_for_snapshot_id(map, snapshot->node_count, edge->source_id);
-        int64_t target_id =
-            incremental_graph_id_for_snapshot_id(map, snapshot->node_count, edge->target_id);
-        if (source_id <= 0 || target_id <= 0 ||
-            cbm_gbuf_insert_edge(gbuf, source_id, target_id, edge->type, edge->properties) <= 0) {
-            free(map);
-            return CBM_NOT_FOUND;
-        }
-    }
-    free(map);
-    return 0;
-}
-
 static int copy_zova_snapshot_hashes(const char *project,
                                      const cbm_zova_workspace_snapshot_t *snapshot,
                                      cbm_file_hash_t **out_hashes, int *out_count) {
@@ -1027,7 +1061,8 @@ static int copy_zova_snapshot_hashes(const char *project,
 }
 
 static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                           int file_count, cbm_zova_workspace_snapshot_t *snapshot) {
+                           int file_count, cbm_zova_workspace_snapshot_t *snapshot,
+                           cbm_gbuf_t *preloaded_graph) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
@@ -1039,6 +1074,7 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
     if (snapshot) {
         if (copy_zova_snapshot_hashes(project, snapshot, &stored, &stored_count) != 0) {
             cbm_log_error("incremental.err", "msg", "load_zova_hashes_failed");
+            cbm_gbuf_free(preloaded_graph);
             return CBM_NOT_FOUND;
         }
     } else {
@@ -1082,6 +1118,7 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
         if (store) {
             cbm_store_close(store);
         }
+        cbm_gbuf_free(preloaded_graph);
         return 0;
     }
 
@@ -1104,9 +1141,10 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
 
     /* Step 1: Load existing graph into RAM */
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    cbm_gbuf_t *existing = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
-    int load_rc = snapshot ? load_zova_snapshot_graph(existing, snapshot)
-                           : cbm_gbuf_load_from_db(existing, db_path, project);
+    cbm_gbuf_t *existing = preloaded_graph
+                               ? preloaded_graph
+                               : cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
+    int load_rc = preloaded_graph ? 0 : cbm_gbuf_load_from_db(existing, db_path, project);
     cbm_log_info(snapshot ? "incremental.load_zova" : "incremental.load_db", "rc",
                  itoa_buf(load_rc), "nodes",
                  itoa_buf(cbm_gbuf_node_count(existing)), "edges",
@@ -1127,6 +1165,11 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
         }
         return CBM_NOT_FOUND;
     }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+    cbm_incremental_derived_state_t derived_before = derived_state(existing);
+    cbm_log_info("incremental.derived_digest", "phase", "baseline", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t)));
 
     if (store) {
         cbm_store_close(store);
@@ -1238,7 +1281,7 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
                  itoa_buf(edge_cap.count), "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     incr_free_edge_capture(&edge_cap);
 
-    run_postpasses(&ctx, changed_files, ci, project);
+    run_postpasses(&ctx, changed_files, ci, project, &derived_before, snapshot != NULL);
 
     free(changed_files);
     cbm_registry_free(registry);
@@ -1267,14 +1310,15 @@ static int run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count) {
-    return run_incremental(p, db_path, files, file_count, NULL);
+    return run_incremental(p, db_path, files, file_count, NULL, NULL);
 }
 
 int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
                                       cbm_file_info_t *files, int file_count,
-                                      cbm_zova_workspace_snapshot_t *snapshot) {
-    if (!snapshot) {
+                                      cbm_zova_workspace_snapshot_t *snapshot,
+                                      cbm_gbuf_t *preloaded_graph) {
+    if (!snapshot || !preloaded_graph) {
         return CBM_NOT_FOUND;
     }
-    return run_incremental(p, zova_path, files, file_count, snapshot);
+    return run_incremental(p, zova_path, files, file_count, snapshot, preloaded_graph);
 }

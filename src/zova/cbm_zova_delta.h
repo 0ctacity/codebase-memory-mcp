@@ -13,6 +13,14 @@ typedef struct {
 } cbm_zova_delta_topology_edge_t;
 
 typedef struct {
+    const char *edge_id;
+    const char *source_stable_id;
+    const char *edge_type;
+    const char *target_stable_id;
+    const char *local_name;
+} cbm_zova_delta_edge_delete_t;
+
+typedef struct {
     uint64_t node_inserts;
     uint64_t node_updates;
     uint64_t node_deletes;
@@ -54,7 +62,7 @@ const char *cbm_zova_workspace_delta_node_delete_at(
     const cbm_zova_workspace_delta_t *delta, int index);
 const cbm_zova_publish_edge_t *cbm_zova_workspace_delta_edge_insert_at(
     const cbm_zova_workspace_delta_t *delta, int index);
-const char *cbm_zova_workspace_delta_edge_delete_at(
+const cbm_zova_delta_edge_delete_t *cbm_zova_workspace_delta_edge_delete_at(
     const cbm_zova_workspace_delta_t *delta, int index);
 const cbm_zova_delta_topology_edge_t *cbm_zova_workspace_delta_topology_insert_at(
     const cbm_zova_workspace_delta_t *delta, int index);
@@ -66,6 +74,7 @@ const char *cbm_zova_workspace_delta_node_vector_delete_at(
     const cbm_zova_workspace_delta_t *delta, int index);
 const cbm_zova_publish_token_vector_t *cbm_zova_workspace_delta_token_vector_upsert_at(
     const cbm_zova_workspace_delta_t *delta, int index);
+/* Internal physical delete identity: the canonical token string, not its public digest ID. */
 const char *cbm_zova_workspace_delta_token_vector_delete_at(
     const cbm_zova_workspace_delta_t *delta, int index);
 const cbm_zova_file_hash_input_t *cbm_zova_workspace_delta_file_hash_upsert_at(

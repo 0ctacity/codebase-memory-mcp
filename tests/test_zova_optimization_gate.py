@@ -99,6 +99,22 @@ def state(route: str, workload: str) -> dict:
             "topology_rows": 0,
             "node_vector_rows": 0,
             "token_vector_rows": 0,
+            "base_phase_mask": 0x7f if route == "single" and incremental else 0,
+            "open_ms": 1.0 if route == "single" and incremental else 0.0,
+            "header_ms": 1.0 if route == "single" and incremental else 0.0,
+            "integrity_ms": 1.0 if route == "single" and incremental else 0.0,
+            "nodes_sql_ms": 3.0 if route == "single" and incremental else 0.0,
+            "nodes_native_ms": 2.0 if route == "single" and incremental else 0.0,
+            "nodes_finalize_ms": 2.0 if route == "single" and incremental else 0.0,
+            "edges_sql_ms": 2.0 if route == "single" and incremental else 0.0,
+            "edges_native_ms": 1.0 if route == "single" and incremental else 0.0,
+            "edges_finalize_ms": 1.0 if route == "single" and incremental else 0.0,
+            "hashes_summary_ms": 1.0 if route == "single" and incremental else 0.0,
+            "close_ms": 1.0 if route == "single" and incremental else 0.0,
+            "graph_buffer_ms": 2.0 if route == "single" and incremental else 0.0,
+            "node_rows": 1000 if route == "single" and incremental else 0,
+            "edge_rows": 4000 if route == "single" and incremental else 0,
+            "file_hash_rows": 100 if route == "single" and incremental else 0,
         },
         "storage": {
             "database_bytes": 800_000,
@@ -228,6 +244,16 @@ class OptimizationGateTests(unittest.TestCase):
         final = report()
         final["states"][3]["snapshot"]["topology_rows"] = 1
         with self.assertRaisesRegex(ValueError, "topology_rows"):
+            self.gate.validate(report(baseline=True), final)
+
+        final = report()
+        del final["states"][3]["snapshot"]["nodes_sql_ms"]
+        with self.assertRaisesRegex((TypeError, ValueError), "nodes_sql_ms"):
+            self.gate.validate(report(baseline=True), final)
+
+        final = report()
+        final["states"][3]["snapshot"]["base_phase_mask"] = 0x3f
+        with self.assertRaisesRegex(ValueError, "base_phase_mask"):
             self.gate.validate(report(baseline=True), final)
 
     def test_final_incremental_must_not_clear_fallback_or_rewrite_unchanged(self) -> None:

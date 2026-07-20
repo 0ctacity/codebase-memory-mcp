@@ -119,6 +119,7 @@ struct cbm_gbuf {
     CBMDumpTokenVec *dump_token_vecs;
     int dump_token_vec_count;
     int dump_token_vec_cap;
+    bool reuse_zova_semantic_vectors;
 
     /* Finalized lightweight topology retained after the SQLite writer closes.
      * Sidecar publication happens after the pipeline persists hashes/FTS, so
@@ -127,6 +128,7 @@ struct cbm_gbuf {
     int zova_dump_node_count;
     CBMDumpEdge *zova_dump_edges;
     int zova_dump_edge_count;
+    cbm_zova_prepared_view_t *zova_prepared_view;
 
     /* The SQLite writer and experimental user-local publisher must describe
      * the same indexed generation. Keep the timestamp produced for the dump
@@ -488,6 +490,27 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
     return gb;
 }
 
+int cbm_gbuf_reserve(cbm_gbuf_t *gb, int node_count, int edge_count) {
+    if (!gb || node_count < 0 || edge_count < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (node_count > gb->nodes.cap) {
+        cbm_gbuf_node_t **nodes =
+            realloc(gb->nodes.items, (size_t)node_count * sizeof(*nodes));
+        if (!nodes) return CBM_NOT_FOUND;
+        gb->nodes.items = nodes;
+        gb->nodes.cap = node_count;
+    }
+    if (edge_count > gb->edges.cap) {
+        cbm_gbuf_edge_t **edges =
+            realloc(gb->edges.items, (size_t)edge_count * sizeof(*edges));
+        if (!edges) return CBM_NOT_FOUND;
+        gb->edges.items = edges;
+        gb->edges.cap = edge_count;
+    }
+    return 0;
+}
+
 void cbm_gbuf_free(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -495,6 +518,7 @@ void cbm_gbuf_free(cbm_gbuf_t *gb) {
 
     free(gb->zova_dump_nodes);
     free_retained_dump_edges(gb->zova_dump_edges, gb->zova_dump_edge_count);
+    cbm_zova_prepared_view_free(gb->zova_prepared_view);
 
     /* Free each individually-allocated node */
     for (int i = 0; i < gb->nodes.count; i++) {
@@ -583,6 +607,13 @@ void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb) {
         free((void *)gb->dump_token_vecs[i].vector);
     }
     gb->dump_token_vec_count = 0;
+}
+
+int cbm_gbuf_reuse_zova_semantic_vectors(cbm_gbuf_t *gb) {
+    if (!gb || gb->dump_vector_count != 0 || gb->dump_token_vec_count != 0)
+        return CBM_NOT_FOUND;
+    gb->reuse_zova_semantic_vectors = true;
+    return 0;
 }
 
 int cbm_gbuf_store_vector(cbm_gbuf_t *gb, int64_t node_id, const uint8_t *vector, int vector_len) {
@@ -1139,6 +1170,16 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
+static bool edge_properties_should_replace(const char *existing, const char *candidate) {
+    if (!candidate || strcmp(candidate, "{}") == 0) {
+        return false;
+    }
+    if (!existing || strcmp(existing, "{}") == 0) {
+        return true;
+    }
+    return strcmp(candidate, existing) < 0;
+}
+
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json) {
     if (!gb || !type) {
@@ -1151,10 +1192,14 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
-        /* Merge properties (just replace for now) */
-        if (properties_json && strcmp(properties_json, "{}") != 0) {
-            free(existing->properties_json);
-            existing->properties_json = heap_strdup(properties_json);
+        /* Pick one canonical value so parallel worker merge order cannot
+         * change the retained properties for a deduplicated edge. */
+        if (edge_properties_should_replace(existing->properties_json, properties_json)) {
+            char *replacement = heap_strdup(properties_json);
+            if (replacement) {
+                free(existing->properties_json);
+                existing->properties_json = replacement;
+            }
         }
         return existing->id;
     }
@@ -1884,6 +1929,35 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
 }
 
 int cbm_gbuf_prepare_zova_dump(cbm_gbuf_t *gb) {
+    int rc = cbm_gbuf_dump_to_sqlite(gb, NULL);
+    if (rc != 0) return rc;
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    cbm_zova_workspace_generation_input_t input = {
+        .root_path = gb->root_path,
+        .project = gb->project,
+        .indexed_at = gb->indexed_at,
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = CBM_SEM_DIM,
+        .nodes = gb->zova_dump_nodes,
+        .node_count = gb->zova_dump_node_count,
+        .edges = gb->zova_dump_edges,
+        .edge_count = gb->zova_dump_edge_count,
+        .node_vectors = gb->dump_vectors,
+        .node_vector_count = gb->dump_vector_count,
+        .token_vectors = gb->dump_token_vecs,
+        .token_vector_count = gb->dump_token_vec_count,
+    };
+    cbm_zova_prepared_view_t *view = NULL;
+    if (cbm_zova_workspace_id_for_root(gb->root_path, workspace_id,
+                                        sizeof(workspace_id)) != 0 ||
+        cbm_zova_prepared_view_build_base(workspace_id, &input, &view) != 0)
+        return CBM_NOT_FOUND;
+    cbm_zova_prepared_view_free(gb->zova_prepared_view);
+    gb->zova_prepared_view = view;
+    return 0;
+}
+
+int cbm_gbuf_prepare_zova_dump_delta(cbm_gbuf_t *gb) {
     return cbm_gbuf_dump_to_sqlite(gb, NULL);
 }
 
@@ -1906,7 +1980,7 @@ int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path) {
 }
 
 int cbm_gbuf_publish_zova_user_database(
-    const cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
+    cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
     int file_hash_count, const cbm_zova_project_summary_input_t *project_summary,
     cbm_zova_workspace_generation_result_t *out_result) {
     if (!gb || !out_result || file_hash_count < 0 ||
@@ -1942,14 +2016,21 @@ int cbm_gbuf_publish_zova_user_database(
         .project_summary = project_summary ? *project_summary : (cbm_zova_project_summary_input_t){0},
     };
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
-    cbm_zova_publish_model_t *model = NULL;
-    if (cbm_zova_workspace_id_for_root(input.root_path, workspace_id,
-                                        sizeof(workspace_id)) != 0 ||
-        cbm_zova_publish_model_build(workspace_id, &input, &model) != 0) {
-        return CBM_NOT_FOUND;
+    cbm_zova_prepared_view_t *view = gb->zova_prepared_view;
+    bool owned_view = false;
+    int rc = cbm_zova_workspace_id_for_root(input.root_path, workspace_id,
+                                             sizeof(workspace_id));
+    if (rc == 0 && !view) {
+        rc = cbm_zova_prepared_view_build(workspace_id, &input, &view);
+        owned_view = rc == 0;
+    } else if (rc == 0) {
+        rc = cbm_zova_prepared_view_complete(
+            view, file_hashes, file_hash_count, project_summary);
     }
-    int rc = cbm_zova_user_database_publish_model(user_database_path, model, out_result);
-    cbm_zova_publish_model_free(model);
+    if (rc == 0)
+        rc = cbm_zova_user_database_publish_prepared_view(user_database_path, view,
+                                                          out_result);
+    if (owned_view) cbm_zova_prepared_view_free(view);
     return rc;
 }
 
@@ -1982,6 +2063,11 @@ int cbm_gbuf_publish_zova_user_database_delta(
     int rc=cbm_zova_workspace_id_for_root(input.root_path,workspace_id,sizeof(workspace_id));
     if(rc==0&&strcmp(workspace_id,before->workspace_id)!=0)rc=-1;
     if(rc==0)rc=cbm_zova_publish_model_build(workspace_id,&input,&model);
+    if (rc == 0 && gb->reuse_zova_semantic_vectors)
+        rc = cbm_zova_publish_model_reuse_vector_digests(
+            model, &before->integrity,
+            CBM_ZOVA_SNAPSHOT_COMPONENT_NODE_VECTORS |
+                CBM_ZOVA_SNAPSHOT_COMPONENT_TOKEN_VECTORS);
     cbm_zova_snapshot_components_t required=CBM_ZOVA_SNAPSHOT_COMPONENT_NONE;
     if(rc==0)rc=cbm_zova_workspace_delta_required_components(before,model,&required);
     if(rc==0&&required!=CBM_ZOVA_SNAPSHOT_COMPONENT_NONE)

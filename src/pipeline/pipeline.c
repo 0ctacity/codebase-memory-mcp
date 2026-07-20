@@ -993,8 +993,9 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                     p->saved_summary_valid = true;
                 }
                 cbm_zova_workspace_snapshot_t snapshot = {0};
-                if (cbm_zova_repository_export_incremental_snapshot(
-                        zova_path, workspace_id, &snapshot) == 0) {
+                cbm_gbuf_t *preloaded = cbm_gbuf_new(p->project_name, p->repo_path);
+                if (preloaded && cbm_zova_repository_export_incremental_snapshot_to_graph(
+                        zova_path, workspace_id, &snapshot, preloaded) == 0) {
                     int hash_count = snapshot.file_hash_count;
                     if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
                         cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
@@ -1005,7 +1006,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                         cbm_zova_repository_close(repo);
                         p->last_route = CBM_PIPELINE_ROUTE_INCREMENTAL;
                         int rc = cbm_pipeline_run_incremental_zova(p, zova_path, files, file_count,
-                                                                   &snapshot);
+                                                                   &snapshot, preloaded);
+                        preloaded = NULL;
                         cbm_zova_workspace_snapshot_free(&snapshot);
                         return rc == 0 ? 0 : PIPELINE_INCREMENTAL_FATAL;
                     }
@@ -1016,6 +1018,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
                     }
                     cbm_zova_workspace_snapshot_free(&snapshot);
                 }
+                cbm_gbuf_free(preloaded);
                 cbm_zova_repository_close(repo);
             }
         }
@@ -1190,12 +1193,33 @@ static int pipeline_publish_zova_user_database(
         .native_graph_nodes_ms = result.native_graph_nodes_ms,
         .native_graph_edges_ms = result.native_graph_edges_ms,
         .native_graph_validate_ms = result.native_graph_validate_ms,
+        .native_graph_key_generation_ms = result.native_graph_key_generation_ms,
         .native_graph_cleanup_ms = result.native_graph_cleanup_ms,
         .native_vectors_ms = result.native_vectors_ms,
+        .fresh_validation_ms = result.fresh_validation_ms,
+        .fresh_index_ms = result.fresh_index_ms,
+        .fresh_commit_ms = result.fresh_commit_ms,
+        .fresh_build_ms = result.fresh_build_ms,
         .readback_ms = result.readback_ms,
         .snapshot_completed = before != NULL,
         .snapshot_base_ms = before ? before->metrics.base_ms : 0.0,
         .snapshot_optional_ms = before ? before->metrics.optional_ms : 0.0,
+        .snapshot_open_ms = before ? before->metrics.open_ms : 0.0,
+        .snapshot_header_ms = before ? before->metrics.header_ms : 0.0,
+        .snapshot_integrity_ms = before ? before->metrics.integrity_ms : 0.0,
+        .snapshot_nodes_sql_ms = before ? before->metrics.nodes_sql_ms : 0.0,
+        .snapshot_nodes_native_ms = before ? before->metrics.nodes_native_ms : 0.0,
+        .snapshot_nodes_finalize_ms = before ? before->metrics.nodes_finalize_ms : 0.0,
+        .snapshot_edges_sql_ms = before ? before->metrics.edges_sql_ms : 0.0,
+        .snapshot_edges_native_ms = before ? before->metrics.edges_native_ms : 0.0,
+        .snapshot_edges_finalize_ms = before ? before->metrics.edges_finalize_ms : 0.0,
+        .snapshot_hashes_summary_ms = before ? before->metrics.hashes_summary_ms : 0.0,
+        .snapshot_close_ms = before ? before->metrics.close_ms : 0.0,
+        .snapshot_graph_buffer_ms = before ? before->metrics.graph_buffer_ms : 0.0,
+        .snapshot_base_phase_mask = before ? before->metrics.base_phase_mask : 0,
+        .snapshot_node_rows = before ? before->metrics.node_rows : 0,
+        .snapshot_edge_rows = before ? before->metrics.edge_rows : 0,
+        .snapshot_file_hash_rows = before ? before->metrics.file_hash_rows : 0,
         .snapshot_hydrated_components = before ? before->hydrated_components : 0,
         .snapshot_topology_rows = before ? before->metrics.topology_rows : 0,
         .snapshot_node_vector_rows = before ? before->metrics.node_vector_rows : 0,

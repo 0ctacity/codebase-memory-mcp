@@ -112,6 +112,38 @@ TEST(configlink_key_symbol_exact_match) {
     PASS();
 }
 
+TEST(configlink_key_symbol_cap_is_insertion_order_independent) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Variable", "max_connections",
+                                   "test.config.max_connections", "config.toml",
+                                   0, 0, NULL), 0);
+
+    char name[64];
+    char qualified_name[128];
+    for (int i = 0; i < CBM_SZ_8K; i++) {
+        snprintf(name, sizeof(name), "filler_%05d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "test.zzz.%05d", i);
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", name, qualified_name,
+                                       "main.go", 0, 0, NULL), 0);
+    }
+
+    /* Insert the matching symbol after the bounded candidate set is full. */
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "getMaxConnections",
+                                   "test.aaa.getMaxConnections", "main.go",
+                                   0, 0, NULL), 0);
+
+    ASSERT_GT(run_configlink(gb, "test", NULL), 0);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gb, "CONFIGURES", &edges, &count), 0);
+    ASSERT_TRUE(has_strategy_with_key(edges, count, "key_symbol", "max_connections"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* Go: TestConfigKeySymbol_SubstringMatch
  * config.toml has request_timeout, main.go has getRequestTimeoutSeconds() */
 TEST(configlink_key_symbol_substring_match) {
@@ -295,6 +327,7 @@ TEST(configlink_file_ref_no_false_positive) {
 SUITE(configlink) {
     /* Strategy 1: Key → Symbol */
     RUN_TEST(configlink_key_symbol_exact_match);
+    RUN_TEST(configlink_key_symbol_cap_is_insertion_order_independent);
     RUN_TEST(configlink_key_symbol_substring_match);
     RUN_TEST(configlink_key_symbol_short_key_skipped);
     RUN_TEST(configlink_key_symbol_camel_case);

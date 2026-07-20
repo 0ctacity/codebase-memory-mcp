@@ -20,7 +20,7 @@ DISK_GUARD=${CBM_ZOVA_OPTIMIZATION_DISK_GUARD:-"$ROOT/scripts/zova-disk-guard.sh
 fail() { echo "error: $*" >&2; exit 1; }
 [[ -n "$REPO" && -n "$NAME" && -n "$RUN_ROOT" ]] ||
   fail "repository path, name, and run root are required"
-case "$NAME" in tops|motive|rvault|CBM) ;; *) fail "invalid repository name: $NAME";; esac
+case "$NAME" in tops|motive|rvault|rchat|deno|CBM) ;; *) fail "invalid repository name: $NAME";; esac
 case "$MUTATION" in digest-stable|source-change) ;;
   *) fail "mutation must be digest-stable or source-change";;
 esac
@@ -46,8 +46,7 @@ mkdir -p "$RUN_ROOT"
 RUN_ROOT=$(cd "$RUN_ROOT" && pwd -P)
 LOCK="$RUN_ROOT/.optimization.lock"
 CLONE="$RUN_ROOT/clone"
-PURE_CACHE="$RUN_ROOT/pure-cache"
-SINGLE_CACHE="$RUN_ROOT/single-cache"
+BENCHMARK_CACHE="$RUN_ROOT/benchmark-cache"
 REPORT="$RUN_ROOT/optimization-report.json"
 DECISION="$RUN_ROOT/optimization-gate.json"
 RUN_ID="$NAME-$MUTATION-optimization-attempt-$ATTEMPT-$(date -u +%Y%m%dT%H%M%SZ)-$$"
@@ -61,7 +60,7 @@ echo "ZOVA OPTIMIZATION repo=$NAME phase=clone" >&2
 git clone -q --shared --no-hardlinks "$REPO" "$CLONE"
 SOURCE_COMMIT=$(git -C "$CLONE" rev-parse HEAD)
 BUILD_SHA=$(shasum -a 256 "$BUILD" | awk '{print $1}')
-mkdir -p "$PURE_CACHE" "$SINGLE_CACHE" "$CLONE/zova_optimization_probe"
+mkdir -p "$BENCHMARK_CACHE" "$CLONE/zova_optimization_probe"
 MUTATION_FILE="$CLONE/zova_optimization_probe/probe.go"
 cat >"$MUTATION_FILE" <<'GO'
 package zova_optimization_probe
@@ -69,21 +68,21 @@ package zova_optimization_probe
 func OptimizationProbe() int { return 7 }
 GO
 
-run_state() {
-  local route=$1 workload=$2 cache=$3 report=$4 log=$5 mode
+run_workload() {
+  local workload=$1 pure_report=$2 single_report=$3 log=$4 mode
   if [[ "$workload" == incremental ]]; then mode=CBM_MODE_INCREMENTAL; else mode=CBM_MODE_FULL; fi
-  echo "ZOVA OPTIMIZATION repo=$NAME route=$route workload=$workload" >&2
-  CBM_ZOVA_TEST_CACHE_DIR="$cache" CBM_ZOVA_BUILD_SKIP=1 \
+  echo "ZOVA OPTIMIZATION repo=$NAME workload=$workload routes=pure,single" >&2
+  CBM_ZOVA_TEST_CACHE_DIR="$BENCHMARK_CACHE" CBM_ZOVA_BUILD_SKIP=1 \
   CBM_ZOVA_REAL_TEST_RUNNER="$TEST_RUNNER" \
   CBM_ZOVA_VALIDATION_REPO="$CLONE" \
-  CBM_ZOVA_OPTIMIZATION_REPORT="$report" \
-  CBM_ZOVA_OPTIMIZATION_ROUTE="$route" \
+  CBM_ZOVA_OPTIMIZATION_PURE_REPORT="$pure_report" \
+  CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT="$single_report" \
   CBM_ZOVA_OPTIMIZATION_WORKLOAD="$workload" \
   CBM_ZOVA_OPTIMIZATION_PIPELINE_MODE="$mode" \
   CBM_ZOVA_OPTIMIZATION_MUTATION="$MUTATION" \
   CBM_ZOVA_OPTIMIZATION_MUTATION_FILE="$MUTATION_FILE" \
   CBM_ZOVA_PROMOTION_STATE="$workload" \
-  CBM_ZOVA_PROMOTION_REPORT="$report" \
+  CBM_ZOVA_PROMOTION_REPORT="$single_report" \
   CBM_ZOVA_PROMOTION_REPOSITORY="$NAME" \
   CBM_ZOVA_PROMOTION_RUN_ID="$RUN_ID" \
   CBM_ZOVA_PROMOTION_ATTEMPT="$ATTEMPT" \
@@ -91,17 +90,17 @@ run_state() {
   CBM_ZOVA_SECTION9_CALIBRATION_MODE=0 \
   "$RUN_TESTS" zova_single_file_promotion_real_repo >"$log" 2>&1 || {
     tail -80 "$log" >&2 || true
-    fail "$route $workload state failed; diagnostics retained in $RUN_ROOT"
+    fail "$workload workload failed; diagnostics retained in $RUN_ROOT"
   }
-  [[ -s "$report" ]] || fail "$route $workload report is missing"
+  [[ -s "$pure_report" ]] || fail "pure $workload report is missing"
+  [[ -s "$single_report" ]] || fail "single $workload report is missing"
 }
 
 PURE_FULL="$RUN_ROOT/pure-full.json"
 SINGLE_FULL="$RUN_ROOT/single-full.json"
 PURE_INCREMENTAL="$RUN_ROOT/pure-incremental.json"
 SINGLE_INCREMENTAL="$RUN_ROOT/single-incremental.json"
-run_state pure full "$PURE_CACHE" "$PURE_FULL" "$RUN_ROOT/pure-full.log"
-run_state single full "$SINGLE_CACHE" "$SINGLE_FULL" "$RUN_ROOT/single-full.log"
+run_workload full "$PURE_FULL" "$SINGLE_FULL" "$RUN_ROOT/full.log"
 
 python3 - "$MUTATION_FILE" "$MUTATION" <<'PY'
 import pathlib, sys
@@ -118,10 +117,8 @@ else:
     raise SystemExit(f"unsupported mutation: {mutation}")
 PY
 
-run_state pure incremental "$PURE_CACHE" "$PURE_INCREMENTAL" \
-  "$RUN_ROOT/pure-incremental.log"
-run_state single incremental "$SINGLE_CACHE" "$SINGLE_INCREMENTAL" \
-  "$RUN_ROOT/single-incremental.log"
+run_workload incremental "$PURE_INCREMENTAL" "$SINGLE_INCREMENTAL" \
+  "$RUN_ROOT/incremental.log"
 
 python3 - "$PURE_FULL" "$SINGLE_FULL" "$PURE_INCREMENTAL" "$SINGLE_INCREMENTAL" \
   "$REPORT" "$NAME" "$SOURCE_COMMIT" "$BUILD_SHA" "$RUN_ID" "$MUTATION" \
@@ -169,5 +166,5 @@ else
     fail "optimization gate failed; diagnostics retained in $RUN_ROOT"
 fi
 
-rm -rf "$CLONE" "$PURE_CACHE" "$SINGLE_CACHE"
+rm -rf "$CLONE" "$BENCHMARK_CACHE"
 echo "ZOVA OPTIMIZATION repo=$NAME phase=complete" >&2

@@ -1244,11 +1244,15 @@ void simplecpp::TokenList::constFoldShift(Token *tok)
         if (!tok->next || !tok->next->number)
             continue;
 
+        const long long shift = stringToLL(tok->next->str());
+        if (shift < 0 || shift >= std::numeric_limits<unsigned long long>::digits)
+            throw std::overflow_error("invalid shift count");
+
         long long result;
         if (tok->str() == "<<")
-            result = stringToLL(tok->previous->str()) << stringToLL(tok->next->str());
+            result = stringToLL(tok->previous->str()) << shift;
         else if (tok->str() == ">>")
-            result = stringToLL(tok->previous->str()) >> stringToLL(tok->next->str());
+            result = stringToLL(tok->previous->str()) >> shift;
         else
             continue;
 

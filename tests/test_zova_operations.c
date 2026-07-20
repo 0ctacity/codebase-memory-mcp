@@ -556,14 +556,15 @@ static int operations_workspace_public_state_capture(
         snprintf(out->fts_qualified_name, sizeof(out->fts_qualified_name), "%s",
                  fts.results[0].node.qualified_name);
     }
-    char sql[512], stable_id[128] = {0};
+    char stable_id[128] = {0};
     if (rc == 0) {
-        snprintf(sql, sizeof(sql),
-                 "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT workspace_key "
-                 "FROM cbm_workspace_registry WHERE workspace_id='%s') "
-                 "AND qualified_name='rich.parse::alpha/beta?'",
-                 workspace_id);
-        rc = operations_text(path, sql, stable_id, sizeof(stable_id));
+        cbm_node_t node = {0};
+        rc = cbm_zova_repository_find_node_by_qn(
+                 repo, workspace_id, "rich.parse::alpha/beta?", &node);
+        if (rc == CBM_STORE_OK)
+            rc = cbm_zova_repository_stable_id_for_numeric_id(
+                repo, workspace_id, node.id, stable_id, sizeof(stable_id));
+        cbm_node_free_fields(&node);
     }
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
@@ -592,6 +593,21 @@ static int operations_workspace_public_state_capture(
     }
     cbm_zova_workspace_snapshot_free(&snapshot);
     return rc;
+}
+
+static int operations_stable_id_for_qn(const char *path, const char *project,
+                                       const char *workspace_id, const char *qualified_name,
+                                       char *out, size_t out_size) {
+    cbm_zova_repository_t *repo = cbm_zova_repository_open(path, project);
+    if (!repo) return -1;
+    cbm_node_t node = {0};
+    int rc = cbm_zova_repository_find_node_by_qn(repo, workspace_id, qualified_name, &node);
+    if (rc == CBM_STORE_OK)
+        rc = cbm_zova_repository_stable_id_for_numeric_id(
+            repo, workspace_id, node.id, out, out_size);
+    cbm_node_free_fields(&node);
+    cbm_zova_repository_close(repo);
+    return rc == CBM_STORE_OK ? 0 : -1;
 }
 
 static int operations_workspace_public_state_equal(
@@ -817,7 +833,7 @@ TEST(zova_operations_database_status_refuses_untrusted_inputs_without_writes) {
 
     ASSERT_EQ(cbm_zova_user_database_init(future), 0);
     ASSERT_EQ(operations_sql(future,
-                             "UPDATE cbm_database_schema_v1 SET schema_version=7 WHERE id=1"), 0);
+                             "UPDATE cbm_database_schema_v1 SET schema_version=8 WHERE id=1"), 0);
     ASSERT_EQ(operations_file_digest(future, before), 0);
     ASSERT_EQ(cbm_zova_database_status(future, &report), CBM_ZOVA_OPERATION_INCOMPATIBLE);
     ASSERT_EQ(operations_file_digest(future, after), 0);
@@ -902,11 +918,8 @@ TEST(zova_operations_workspace_delete_is_isolated_reported_and_idempotent) {
              "INSERT INTO cbm_workspace_health_v1"
              "(workspace_key,state,reason,checked_generation,checked_at) "
              "SELECT workspace_key,'healthy','checked',1,'2026-07-14T00:00:00Z' "
-             "FROM cbm_workspace_registry WHERE workspace_id='%s';"
-             "INSERT INTO cbm_project_summaries_v1(workspace_key,summary,updated_at) "
-             "SELECT workspace_key,'{\"legacy\":true}','2026-07-14T00:00:00Z' "
              "FROM cbm_workspace_registry WHERE workspace_id='%s'",
-             rich_a.workspace_id, rich_a.workspace_id);
+             rich_a.workspace_id);
     ASSERT_EQ(operations_sql(path, sql), 0);
 
     operations_workspace_state_t before_b = {0}, after_b = {0}, repeated_b = {0};
@@ -1658,13 +1671,13 @@ TEST(zova_operations_workspace_recover_quarantines_whole_file_without_replacemen
 }
 #endif
 
-TEST(zova_operations_empty_bootstrap_creates_exact_v6_health_schema) {
+TEST(zova_operations_empty_bootstrap_creates_exact_v7_health_schema) {
     char path[OPERATIONS_PATH_MAX];
     operations_path(path, sizeof(path), "empty-v5");
     ASSERT_EQ(cbm_zova_user_database_init(path), 0);
     ASSERT_EQ(operations_scalar(path,
                                 "SELECT schema_version FROM cbm_database_schema_v1 WHERE id=1"),
-              6);
+              CBM_ZOVA_DATABASE_SCHEMA_VERSION);
     char columns[128];
     ASSERT_EQ(operations_text(path,
                               "SELECT group_concat(name,',') FROM "
@@ -1683,7 +1696,7 @@ TEST(zova_operations_empty_bootstrap_creates_exact_v6_health_schema) {
     PASS();
 }
 
-TEST(zova_operations_pre_v6_init_requires_repack_without_writes) {
+TEST(zova_operations_pre_v7_init_requires_repack_without_writes) {
     char path[OPERATIONS_PATH_MAX];
     uint8_t before[CBM_SHA256_DIGEST_LEN], after[CBM_SHA256_DIGEST_LEN];
     operations_path(path, sizeof(path), "ordered-v1");
@@ -1719,7 +1732,7 @@ TEST(zova_operations_pre_v6_init_requires_repack_without_writes) {
     PASS();
 }
 
-TEST(zova_operations_v6_init_is_idempotent) {
+TEST(zova_operations_v7_init_is_idempotent) {
     char path[OPERATIONS_PATH_MAX];
     uint8_t before[CBM_SHA256_DIGEST_LEN], after[CBM_SHA256_DIGEST_LEN];
     operations_path(path, sizeof(path), "v5-idempotent");
@@ -1736,7 +1749,7 @@ TEST(zova_operations_v6_init_is_idempotent) {
     PASS();
 }
 
-TEST(zova_operations_malformed_v6_shape_is_rejected_without_writes) {
+TEST(zova_operations_malformed_v7_shape_is_rejected_without_writes) {
     char path[OPERATIONS_PATH_MAX];
     uint8_t before[CBM_SHA256_DIGEST_LEN], after[CBM_SHA256_DIGEST_LEN];
     operations_path(path, sizeof(path), "malformed-v5");
@@ -1757,12 +1770,12 @@ TEST(zova_operations_malformed_v6_shape_is_rejected_without_writes) {
     ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
     ASSERT_EQ(operations_scalar(path,
                                 "SELECT schema_version FROM cbm_database_schema_v1 WHERE id=1"),
-              6);
+              CBM_ZOVA_DATABASE_SCHEMA_VERSION);
     cbm_unlink(path);
     PASS();
 }
 
-TEST(zova_operations_malformed_v4_and_future_v7_fail_closed_without_writes) {
+TEST(zova_operations_malformed_v4_and_future_v8_fail_closed_without_writes) {
     char path[OPERATIONS_PATH_MAX];
     uint8_t before[CBM_SHA256_DIGEST_LEN], after[CBM_SHA256_DIGEST_LEN];
     char digest_before[256], digest_after[256];
@@ -1786,11 +1799,11 @@ TEST(zova_operations_malformed_v4_and_future_v7_fail_closed_without_writes) {
               0);
     cbm_unlink(path);
 
-    operations_path(path, sizeof(path), "future-v7");
+    operations_path(path, sizeof(path), "future-v8");
     ASSERT_EQ(cbm_zova_user_database_init(path), 0);
     ASSERT_EQ(operations_add_ready_workspace(path), 0);
     ASSERT_EQ(operations_sql(path,
-                             "UPDATE cbm_database_schema_v1 SET schema_version=7 WHERE id=1"),
+                             "UPDATE cbm_database_schema_v1 SET schema_version=8 WHERE id=1"),
               0);
     ASSERT_EQ(operations_ready_digest(path, digest_before, sizeof(digest_before)), 0);
     ASSERT_EQ(operations_file_digest(path, before), 0);
@@ -1801,12 +1814,12 @@ TEST(zova_operations_malformed_v4_and_future_v7_fail_closed_without_writes) {
     ASSERT_STR_EQ(digest_before, digest_after);
     ASSERT_EQ(operations_scalar(path,
                                 "SELECT schema_version FROM cbm_database_schema_v1 WHERE id=1"),
-              7);
+              8);
     cbm_unlink(path);
     PASS();
 }
 
-TEST(zova_operations_interrupted_v6_bootstrap_rolls_back_and_retries_once) {
+TEST(zova_operations_interrupted_v7_bootstrap_rolls_back_and_retries_once) {
     char path[OPERATIONS_PATH_MAX];
     operations_path(path, sizeof(path), "interrupt-v6");
     cbm_setenv("CBM_ZOVA_TEST_FAIL_PHASE", "schema_v6_before_commit", 1);
@@ -1820,7 +1833,7 @@ TEST(zova_operations_interrupted_v6_bootstrap_rolls_back_and_retries_once) {
     ASSERT_EQ(cbm_zova_user_database_init(path), 0);
     ASSERT_EQ(operations_scalar(path,
                                 "SELECT schema_version FROM cbm_database_schema_v1 WHERE id=1"),
-              6);
+              CBM_ZOVA_DATABASE_SCHEMA_VERSION);
     ASSERT_EQ(operations_scalar(path,
                                 "SELECT count(*) FROM sqlite_master WHERE type='table' AND "
                                 "name='cbm_workspace_health_v1'"),
@@ -2200,7 +2213,7 @@ TEST(zova_operations_database_archive_refuses_untrusted_inputs_without_live_writ
     ASSERT_EQ(cbm_zova_database_import(live, archives[0], true, &report),
               CBM_ZOVA_OPERATION_INCOMPATIBLE);
     ASSERT_EQ(operations_manifest_replace_char(
-                  archives[1], "\"schema_version\":6", strlen("\"schema_version\":"), '7'),
+                  archives[1], "\"schema_version\":7", strlen("\"schema_version\":"), '8'),
               0);
     ASSERT_EQ(cbm_zova_database_import(live, archives[1], true, &report),
               CBM_ZOVA_OPERATION_INCOMPATIBLE);
@@ -2338,13 +2351,14 @@ TEST(zova_operations_workspace_export_is_fresh_rich_and_single_workspace) {
     ASSERT(saw_punctuation);
     ASSERT(saw_raw_i8);
 
-    char sql[512], source_local_id[128], archive_local_id[128];
-    snprintf(sql, sizeof(sql), "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT "
-                               "workspace_key FROM cbm_workspace_registry WHERE workspace_id='%s') "
-                               "AND qualified_name='rich.parse::<local>#value'", rich.workspace_id);
-    ASSERT_EQ(operations_text(source, sql, source_local_id, sizeof(source_local_id)), 0);
+    char source_local_id[128], archive_local_id[128];
+    ASSERT_EQ(operations_stable_id_for_qn(source, "workspace-rich", rich.workspace_id,
+                                          "rich.parse::<local>#value", source_local_id,
+                                          sizeof(source_local_id)), 0);
     ASSERT_TRUE(strncmp(source_local_id, "n:v2:", 5) == 0);
-    ASSERT_EQ(operations_text(data, sql, archive_local_id, sizeof(archive_local_id)), 0);
+    ASSERT_EQ(operations_stable_id_for_qn(data, "workspace-rich", rich.workspace_id,
+                                          "rich.parse::<local>#value", archive_local_id,
+                                          sizeof(archive_local_id)), 0);
     ASSERT_STR_EQ(archive_local_id, source_local_id);
 
     cbm_zova_repository_t *repo = cbm_zova_repository_open(data, "workspace-rich");
@@ -2521,12 +2535,10 @@ TEST(zova_operations_workspace_import_adds_rich_workspace_without_touching_resid
                                          "resident-b", 2, &resident_b), 0);
     cbm_zova_workspace_snapshot_t before_b = {0};
     ASSERT_EQ(cbm_zova_repository_export_snapshot(resident, resident_b.workspace_id, &before_b), 0);
-    char b_id_sql[512], b_id_before[128], b_id_after[128];
-    snprintf(b_id_sql, sizeof(b_id_sql),
-             "SELECT node_id FROM cbm_nodes_v1 WHERE workspace_key=(SELECT workspace_key "
-             "FROM cbm_workspace_registry WHERE workspace_id='%s') "
-             "AND qualified_name='fixture.root_one'", resident_b.workspace_id);
-    ASSERT_EQ(operations_text(resident, b_id_sql, b_id_before, sizeof(b_id_before)), 0);
+    char b_id_before[128], b_id_after[128];
+    ASSERT_EQ(operations_stable_id_for_qn(resident, "resident-b", resident_b.workspace_id,
+                                          "fixture.root_one", b_id_before,
+                                          sizeof(b_id_before)), 0);
 
     ASSERT_EQ(cbm_zova_workspace_import(resident, archive, false, &report),
               CBM_ZOVA_OPERATION_OK);
@@ -2561,7 +2573,9 @@ TEST(zova_operations_workspace_import_adds_rich_workspace_without_touching_resid
         ASSERT_EQ(memcmp(after_b.token_vectors[i].vector, before_b.token_vectors[i].vector,
                          (size_t)before_b.token_vectors[i].vector_len), 0);
     }
-    ASSERT_EQ(operations_text(resident, b_id_sql, b_id_after, sizeof(b_id_after)), 0);
+    ASSERT_EQ(operations_stable_id_for_qn(resident, "resident-b", resident_b.workspace_id,
+                                          "fixture.root_one", b_id_after,
+                                          sizeof(b_id_after)), 0);
     ASSERT_STR_EQ(b_id_after, b_id_before);
     ASSERT_EQ(operations_scalar(archive_data, "SELECT count(*) FROM cbm_workspace_registry"), 1);
 
@@ -2751,7 +2765,7 @@ TEST(zova_operations_workspace_import_refuses_outer_archive_tampering_without_ta
     ASSERT_EQ(operations_file_digest(target, after), 0);
     ASSERT_EQ(memcmp(before, after, sizeof(before)), 0);
     ASSERT_EQ(operations_manifest_replace_char(
-                  archives[1], "\"schema_version\":6", strlen("\"schema_version\":"), '7'), 0);
+                  archives[1], "\"schema_version\":7", strlen("\"schema_version\":"), '8'), 0);
     ASSERT_EQ(cbm_zova_workspace_import(target, archives[1], false, &report),
               CBM_ZOVA_OPERATION_INCOMPATIBLE);
     ASSERT_EQ(operations_file_digest(target, after), 0);
@@ -3168,12 +3182,12 @@ SUITE(zova_operations) {
     RUN_TEST(zova_operations_whole_file_corruption_recovers_only_through_verified_restore);
     RUN_TEST(zova_operations_workspace_recover_quarantines_whole_file_without_replacement);
 #endif
-    RUN_TEST(zova_operations_empty_bootstrap_creates_exact_v6_health_schema);
-    RUN_TEST(zova_operations_pre_v6_init_requires_repack_without_writes);
-    RUN_TEST(zova_operations_v6_init_is_idempotent);
-    RUN_TEST(zova_operations_malformed_v6_shape_is_rejected_without_writes);
-    RUN_TEST(zova_operations_malformed_v4_and_future_v7_fail_closed_without_writes);
-    RUN_TEST(zova_operations_interrupted_v6_bootstrap_rolls_back_and_retries_once);
+    RUN_TEST(zova_operations_empty_bootstrap_creates_exact_v7_health_schema);
+    RUN_TEST(zova_operations_pre_v7_init_requires_repack_without_writes);
+    RUN_TEST(zova_operations_v7_init_is_idempotent);
+    RUN_TEST(zova_operations_malformed_v7_shape_is_rejected_without_writes);
+    RUN_TEST(zova_operations_malformed_v4_and_future_v8_fail_closed_without_writes);
+    RUN_TEST(zova_operations_interrupted_v7_bootstrap_rolls_back_and_retries_once);
 #if CBM_WITH_ZOVA
     RUN_TEST(zova_operations_repository_snapshot_is_owned_and_workspace_filtered);
     RUN_TEST(zova_operations_workspace_export_is_fresh_rich_and_single_workspace);

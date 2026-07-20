@@ -11,7 +11,7 @@ struct cbm_zova_workspace_delta {
     const cbm_zova_publish_node_t **node_updates;
     char **node_deletes;
     const cbm_zova_publish_edge_t **edge_inserts;
-    char **edge_deletes;
+    cbm_zova_delta_edge_delete_t *edge_deletes;
     cbm_zova_delta_topology_edge_t *topology_inserts;
     cbm_zova_delta_topology_edge_t *topology_deletes;
     const cbm_zova_publish_node_vector_t **node_vector_upserts;
@@ -49,6 +49,27 @@ static int sorted_unique(char *const *ids, int count) {
     if (count < 0 || (count > 0 && !ids)) return 0;
     for (int i = 0; i < count; i++) {
         if (!ids[i] || (i > 0 && strcmp(ids[i - 1], ids[i]) >= 0)) return 0;
+    }
+    return 1;
+}
+
+enum { DELTA_EDGE_ID_CAP = CBM_ZOVA_WORKSPACE_ID_MAX + 80 };
+
+static int snapshot_edge_id_at(const cbm_zova_workspace_snapshot_t *snapshot, int index,
+                               char out[DELTA_EDGE_ID_CAP]) {
+    return cbm_zova_workspace_snapshot_format_edge_id(
+        snapshot, index, out, DELTA_EDGE_ID_CAP);
+}
+
+static int snapshot_edge_ids_sorted_unique(const cbm_zova_workspace_snapshot_t *snapshot) {
+    if (!snapshot || snapshot->edge_count < 0 ||
+        (snapshot->edge_count > 0 && (!snapshot->edges || !snapshot->edge_ids))) return 0;
+    char previous[DELTA_EDGE_ID_CAP] = {0};
+    char current[DELTA_EDGE_ID_CAP] = {0};
+    for (int i = 0; i < snapshot->edge_count; i++) {
+        if (snapshot_edge_id_at(snapshot, i, current) != 0 ||
+            (i > 0 && strcmp(previous, current) >= 0)) return 0;
+        memcpy(previous, current, sizeof(previous));
     }
     return 1;
 }
@@ -264,20 +285,40 @@ static int build_edges(cbm_zova_workspace_delta_t *delta,
                        const cbm_zova_publish_model_t *after) {
     int left = 0, right = 0, right_count = cbm_zova_publish_model_edge_count(after);
     while (left < before->edge_count || right < right_count) {
+        char before_edge_id[DELTA_EDGE_ID_CAP] = {0};
+        if (left < before->edge_count &&
+            snapshot_edge_id_at(before, left, before_edge_id) != 0) return -1;
         const cbm_zova_publish_edge_t *edge =
             right < right_count ? cbm_zova_publish_model_edge_at(after, right) : NULL;
         int order = left >= before->edge_count ? 1 : right >= right_count ? -1
-                    : strcmp(before->edge_ids[left], edge->edge_id);
+                    : strcmp(before_edge_id, edge->edge_id);
         if (order < 0) {
-            if (append_delete(delta->edge_deletes, &delta->metrics.edge_deletes,
-                              before->edge_ids[left++]) != 0) return -1;
+            const CBMDumpEdge *old = &before->edges[left];
+            cbm_zova_delta_edge_delete_t *deleted =
+                &delta->edge_deletes[delta->metrics.edge_deletes++];
+            deleted->edge_id = delta_dup(before_edge_id);
+            deleted->source_stable_id = delta_dup(before->node_stable_ids[old->source_id - 1]);
+            deleted->edge_type = delta_dup(old->type);
+            deleted->target_stable_id = delta_dup(before->node_stable_ids[old->target_id - 1]);
+            deleted->local_name = delta_dup(old->local_name ? old->local_name : "");
+            if (!deleted->edge_id || !deleted->source_stable_id || !deleted->edge_type ||
+                !deleted->target_stable_id || !deleted->local_name) return -1;
+            left++;
         } else if (order > 0) {
             delta->edge_inserts[delta->metrics.edge_inserts++] = edge;
             right++;
         } else {
             if (!edge_equal(before, left, edge)) {
-                if (append_delete(delta->edge_deletes, &delta->metrics.edge_deletes,
-                                  before->edge_ids[left]) != 0) return -1;
+                const CBMDumpEdge *old = &before->edges[left];
+                cbm_zova_delta_edge_delete_t *deleted =
+                    &delta->edge_deletes[delta->metrics.edge_deletes++];
+                deleted->edge_id = delta_dup(before_edge_id);
+                deleted->source_stable_id = delta_dup(before->node_stable_ids[old->source_id - 1]);
+                deleted->edge_type = delta_dup(old->type);
+                deleted->target_stable_id = delta_dup(before->node_stable_ids[old->target_id - 1]);
+                deleted->local_name = delta_dup(old->local_name ? old->local_name : "");
+                if (!deleted->edge_id || !deleted->source_stable_id || !deleted->edge_type ||
+                    !deleted->target_stable_id || !deleted->local_name) return -1;
                 delta->edge_inserts[delta->metrics.edge_inserts++] = edge;
             }
             left++; right++;
@@ -358,7 +399,7 @@ static int build_token_vectors(cbm_zova_workspace_delta_t *delta,
         if (order < 0) {
             if (append_delete(delta->token_vector_deletes,
                               &delta->metrics.token_vector_deletes,
-                              before->token_vector_ids[left++]) != 0) return -1;
+                              before->token_vectors[left++].token) != 0) return -1;
         } else if (order > 0) {
             delta->token_vector_upserts[delta->metrics.token_vector_upserts++] = vector;
             right++;
@@ -406,7 +447,7 @@ int cbm_zova_workspace_delta_build(const cbm_zova_workspace_snapshot_t *before,
         (before->hydrated_components & required) != required ||
         (before->node_count > 0 && !before->node_source_ordinals) ||
         !sorted_unique(before->node_stable_ids, before->node_count) ||
-        !sorted_unique(before->edge_ids, before->edge_count) ||
+        !snapshot_edge_ids_sorted_unique(before) ||
         ((required & CBM_ZOVA_SNAPSHOT_COMPONENT_NODE_VECTORS) &&
          !sorted_unique(before->node_vector_ids, before->node_vector_count)) ||
         ((required & CBM_ZOVA_SNAPSHOT_COMPONENT_TOKEN_VECTORS) &&
@@ -444,7 +485,13 @@ int64_t cbm_zova_workspace_delta_expected_generation(
 void cbm_zova_workspace_delta_free(cbm_zova_workspace_delta_t *delta) {
     if (!delta) return;
     for (uint64_t i = 0; i < delta->metrics.node_deletes; i++) free(delta->node_deletes[i]);
-    for (uint64_t i = 0; i < delta->metrics.edge_deletes; i++) free(delta->edge_deletes[i]);
+    for (uint64_t i = 0; i < delta->metrics.edge_deletes; i++) {
+        free((char *)delta->edge_deletes[i].edge_id);
+        free((char *)delta->edge_deletes[i].source_stable_id);
+        free((char *)delta->edge_deletes[i].edge_type);
+        free((char *)delta->edge_deletes[i].target_stable_id);
+        free((char *)delta->edge_deletes[i].local_name);
+    }
     for (uint64_t i = 0; i < delta->metrics.topology_deletes; i++) {
         free((char *)delta->topology_deletes[i].source_stable_id);
         free((char *)delta->topology_deletes[i].edge_type);
@@ -476,7 +523,6 @@ DELTA_GETTER(node_insert, const cbm_zova_publish_node_t *, node_inserts, node_in
 DELTA_GETTER(node_update, const cbm_zova_publish_node_t *, node_updates, node_updates)
 DELTA_GETTER(node_delete, const char *, node_deletes, node_deletes)
 DELTA_GETTER(edge_insert, const cbm_zova_publish_edge_t *, edge_inserts, edge_inserts)
-DELTA_GETTER(edge_delete, const char *, edge_deletes, edge_deletes)
 DELTA_GETTER(node_vector_upsert, const cbm_zova_publish_node_vector_t *, node_vector_upserts, node_vector_upserts)
 DELTA_GETTER(node_vector_delete, const char *, node_vector_deletes, node_vector_deletes)
 DELTA_GETTER(token_vector_upsert, const cbm_zova_publish_token_vector_t *, token_vector_upserts, token_vector_upserts)
@@ -484,6 +530,12 @@ DELTA_GETTER(token_vector_delete, const char *, token_vector_deletes, token_vect
 DELTA_GETTER(file_hash_upsert, const cbm_zova_file_hash_input_t *, file_hash_upserts, file_hash_upserts)
 DELTA_GETTER(file_hash_delete, const char *, file_hash_deletes, file_hash_deletes)
 #undef DELTA_GETTER
+
+const cbm_zova_delta_edge_delete_t *cbm_zova_workspace_delta_edge_delete_at(
+    const cbm_zova_workspace_delta_t *delta, int index) {
+    return delta && index >= 0 && (uint64_t)index < delta->metrics.edge_deletes
+        ? &delta->edge_deletes[index] : NULL;
+}
 
 const cbm_zova_delta_topology_edge_t *cbm_zova_workspace_delta_topology_insert_at(
     const cbm_zova_workspace_delta_t *delta, int index) {

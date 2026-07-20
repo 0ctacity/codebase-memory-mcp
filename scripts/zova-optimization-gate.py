@@ -72,6 +72,12 @@ ZERO_FIELDS = (
 )
 COUNT_FIELDS = ("full_fallback_count", "full_clear_count", "unchanged_rewrite_count")
 SNAPSHOT_ROW_FIELDS = ("topology_rows", "node_vector_rows", "token_vector_rows")
+SNAPSHOT_BASE_ROW_FIELDS = ("node_rows", "edge_rows", "file_hash_rows")
+SNAPSHOT_BASE_TIMING_FIELDS = (
+    "open_ms", "header_ms", "integrity_ms", "nodes_sql_ms", "nodes_native_ms",
+    "nodes_finalize_ms", "edges_sql_ms", "edges_native_ms", "edges_finalize_ms",
+    "hashes_summary_ms", "close_ms", "graph_buffer_ms",
+)
 STATEMENT_PHASES = (
     "canonical_files",
     "canonical_nodes",
@@ -194,6 +200,14 @@ def _state(value: Any, index: int) -> dict[str, Any]:
                           f"states[{index}].snapshot.generation")
     _number(snapshot.get("base_ms"), f"states[{index}].snapshot.base_ms")
     _number(snapshot.get("optional_ms"), f"states[{index}].snapshot.optional_ms")
+    base_phase_mask = _integer(snapshot.get("base_phase_mask"),
+                               f"states[{index}].snapshot.base_phase_mask")
+    for field in SNAPSHOT_BASE_TIMING_FIELDS:
+        _number(snapshot.get(field), f"states[{index}].snapshot.{field}")
+    base_rows = {
+        field: _integer(snapshot.get(field), f"states[{index}].snapshot.{field}")
+        for field in SNAPSHOT_BASE_ROW_FIELDS
+    }
     components = _integer(snapshot.get("hydrated_components"),
                           f"states[{index}].snapshot.hydrated_components")
     if components & ~0x7:
@@ -207,7 +221,10 @@ def _state(value: Any, index: int) -> dict[str, Any]:
         raise ValueError(f"states[{index}].snapshot.completed must be {str(expected_snapshot).lower()}")
     if expected_snapshot and generation <= 0:
         raise ValueError(f"states[{index}].snapshot.generation must be positive")
+    if expected_snapshot and base_phase_mask != 0x7f:
+        raise ValueError(f"states[{index}].snapshot.base_phase_mask must be 127")
     if not expected_snapshot and (generation != 0 or components != 0 or
+                                  base_phase_mask != 0 or any(base_rows.values()) or
                                   any(snapshot_rows.values())):
         raise ValueError(f"states[{index}].snapshot must be empty outside single incremental")
     bit_rows = ((0x1, "topology_rows"), (0x2, "node_vector_rows"),
@@ -230,7 +247,7 @@ def _report(value: Any, label: str) -> dict[str, Any]:
     if _integer(report.get("schema_version"), f"{label}.schema_version") != SCHEMA_VERSION:
         raise ValueError(f"{label}.schema_version must be {SCHEMA_VERSION}")
     repository = _string(report.get("repository"), f"{label}.repository")
-    if repository not in ("tops", "motive", "rvault", "CBM"):
+    if repository not in ("tops", "motive", "rvault", "rchat", "deno", "CBM"):
         raise ValueError(f"{label}.repository is invalid")
     _digest(report.get("source_commit"), f"{label}.source_commit", 40)
     _digest(report.get("build_sha256"), f"{label}.build_sha256", 64)
@@ -257,7 +274,7 @@ def _documented_baseline(value: Any) -> dict[str, Any]:
     if _string(baseline.get("baseline_kind"), "baseline.baseline_kind") != "documented_pre_v6":
         raise ValueError("baseline.baseline_kind must be documented_pre_v6")
     repository = _string(baseline.get("repository"), "baseline.repository")
-    if repository not in ("tops", "motive", "rvault", "CBM"):
+    if repository not in ("tops", "motive", "rvault", "rchat", "deno", "CBM"):
         raise ValueError("baseline.repository is invalid")
     _string(baseline.get("run_id"), "baseline.run_id")
     sources = _list(baseline.get("source_documents"), "baseline.source_documents")
@@ -545,11 +562,12 @@ def aggregate_baseline(sample_values: list[Any]) -> dict[str, Any]:
             )
         snapshot_states = [item["snapshot"] for item in source_states]
         state["snapshot"]["completed"] = all(item["completed"] for item in snapshot_states)
-        for field in ("generation", "hydrated_components") + SNAPSHOT_ROW_FIELDS:
+        for field in (("generation", "hydrated_components", "base_phase_mask") +
+                      SNAPSHOT_ROW_FIELDS + SNAPSHOT_BASE_ROW_FIELDS):
             state["snapshot"][field] = int(
                 statistics.median(item[field] for item in snapshot_states)
             )
-        for field in ("base_ms", "optional_ms"):
+        for field in ("base_ms", "optional_ms") + SNAPSHOT_BASE_TIMING_FIELDS:
             state["snapshot"][field] = float(
                 statistics.median(item[field] for item in snapshot_states)
             )

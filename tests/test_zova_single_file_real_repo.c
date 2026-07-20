@@ -36,6 +36,14 @@
 static int single_file_sql_count(sqlite3 *db, const char *sql, const char *bind,
                                  int64_t *out);
 
+static size_t single_file_cypher_case_count(int64_t node_count, size_t total_cases) {
+    enum { LARGE_REPOSITORY_NODE_COUNT = 50000, LARGE_REPOSITORY_CASE_COUNT = 10 };
+    if (node_count > LARGE_REPOSITORY_NODE_COUNT &&
+        total_cases > LARGE_REPOSITORY_CASE_COUNT)
+        return LARGE_REPOSITORY_CASE_COUNT;
+    return total_cases;
+}
+
 enum { SINGLE_FILE_PUBLIC_RESPONSE_COUNT = 8 };
 
 typedef struct {
@@ -177,6 +185,7 @@ static int single_file_public_response_mismatches(
 
 typedef struct {
     int64_t sqlite_id;
+    int64_t snapshot_id;
     char stable_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
 } single_file_node_ref_t;
 
@@ -187,6 +196,13 @@ static int single_file_compare_cypher(const char *source_path, const char *zova_
     cbm_store_t *source = cbm_store_open_path_query(source_path);
     cbm_store_t *flagged = cbm_store_open_zova_workspace_query(zova_path, workspace_id);
     if (!source || !flagged) { if (source) cbm_store_close(source); if (flagged) cbm_store_close(flagged); return -1; }
+    sqlite3 *flagged_db = cbm_store_get_db(flagged);
+    int64_t node_count = 0;
+    if (!flagged_db ||
+        single_file_sql_count(flagged_db, "SELECT count(*) FROM cbm_nodes_v1", NULL,
+                              &node_count) != 0) {
+        cbm_store_close(flagged); cbm_store_close(source); return -1;
+    }
     sqlite3_stmt *sample_stmt = NULL;
     char source_qn[1024] = {0}, target_qn[1024] = {0};
     if (sqlite3_prepare_v2(cbm_store_get_db(source),
@@ -225,9 +241,13 @@ static int single_file_compare_cypher(const char *source_path, const char *zova_
         {"MATCH (n:Function) RETURN n.name ORDER BY n.name LIMIT 0", 1000},
         {rel_out, 5}, {rel_in, 5}, {rel_both, 5}, {rel_props, 5}, {rel_bounded, 5},
     };
+    size_t case_count = single_file_cypher_case_count(
+        node_count, sizeof(cases) / sizeof(cases[0]));
+    fprintf(stderr, "cypher parity cases=%zu nodes=%lld\n", case_count,
+            (long long)node_count);
     int mismatches = 0;
     *native_routes = *compat_routes = *ordering_mismatches = 0;
-    for (size_t qi = 0; qi < sizeof(cases) / sizeof(cases[0]); ++qi) {
+    for (size_t qi = 0; qi < case_count; ++qi) {
         const char *query = cases[qi].query;
         cbm_query_t *plan = NULL; char *error = NULL; const char *reason = NULL;
         if (cbm_cypher_parse(query, &plan, &error) != 0) { free(error); mismatches++; continue; }
@@ -263,6 +283,10 @@ static int single_file_text_equal(sqlite3_stmt *left, int left_column,
                                   const char *left_fallback, const char *right_fallback) {
     return strcmp(single_file_text(left, left_column, left_fallback),
                   single_file_text(right, right_column, right_fallback)) == 0;
+}
+
+static const char *single_file_nonnull(const char *value, const char *fallback) {
+    return value ? value : fallback;
 }
 
 static const char *single_file_node_ref_find(const single_file_node_ref_t *refs, int count,
@@ -399,64 +423,392 @@ static int single_file_compare_nodes(sqlite3 *source, sqlite3 *user, const char 
 static int single_file_compare_edges(sqlite3 *source, sqlite3 *user, const char *project,
                                      const char *workspace_id, const single_file_node_ref_t *refs,
                                      int ref_count) {
+    if (!source || !user || !project || !workspace_id || ref_count < 0 ||
+        (ref_count > 0 && !refs)) return -1;
     sqlite3_stmt *source_stmt = NULL;
     sqlite3_stmt *user_stmt = NULL;
+    sqlite3_stmt *ref_insert = NULL;
     int mismatches = 0;
-    if (sqlite3_prepare_v2(
-            source,
-            "SELECT source_id,target_id,type,properties,url_path_gen,local_name_gen "
-            "FROM edges WHERE project=?1 ORDER BY id",
-            -1, &source_stmt, NULL) != SQLITE_OK ||
-        sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
-        sqlite3_prepare_v2(
-            user,
-            "SELECT target.node_id,e.edge_type,e.properties,e.url_path,e.local_name "
-            "FROM cbm_edges_v1 AS e INDEXED BY cbm_edges_v1_source_type "
-            "JOIN cbm_nodes_v1 target ON target.node_key=e.target_node_key "
-            "WHERE e.workspace_key=(SELECT workspace_key FROM cbm_workspace_registry "
-            "WHERE workspace_id=?1) AND e.source_node_key=(SELECT n.node_key "
-            "FROM cbm_nodes_v1 n JOIN cbm_workspace_registry r USING(workspace_key) "
-            "WHERE r.workspace_id=?1 AND n.node_id=?2) AND e.edge_type=?3",
-            -1, &user_stmt, NULL) != SQLITE_OK) {
-        if (source_stmt) sqlite3_finalize(source_stmt);
-        if (user_stmt) sqlite3_finalize(user_stmt);
+    if (sqlite3_exec(user,
+                     "PRAGMA temp_store=MEMORY;"
+                     "DROP TABLE IF EXISTS temp.cbm_zsp_node_refs;"
+                     "CREATE TEMP TABLE cbm_zsp_node_refs("
+                     "sqlite_id INTEGER PRIMARY KEY,stable_id TEXT NOT NULL UNIQUE);"
+                     "BEGIN",
+                     NULL, NULL, NULL) != SQLITE_OK ||
+        sqlite3_prepare_v2(user,
+                           "INSERT INTO temp.cbm_zsp_node_refs(sqlite_id,stable_id) "
+                           "VALUES(?1,?2)",
+                           -1, &ref_insert, NULL) != SQLITE_OK) {
+        if (ref_insert) sqlite3_finalize(ref_insert);
+        sqlite3_exec(user, "ROLLBACK; DROP TABLE IF EXISTS temp.cbm_zsp_node_refs", NULL,
+                     NULL, NULL);
         return -1;
     }
-    while (sqlite3_step(source_stmt) == SQLITE_ROW) {
-        const char *source_id = single_file_node_ref_find(refs, ref_count,
-                                                            sqlite3_column_int64(source_stmt, 0));
-        const char *target_id = single_file_node_ref_find(refs, ref_count,
-                                                            sqlite3_column_int64(source_stmt, 1));
-        const char *type = single_file_text(source_stmt, 2, "");
-        const char *local_name = single_file_text(source_stmt, 5, "");
-        if (!source_id || !target_id) {
+    int rc = 0;
+    for (int i = 0; i < ref_count; i++) {
+        sqlite3_reset(ref_insert);
+        sqlite3_clear_bindings(ref_insert);
+        if (sqlite3_bind_int64(ref_insert, 1, refs[i].sqlite_id) != SQLITE_OK ||
+            sqlite3_bind_text(ref_insert, 2, refs[i].stable_id, -1, SQLITE_STATIC) != SQLITE_OK ||
+            sqlite3_step(ref_insert) != SQLITE_DONE) {
+            rc = -1;
+            break;
+        }
+    }
+    sqlite3_finalize(ref_insert);
+    ref_insert = NULL;
+    if (rc != 0 || sqlite3_exec(user, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) !=
+                           SQLITE_OK) {
+        sqlite3_exec(user, "ROLLBACK; DROP TABLE IF EXISTS temp.cbm_zsp_node_refs", NULL,
+                     NULL, NULL);
+        return -1;
+    }
+    static const char *source_sql =
+        "SELECT source_id,target_id,type,coalesce(properties,'{}'),"
+        "coalesce(url_path_gen,''),coalesce(local_name_gen,'') "
+        "FROM edges WHERE project=?1 "
+        "ORDER BY source_id,target_id,type,coalesce(local_name_gen,''),"
+        "coalesce(properties,'{}'),coalesce(url_path_gen,'')";
+    static const char *user_sql =
+        "SELECT source_ref.sqlite_id,target_ref.sqlite_id,e.edge_type,"
+        "coalesce(e.properties,'{}'),coalesce(e.url_path,''),coalesce(e.local_name,'') "
+        "FROM cbm_edges_v1 e "
+        "JOIN cbm_workspace_registry r ON r.workspace_key=e.workspace_key "
+        "JOIN cbm_nodes_v1 source_node ON source_node.node_key=e.source_node_key "
+        "JOIN cbm_nodes_v1 target_node ON target_node.node_key=e.target_node_key "
+        "JOIN temp.cbm_zsp_node_refs source_ref ON source_ref.stable_id=source_node.node_id "
+        "JOIN temp.cbm_zsp_node_refs target_ref ON target_ref.stable_id=target_node.node_id "
+        "WHERE r.workspace_id=?1 "
+        "ORDER BY source_ref.sqlite_id,target_ref.sqlite_id,e.edge_type,"
+        "coalesce(e.local_name,''),coalesce(e.properties,'{}'),coalesce(e.url_path,'')";
+    if (sqlite3_prepare_v2(source, source_sql, -1, &source_stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(source_stmt, 1, project, -1, SQLITE_STATIC) != SQLITE_OK ||
+        sqlite3_prepare_v2(user, user_sql, -1, &user_stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(user_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK) {
+        if (source_stmt) sqlite3_finalize(source_stmt);
+        if (user_stmt) sqlite3_finalize(user_stmt);
+        sqlite3_exec(user, "DROP TABLE IF EXISTS temp.cbm_zsp_node_refs", NULL, NULL, NULL);
+        return -1;
+    }
+    for (;;) {
+        int source_step = sqlite3_step(source_stmt);
+        int user_step = sqlite3_step(user_stmt);
+        if (source_step == SQLITE_DONE && user_step == SQLITE_DONE) break;
+        if (source_step != SQLITE_ROW || user_step != SQLITE_ROW) {
+            if (mismatches < 5)
+                fprintf(stderr, "edge parity stream length source_step=%d user_step=%d\n",
+                        source_step, user_step);
             mismatches++;
-            continue;
+            break;
         }
-        sqlite3_reset(user_stmt);
-        sqlite3_clear_bindings(user_stmt);
-        if (sqlite3_bind_text(user_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
-            sqlite3_bind_text(user_stmt, 2, source_id, -1, SQLITE_STATIC) != SQLITE_OK ||
-            sqlite3_bind_text(user_stmt, 3, type, -1, SQLITE_STATIC) != SQLITE_OK) {
-            mismatches++;
-            continue;
+        int row_mismatches = 0;
+        row_mismatches +=
+            sqlite3_column_int64(source_stmt, 0) != sqlite3_column_int64(user_stmt, 0);
+        row_mismatches +=
+            sqlite3_column_int64(source_stmt, 1) != sqlite3_column_int64(user_stmt, 1);
+        for (int column = 2; column < 6; column++) {
+            row_mismatches +=
+                !single_file_text_equal(source_stmt, column, user_stmt, column, "", "");
         }
-        int found = 0;
-        while (sqlite3_step(user_stmt) == SQLITE_ROW) {
-            if (strcmp(single_file_text(user_stmt, 0, ""), target_id) != 0 ||
-                strcmp(single_file_text(user_stmt, 4, ""), local_name) != 0) {
-                continue;
-            }
-            found++;
-            mismatches += !single_file_text_equal(source_stmt, 3, user_stmt, 2, "{}", "{}");
-            mismatches += !single_file_text_equal(source_stmt, 4, user_stmt, 3, "", "");
-            mismatches += !single_file_text_equal(source_stmt, 5, user_stmt, 4, "", "");
+        if (row_mismatches && mismatches < 5) {
+            fprintf(stderr,
+                    "edge parity row source=(%lld,%lld,%s,%s,%s,%s) "
+                    "user=(%lld,%lld,%s,%s,%s,%s)\n",
+                    (long long)sqlite3_column_int64(source_stmt, 0),
+                    (long long)sqlite3_column_int64(source_stmt, 1),
+                    single_file_text(source_stmt, 2, ""),
+                    single_file_text(source_stmt, 3, ""),
+                    single_file_text(source_stmt, 4, ""),
+                    single_file_text(source_stmt, 5, ""),
+                    (long long)sqlite3_column_int64(user_stmt, 0),
+                    (long long)sqlite3_column_int64(user_stmt, 1),
+                    single_file_text(user_stmt, 2, ""),
+                    single_file_text(user_stmt, 3, ""),
+                    single_file_text(user_stmt, 4, ""),
+                    single_file_text(user_stmt, 5, ""));
         }
-        if (found != 1) mismatches++;
+        mismatches += row_mismatches;
     }
     sqlite3_finalize(source_stmt);
     sqlite3_finalize(user_stmt);
+    sqlite3_exec(user, "DROP TABLE IF EXISTS temp.cbm_zsp_node_refs", NULL, NULL, NULL);
     return mismatches;
+}
+
+static int single_file_snapshot_node_index(
+    const cbm_zova_workspace_snapshot_t *snapshot, const char *stable_id) {
+    int low = 0;
+    int high = snapshot ? snapshot->node_count - 1 : -1;
+    while (low <= high) {
+        int mid = low + (high - low) / 2;
+        int order = strcmp(snapshot->node_stable_ids[mid], stable_id);
+        if (order == 0) return mid;
+        if (order < 0) low = mid + 1;
+        else high = mid - 1;
+    }
+    return -1;
+}
+
+static int single_file_compare_snapshot_nodes(
+    sqlite3 *source, const char *project, const char *workspace_id,
+    const cbm_zova_workspace_snapshot_t *snapshot, single_file_node_ref_t **out_refs,
+    int *out_count) {
+    if (!source || !project || !workspace_id || !snapshot || !out_refs || !out_count)
+        return -1;
+    *out_refs = NULL;
+    *out_count = 0;
+    int64_t count = 0;
+    if (single_file_sql_count(source, "SELECT count(*) FROM nodes WHERE project=?1", project,
+                              &count) != 0 || count != snapshot->node_count ||
+        count < 0 || count > INT32_MAX)
+        return count >= 0 && count <= INT32_MAX ? 1 : -1;
+    single_file_node_ref_t *refs = count ? calloc((size_t)count, sizeof(*refs)) : NULL;
+    if (count && !refs) return -1;
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(
+            source,
+            "SELECT id,project,label,name,qualified_name,file_path,start_line,end_line,properties "
+            "FROM nodes WHERE project=?1 ORDER BY id",
+            -1, &statement, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(statement, 1, project, -1, SQLITE_STATIC) != SQLITE_OK) {
+        if (statement) sqlite3_finalize(statement);
+        free(refs);
+        return -1;
+    }
+    int mismatches = 0;
+    int index = 0;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        if (index >= count) { mismatches++; break; }
+        const char *label = single_file_text(statement, 2, "");
+        const char *name = single_file_text(statement, 3, "");
+        const char *qualified_name = single_file_text(statement, 4, "");
+        const char *file_path = single_file_text(statement, 5, "");
+        char discriminator[512];
+        if (qualified_name[0])
+            snprintf(discriminator, sizeof(discriminator), "named:%s", qualified_name);
+        else
+            snprintf(discriminator, sizeof(discriminator), "local:%s:span:%d:%d", name,
+                     sqlite3_column_int(statement, 6), sqlite3_column_int(statement, 7));
+        refs[index].sqlite_id = sqlite3_column_int64(statement, 0);
+        if (cbm_zova_workspace_node_id_v2(
+                workspace_id, label, file_path, qualified_name, discriminator,
+                refs[index].stable_id, sizeof(refs[index].stable_id)) != 0) {
+            mismatches++;
+            index++;
+            continue;
+        }
+        int snapshot_index = single_file_snapshot_node_index(snapshot, refs[index].stable_id);
+        if (snapshot_index < 0) {
+            mismatches++;
+            index++;
+            continue;
+        }
+        refs[index].snapshot_id = snapshot_index + 1;
+        const CBMDumpNode *node = &snapshot->nodes[snapshot_index];
+        mismatches += strcmp(single_file_text(statement, 1, ""),
+                             single_file_nonnull(node->project, "")) != 0;
+        mismatches += strcmp(label, single_file_nonnull(node->label, "")) != 0;
+        mismatches += strcmp(name, single_file_nonnull(node->name, "")) != 0;
+        mismatches += strcmp(qualified_name,
+                             single_file_nonnull(node->qualified_name, "")) != 0;
+        mismatches += strcmp(file_path, single_file_nonnull(node->file_path, "")) != 0;
+        mismatches += sqlite3_column_int(statement, 6) != node->start_line;
+        mismatches += sqlite3_column_int(statement, 7) != node->end_line;
+        mismatches += strcmp(single_file_text(statement, 8, "{}"),
+                             single_file_nonnull(node->properties, "{}")) != 0;
+        index++;
+    }
+    sqlite3_finalize(statement);
+    if (index != count) mismatches++;
+    *out_refs = refs;
+    *out_count = index;
+    return mismatches;
+}
+
+typedef struct {
+    const CBMDumpEdge *edge;
+    int64_t source_sqlite_id;
+    int64_t target_sqlite_id;
+} single_file_snapshot_edge_ref_t;
+
+static int single_file_snapshot_edge_ref_compare(const void *left_ptr,
+                                                 const void *right_ptr) {
+    const single_file_snapshot_edge_ref_t *left = left_ptr;
+    const single_file_snapshot_edge_ref_t *right = right_ptr;
+    if (left->source_sqlite_id != right->source_sqlite_id)
+        return left->source_sqlite_id < right->source_sqlite_id ? -1 : 1;
+    if (left->target_sqlite_id != right->target_sqlite_id)
+        return left->target_sqlite_id < right->target_sqlite_id ? -1 : 1;
+    int order = strcmp(single_file_nonnull(left->edge->type, ""),
+                       single_file_nonnull(right->edge->type, ""));
+    if (order == 0)
+        order = strcmp(single_file_nonnull(left->edge->local_name, ""),
+                       single_file_nonnull(right->edge->local_name, ""));
+    if (order == 0)
+        order = strcmp(single_file_nonnull(left->edge->properties, "{}"),
+                       single_file_nonnull(right->edge->properties, "{}"));
+    if (order == 0)
+        order = strcmp(single_file_nonnull(left->edge->url_path, ""),
+                       single_file_nonnull(right->edge->url_path, ""));
+    return order;
+}
+
+static int single_file_compare_snapshot_edges(
+    sqlite3 *source, const char *project, const cbm_zova_workspace_snapshot_t *snapshot,
+    const single_file_node_ref_t *refs, int ref_count) {
+    if (!source || !project || !snapshot || ref_count < 0 ||
+        (ref_count && !refs)) return -1;
+    int64_t *snapshot_to_sqlite = snapshot->node_count
+        ? calloc((size_t)snapshot->node_count + 1, sizeof(*snapshot_to_sqlite)) : NULL;
+    single_file_snapshot_edge_ref_t *edges = snapshot->edge_count
+        ? calloc((size_t)snapshot->edge_count, sizeof(*edges)) : NULL;
+    if ((snapshot->node_count && !snapshot_to_sqlite) || (snapshot->edge_count && !edges)) {
+        free(snapshot_to_sqlite); free(edges); return -1;
+    }
+    int rc = 0;
+    for (int i = 0; i < ref_count; i++) {
+        if (refs[i].snapshot_id <= 0 || refs[i].snapshot_id > snapshot->node_count ||
+            snapshot_to_sqlite[refs[i].snapshot_id] != 0) {
+            rc = -1; break;
+        }
+        snapshot_to_sqlite[refs[i].snapshot_id] = refs[i].sqlite_id;
+    }
+    for (int i = 0; rc == 0 && i < snapshot->edge_count; i++) {
+        const CBMDumpEdge *edge = &snapshot->edges[i];
+        if (edge->source_id <= 0 || edge->source_id > snapshot->node_count ||
+            edge->target_id <= 0 || edge->target_id > snapshot->node_count ||
+            snapshot_to_sqlite[edge->source_id] == 0 ||
+            snapshot_to_sqlite[edge->target_id] == 0) {
+            rc = -1; break;
+        }
+        edges[i] = (single_file_snapshot_edge_ref_t){
+            .edge = edge,
+            .source_sqlite_id = snapshot_to_sqlite[edge->source_id],
+            .target_sqlite_id = snapshot_to_sqlite[edge->target_id],
+        };
+    }
+    free(snapshot_to_sqlite);
+    if (rc != 0) { free(edges); return -1; }
+    if (snapshot->edge_count > 1)
+        qsort(edges, (size_t)snapshot->edge_count, sizeof(*edges),
+              single_file_snapshot_edge_ref_compare);
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(
+            source,
+            "SELECT source_id,target_id,type,coalesce(properties,'{}'),"
+            "coalesce(url_path_gen,''),coalesce(local_name_gen,'') "
+            "FROM edges WHERE project=?1 "
+            "ORDER BY source_id,target_id,type,coalesce(local_name_gen,''),"
+            "coalesce(properties,'{}'),coalesce(url_path_gen,'')",
+            -1, &statement, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(statement, 1, project, -1, SQLITE_STATIC) != SQLITE_OK) {
+        if (statement) sqlite3_finalize(statement);
+        free(edges);
+        return -1;
+    }
+    int mismatches = 0;
+    int index = 0;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        if (index >= snapshot->edge_count) { mismatches++; break; }
+        const single_file_snapshot_edge_ref_t *actual = &edges[index++];
+        mismatches += sqlite3_column_int64(statement, 0) != actual->source_sqlite_id;
+        mismatches += sqlite3_column_int64(statement, 1) != actual->target_sqlite_id;
+        mismatches += strcmp(single_file_text(statement, 2, ""),
+                             single_file_nonnull(actual->edge->type, "")) != 0;
+        mismatches += strcmp(single_file_text(statement, 3, "{}"),
+                             single_file_nonnull(actual->edge->properties, "{}")) != 0;
+        mismatches += strcmp(single_file_text(statement, 4, ""),
+                             single_file_nonnull(actual->edge->url_path, "")) != 0;
+        mismatches += strcmp(single_file_text(statement, 5, ""),
+                             single_file_nonnull(actual->edge->local_name, "")) != 0;
+    }
+    sqlite3_finalize(statement);
+    if (index != snapshot->edge_count) mismatches++;
+    free(edges);
+    return mismatches;
+}
+
+static int single_file_edge_select_trace(unsigned mask, void *context, void *statement,
+                                         void *unused_sql) {
+    (void)unused_sql;
+    if (mask != SQLITE_TRACE_STMT || !context || !statement) return 0;
+    sqlite3_stmt *stmt = (sqlite3_stmt *)statement;
+    if (!sqlite3_stmt_readonly(stmt)) return 0;
+    const char *sql = sqlite3_sql(stmt);
+    if (sql && strstr(sql, "FROM cbm_edges_v1")) (*(int *)context)++;
+    return 0;
+}
+
+TEST(zova_single_file_edge_parity_streams_once) {
+    sqlite3 *source = NULL;
+    sqlite3 *user = NULL;
+    ASSERT_EQ(sqlite3_open(":memory:", &source), SQLITE_OK);
+    ASSERT_EQ(sqlite3_open(":memory:", &user), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(
+                  source,
+                  "CREATE TABLE edges(id INTEGER PRIMARY KEY,project TEXT,source_id INTEGER,"
+                  "target_id INTEGER,type TEXT,properties TEXT,url_path_gen TEXT,"
+                  "local_name_gen TEXT);"
+                  "INSERT INTO edges VALUES"
+                  "(1,'project',1,2,'CALLS','{}','','first'),"
+                  "(2,'project',1,2,'CALLS','{\"rank\":2}','','second'),"
+                  "(3,'project',2,1,'RETURNS','{}','/return','');",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(
+                  user,
+                  "CREATE TABLE cbm_workspace_registry(workspace_key INTEGER PRIMARY KEY,"
+                  "workspace_id TEXT UNIQUE);"
+                  "CREATE TABLE cbm_nodes_v1(node_key INTEGER PRIMARY KEY,workspace_key INTEGER,"
+                  "node_id TEXT);"
+                  "CREATE TABLE cbm_edges_v1(edge_key INTEGER PRIMARY KEY,workspace_key INTEGER,"
+                  "source_node_key INTEGER,target_node_key INTEGER,edge_type TEXT,properties TEXT,"
+                  "url_path TEXT,local_name TEXT);"
+                  "CREATE INDEX cbm_edges_v1_source_type ON cbm_edges_v1"
+                  "(workspace_key,source_node_key,edge_type);"
+                  "INSERT INTO cbm_workspace_registry VALUES(1,'workspace');"
+                  "INSERT INTO cbm_nodes_v1 VALUES(11,1,'node-a'),(12,1,'node-b');"
+                  "INSERT INTO cbm_edges_v1 VALUES"
+                  "(21,1,11,12,'CALLS','{}','','first'),"
+                  "(22,1,11,12,'CALLS','{\"rank\":2}','','second'),"
+                  "(23,1,12,11,'RETURNS','{}','/return','');",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    const single_file_node_ref_t refs[] = {
+        {.sqlite_id = 1, .stable_id = "node-a"},
+        {.sqlite_id = 2, .stable_id = "node-b"},
+    };
+    int edge_selects = 0;
+    ASSERT_EQ(sqlite3_trace_v2(user, SQLITE_TRACE_STMT, single_file_edge_select_trace,
+                               &edge_selects),
+              SQLITE_OK);
+    ASSERT_EQ(single_file_compare_edges(source, user, "project", "workspace", refs, 2), 0);
+    ASSERT_EQ(edge_selects, 1);
+    ASSERT_EQ(sqlite3_exec(user,
+                           "UPDATE cbm_edges_v1 SET properties='{\"rank\":99}' WHERE edge_key=22",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_GT(single_file_compare_edges(source, user, "project", "workspace", refs, 2), 0);
+    ASSERT_EQ(edge_selects, 2);
+    ASSERT_EQ(sqlite3_exec(user,
+                           "UPDATE cbm_edges_v1 SET properties='{\"rank\":2}' WHERE edge_key=22;"
+                           "DELETE FROM cbm_edges_v1 WHERE edge_key=23",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    ASSERT_GT(single_file_compare_edges(source, user, "project", "workspace", refs, 2), 0);
+    ASSERT_EQ(edge_selects, 3);
+    sqlite3_trace_v2(user, 0, NULL, NULL);
+    sqlite3_close(source);
+    sqlite3_close(user);
+    PASS();
+}
+
+TEST(zova_single_file_cypher_parity_bounds_large_repositories) {
+    ASSERT_EQ(single_file_cypher_case_count(50000, 14), 14);
+    ASSERT_EQ(single_file_cypher_case_count(50001, 14), 10);
+    ASSERT_EQ(single_file_cypher_case_count(50001, 8), 8);
+    PASS();
 }
 
 static int single_file_compare_file_hashes(sqlite3 *source, sqlite3 *user, const char *project,
@@ -603,11 +955,13 @@ static int single_file_compare_fts(sqlite3 *source, sqlite3 *user, const char *p
              "WHERE nodes_fts MATCH ?1 AND nodes.project=?2 "
              "ORDER BY bm25(nodes_fts),nodes_fts.rowid");
     snprintf(user_sql, sizeof(user_sql),
-             "SELECT n.node_id,bm25(cbm_nodes_fts_v1) FROM cbm_nodes_fts_v1 f "
-             "JOIN cbm_nodes_v1 n ON n.node_key=f.rowid "
+             "SELECT n.label,n.name,n.qualified_name,p.file_path,n.start_line,n.end_line,"
+             "bm25(cbm_nodes_fts_v1) FROM cbm_nodes_fts_v1 f "
+             "JOIN cbm_nodes_v1 n ON n.zova_node_key=f.rowid "
+             "JOIN cbm_files_v1 p ON p.file_key=n.file_key "
              "JOIN cbm_workspace_registry r ON r.workspace_key=n.workspace_key "
              "WHERE r.workspace_id=?2 AND cbm_nodes_fts_v1 MATCH ?1 "
-             "ORDER BY bm25(cbm_nodes_fts_v1),n.node_id");
+             "ORDER BY bm25(cbm_nodes_fts_v1),n.zova_node_key");
     int mismatches = 0;
     int query_count = 0;
     while (sqlite3_step(term_stmt) == SQLITE_ROW) {
@@ -653,10 +1007,25 @@ static int single_file_compare_fts(sqlite3 *source, sqlite3 *user, const char *p
         }
         int user_count = 0;
         while (user_count < ref_count && sqlite3_step(user_results) == SQLITE_ROW) {
-            snprintf(user_ranks[user_count].id, sizeof(user_ranks[user_count].id), "%s",
-                     single_file_text(user_results, 0, ""));
-            user_ranks[user_count].score = sqlite3_column_double(user_results, 1);
-            user_count++;
+            const char *label = single_file_text(user_results, 0, "");
+            const char *name = single_file_text(user_results, 1, "");
+            const char *qualified_name = single_file_text(user_results, 2, "");
+            const char *file_path = single_file_text(user_results, 3, "");
+            char discriminator[512];
+            if (qualified_name[0])
+                snprintf(discriminator, sizeof(discriminator), "named:%s", qualified_name);
+            else
+                snprintf(discriminator, sizeof(discriminator), "local:%s:span:%d:%d", name,
+                         sqlite3_column_int(user_results, 4),
+                         sqlite3_column_int(user_results, 5));
+            if (cbm_zova_workspace_node_id_v2(
+                    workspace_id, label, file_path, qualified_name, discriminator,
+                    user_ranks[user_count].id, sizeof(user_ranks[user_count].id)) != 0) {
+                mismatches++;
+            } else {
+                user_ranks[user_count].score = sqlite3_column_double(user_results, 6);
+                user_count++;
+            }
         }
         qsort(source_ranks, (size_t)source_count, sizeof(source_ranks[0]),
               single_file_fts_rank_compare);
@@ -759,6 +1128,7 @@ static int single_file_rank_compare(const void *left, const void *right) {
 static int single_file_compare_rankings(zova_database *db, sqlite3 *source,
                                         const char *project, const char *collection,
                                         const single_file_node_ref_t *refs, int ref_count,
+                                        const cbm_zova_workspace_snapshot_t *snapshot,
                                         int *out_checks) {
     sqlite3_stmt *token_stmt = NULL;
     sqlite3_stmt *node_stmt = NULL;
@@ -819,7 +1189,20 @@ static int single_file_compare_rankings(zova_database *db, sqlite3 *source,
         if (status != ZOVA_OK || results.len != (size_t)(count < 20 ? count : 20)) mismatches++;
         size_t compare_count = results.len < 20 ? results.len : 20;
         for (size_t i = 0; i < compare_count && i < (size_t)count; i++) {
-            mismatches += strcmp(results.items[i].id, expected[i].id) != 0;
+            char *end = NULL;
+            long long key = results.items[i].id
+                ? strtoll(results.items[i].id, &end, 10) : 0;
+            const char *public_id = NULL;
+            if (results.items[i].id && end != results.items[i].id && *end == '\0' && key > 0 &&
+                snapshot && snapshot->zova_node_keys) {
+                for (int n = 0; n < snapshot->node_count; n++) {
+                    if (snapshot->zova_node_keys[n] == key) {
+                        public_id = snapshot->node_stable_ids[n];
+                        break;
+                    }
+                }
+            }
+            mismatches += !public_id || strcmp(public_id, expected[i].id) != 0;
             mismatches += fabs((1.0 - results.items[i].distance) - expected[i].score) > 1e-9;
         }
         zova_vector_search_results_free(&results);
@@ -898,19 +1281,26 @@ static int single_file_compare_native_vectors(
     const char *user_path, sqlite3 *source, const char *project, const char *workspace_id,
     const single_file_node_ref_t *refs, int ref_count) {
     char node_collection[CBM_ZOVA_WORKSPACE_ID_MAX + 128];
-    char token_collection[CBM_ZOVA_WORKSPACE_ID_MAX + 128];
     if (cbm_zova_workspace_node_vector_collection_name(
             workspace_id, CBM_ZOVA_MODEL_FINGERPRINT, 768, node_collection,
-            sizeof(node_collection)) != 0 ||
-        cbm_zova_workspace_token_vector_collection_name(
-            workspace_id, CBM_ZOVA_MODEL_FINGERPRINT, 768, token_collection,
-            sizeof(token_collection)) != 0) {
+            sizeof(node_collection)) != 0) {
         return -1;
     }
     zova_database *db = NULL;
+    cbm_zova_vector_session_t *vector_session = NULL;
+    cbm_zova_workspace_snapshot_t snapshot = {0};
     zova_message error = {0};
     if (zova_database_open(&(zova_database_open_request){
             .path = user_path, .out_db = &db, .out_error_message = &error}) != ZOVA_OK || !db) {
+        zova_message_free(&error);
+        return -1;
+    }
+    if (cbm_zova_repository_export_incremental_snapshot(
+            user_path, workspace_id, &snapshot) != CBM_ZOVA_SNAPSHOT_OK ||
+        !snapshot.zova_node_keys ||
+        !(vector_session = cbm_zova_vector_session_open(user_path))) {
+        cbm_zova_workspace_snapshot_free(&snapshot);
+        zova_database_close(db);
         zova_message_free(&error);
         return -1;
     }
@@ -933,9 +1323,24 @@ static int single_file_compare_native_vectors(
             mismatches++;
             continue;
         }
+        int low = 0, high = snapshot.node_count;
+        int64_t node_key = 0;
+        while (low < high) {
+            int mid = low + (high - low) / 2;
+            int order = strcmp(snapshot.node_stable_ids[mid], node_id);
+            if (order == 0) { node_key = snapshot.zova_node_keys[mid]; break; }
+            if (order < 0) low = mid + 1;
+            else high = mid;
+        }
+        char physical_id[32];
+        if (node_key <= 0 || snprintf(physical_id, sizeof(physical_id), "%lld",
+                                     (long long)node_key) >= (int)sizeof(physical_id)) {
+            mismatches++;
+            continue;
+        }
         zova_vector vector = {0};
         zova_status status = zova_vector_get(&(zova_vector_get_request){
-            .db = db, .collection_name = node_collection, .vector_id = node_id,
+            .db = db, .collection_name = node_collection, .vector_id = physical_id,
             .out_vector = &vector});
         if (status != ZOVA_OK || vector.element_type != ZOVA_VECTOR_ELEMENT_TYPE_I8 ||
             vector.values_len != (size_t)source_bytes ||
@@ -958,24 +1363,22 @@ static int single_file_compare_native_vectors(
         const char *token = single_file_text(source_stmt, 0, "");
         int source_bytes = sqlite3_column_bytes(source_stmt, 1);
         const void *source_blob = sqlite3_column_blob(source_stmt, 1);
-        char token_id[CBM_ZOVA_WORKSPACE_ID_MAX + 64];
-        if (single_file_token_id(workspace_id, token, token_id, sizeof(token_id)) != 0 ||
-            source_bytes <= 0) {
+        if (source_bytes <= 0) {
             mismatches++;
             continue;
         }
-        zova_vector vector = {0};
-        zova_status status = zova_vector_get(&(zova_vector_get_request){
-            .db = db, .collection_name = token_collection, .vector_id = token_id,
-            .out_vector = &vector});
-        if (status != ZOVA_OK || vector.element_type != ZOVA_VECTOR_ELEMENT_TYPE_I8 ||
-            vector.values_len != (size_t)source_bytes ||
-            memcmp(vector.i8_values, source_blob, (size_t)source_bytes) != 0) {
+        int8_t *values = malloc((size_t)source_bytes);
+        bool found = false;
+        if (!values || cbm_zova_vector_session_get_workspace_token_i8(
+                vector_session, workspace_id, CBM_ZOVA_MODEL_FINGERPRINT,
+                source_bytes, token, values, (size_t)source_bytes, &found) != 0 ||
+            !found || memcmp(values, source_blob, (size_t)source_bytes) != 0) {
             mismatches++;
         }
-        zova_vector_free(&vector);
+        free(values);
     }
     sqlite3_finalize(source_stmt);
+    cbm_zova_vector_session_close(vector_session);
     zova_database_close(db);
     zova_message_free(&error);
     return mismatches;
@@ -1245,12 +1648,16 @@ TEST(zova_single_file_real_repo_compact_parity) {
     int metadata_mismatches = single_file_compare_project(source, user, project_copy, workspace_id);
     single_file_node_ref_t *node_refs = NULL;
     int node_ref_count = 0;
-    int node_mismatch = single_file_compare_nodes(source, user, project_copy, workspace_id,
-                                                   &node_refs, &node_ref_count);
+    cbm_zova_workspace_snapshot_t snapshot = {0};
+    ASSERT_EQ(cbm_zova_repository_export_incremental_snapshot(
+                  user_path, workspace_id, &snapshot),
+              CBM_ZOVA_SNAPSHOT_OK);
+    int node_mismatch = single_file_compare_snapshot_nodes(
+        source, project_copy, workspace_id, &snapshot, &node_refs, &node_ref_count);
     int edge_mismatch = node_mismatch < 0
                             ? -1
-                            : single_file_compare_edges(source, user, project_copy, workspace_id,
-                                                        node_refs, node_ref_count);
+                            : single_file_compare_snapshot_edges(
+                                  source, project_copy, &snapshot, node_refs, node_ref_count);
     int hash_mismatch = single_file_compare_file_hashes(source, user, project_copy, workspace_id);
     int summary_mismatch = single_file_compare_summary(source, user, project_copy, workspace_id);
     if (metadata_mismatches < 0 || node_mismatch < 0 || edge_mismatch < 0 || hash_mismatch < 0 ||
@@ -1299,10 +1706,12 @@ TEST(zova_single_file_real_repo_compact_parity) {
     int ranking_checks = 0;
     int ranking_mismatches = single_file_compare_rankings(
         native_db, source, project_copy, node_collection, node_refs, node_ref_count,
+        &snapshot,
         &ranking_checks);
     ASSERT_EQ(zova_database_close(native_db), ZOVA_OK);
     ASSERT_EQ(graph_mismatches, 0);
     ASSERT_EQ(ranking_mismatches, 0);
+    cbm_zova_workspace_snapshot_free(&snapshot);
     vector_mismatches += ranking_mismatches;
     int cypher_native_route_count = 0, cypher_compat_route_count = 0;
     int cypher_ordering_mismatches = 0;
@@ -1718,11 +2127,10 @@ static int zsp_pure_sqlite_baseline_enabled(void) {
 }
 
 static int zsp_optimization_requested(void) {
-    const char *report = getenv("CBM_ZOVA_OPTIMIZATION_REPORT");
-    const char *route = getenv("CBM_ZOVA_OPTIMIZATION_ROUTE");
+    const char *pure_report = getenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
+    const char *single_report = getenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
     const char *workload = getenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
-    return report && report[0] && route &&
-        (strcmp(route, "pure") == 0 || strcmp(route, "single") == 0) &&
+    return pure_report && pure_report[0] && single_report && single_report[0] &&
         workload &&
         (strcmp(workload, "full") == 0 || strcmp(workload, "incremental") == 0);
 }
@@ -1743,6 +2151,28 @@ static int zsp_route_matches_workload(cbm_pipeline_route_t route, const char *wo
 
 static int zsp_pure_sqlite_route_enabled(void) {
     return zsp_pure_sqlite_baseline_enabled() || zsp_optimization_requested();
+}
+
+static int zsp_set_benchmark_project_name(cbm_pipeline_t *pipeline) {
+    const char *repository = getenv("CBM_ZOVA_PROMOTION_REPOSITORY");
+    return pipeline && repository && repository[0] &&
+                   cbm_pipeline_set_project_name(pipeline, repository)
+               ? 0
+               : -1;
+}
+
+TEST(zova_single_file_promotion_uses_repository_label_for_project_name) {
+    const char *saved_value = getenv("CBM_ZOVA_PROMOTION_REPOSITORY");
+    char *saved = saved_value ? strdup(saved_value) : NULL;
+    cbm_setenv("CBM_ZOVA_PROMOTION_REPOSITORY", "deno", 1);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(
+        "/Volumes/example/very-long/benchmark/run-root/clone", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(zsp_set_benchmark_project_name(pipeline), 0);
+    ASSERT_STR_EQ(cbm_pipeline_project_name(pipeline), "deno");
+    cbm_pipeline_free(pipeline);
+    zsp_restore_env("CBM_ZOVA_PROMOTION_REPOSITORY", saved);
+    PASS();
 }
 
 static int zsp_run_route(const char *repo, const char *cache, int flagged,
@@ -1770,7 +2200,9 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
     int pure_sqlite = !flagged && zsp_pure_sqlite_route_enabled();
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
     cbm_setenv("CBM_ZOVA_MODE", pure_sqlite ? "off" : "graph_read", 1);
-    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    /* Keep promotion evidence deterministic by default, but let an explicit
+     * caller setting exercise the production parallel indexing route. */
+    if (!old_thread_value) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
     if (flagged) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
 
@@ -1778,7 +2210,10 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
     cbm_clock_gettime(CLOCK_MONOTONIC, &started);
     cbm_zova_publish_test_metrics_reset();
     cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, artifact->db, CBM_MODE_FULL);
-    int rc = pipeline && cbm_pipeline_run(pipeline) == 0 ? 0 : -1;
+    int rc = pipeline && zsp_set_benchmark_project_name(pipeline) == 0 &&
+                     cbm_pipeline_run(pipeline) == 0
+                 ? 0
+                 : -1;
     cbm_clock_gettime(CLOCK_MONOTONIC, &finished);
     if (pipeline) {
         artifact->route = cbm_pipeline_get_last_route(pipeline);
@@ -1906,8 +2341,10 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     sqlite3 *source = NULL;
     sqlite3 *user = NULL;
     single_file_node_ref_t *refs = NULL;
+    cbm_zova_workspace_snapshot_t snapshot = {0};
     int ref_count = 0;
     int rc = -1;
+    const char *failure_phase = "open";
     if (sqlite3_open_v2(compat->db, &source, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
         sqlite3_open_v2(flagged->zova, &user, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
         goto done;
@@ -1915,16 +2352,21 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     sqlite3_busy_timeout(user, 5000);
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
     int64_t generation = 0;
+    failure_phase = "generation";
     if (zsp_workspace_generation(user, workspace_id, sizeof(workspace_id), &generation) != 0)
         goto done;
     report->generation = generation;
 
+    failure_phase = "canonical_metadata";
+    if (cbm_zova_repository_export_incremental_snapshot(
+            flagged->zova, workspace_id, &snapshot) != CBM_ZOVA_SNAPSHOT_OK)
+        goto done;
     int project_mismatches = single_file_compare_project(
         source, user, compat->project, workspace_id);
-    int node_mismatches = single_file_compare_nodes(
-        source, user, compat->project, workspace_id, &refs, &ref_count);
-    int edge_mismatches = node_mismatches < 0 ? -1 : single_file_compare_edges(
-        source, user, compat->project, workspace_id, refs, ref_count);
+    int node_mismatches = single_file_compare_snapshot_nodes(
+        source, compat->project, workspace_id, &snapshot, &refs, &ref_count);
+    int edge_mismatches = node_mismatches < 0 ? -1 : single_file_compare_snapshot_edges(
+        source, compat->project, &snapshot, refs, ref_count);
     int hash_mismatches = single_file_compare_file_hashes(
         source, user, compat->project, workspace_id);
     int summary_mismatches = single_file_compare_summary(
@@ -1940,6 +2382,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     report->metadata_mismatches += project_mismatches + node_mismatches +
         edge_mismatches + hash_mismatches + summary_mismatches;
 
+    failure_phase = "fts";
     int fts_queries = 0;
     int fts_mismatches = single_file_compare_fts(
         source, user, compat->project, workspace_id, refs, ref_count, &fts_queries);
@@ -1950,6 +2393,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     report->fts_mismatches += fts_mismatches;
     if (fts_queries > report->fts_query_count) report->fts_query_count = fts_queries;
 
+    failure_phase = "native_vectors";
     int native_vectors = single_file_compare_native_vectors(
         flagged->zova, source, compat->project, workspace_id, refs, ref_count);
     if (native_vectors < 0) goto done;
@@ -1957,6 +2401,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
         fprintf(stderr, "promotion native vector parity mismatches=%d\n", native_vectors);
     report->vector_mismatches += native_vectors;
 
+    failure_phase = "native_names";
     char graph_name[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
     char node_collection[CBM_ZOVA_WORKSPACE_ID_MAX + 128];
     if (cbm_zova_workspace_graph_name(workspace_id, graph_name, sizeof(graph_name)) != 0 ||
@@ -1972,12 +2417,14 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
         goto done;
     }
     zova_message_free(&error);
+    failure_phase = "graph_vector_samples";
     int graph_checks = 0;
     int graph_mismatches = single_file_compare_graph_samples(
         native, source, compat->project, graph_name, refs, ref_count, &graph_checks);
     int ranking_checks = 0;
     int ranking_mismatches = single_file_compare_rankings(
-        native, source, compat->project, node_collection, refs, ref_count, &ranking_checks);
+        native, source, compat->project, node_collection, refs, ref_count, &snapshot,
+        &ranking_checks);
     zova_database_close(native);
     if (graph_mismatches < 0 || ranking_mismatches < 0) goto done;
     if (ranking_mismatches != 0)
@@ -1988,6 +2435,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     if (graph_checks > report->graph_sample_count) report->graph_sample_count = graph_checks;
     report->vector_query_count = ZSP_VECTOR_CASES;
 
+    failure_phase = "cypher";
     int native_routes = 0, compat_routes = 0, ordering_mismatches = 0;
     int cypher_mismatches = single_file_compare_cypher(
         compat->db, flagged->zova, workspace_id, compat->project,
@@ -1999,6 +2447,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     if (compat_routes > report->cypher_compat_route_count)
         report->cypher_compat_route_count = compat_routes;
 
+    failure_phase = "counts";
     int64_t source_nodes = 0, source_edges = 0, source_graph_edges = 0;
     int64_t source_node_vectors = 0;
     int64_t source_token_vectors = 0;
@@ -2037,6 +2486,7 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     report->token_vectors_total = source_token_vectors;
 
     if (public_checks) {
+        failure_phase = "public_mcp";
         sqlite3_stmt *sample = NULL;
         char sample_name[1024] = {0}, sample_qn[2048] = {0};
         if (sqlite3_prepare_v2(source,
@@ -2066,6 +2516,8 @@ static int zsp_compare_pair(const zsp_artifact_t *compat,
     }
     rc = 0;
 done:
+    if (rc != 0) fprintf(stderr, "promotion comparison failed phase=%s\n", failure_phase);
+    cbm_zova_workspace_snapshot_free(&snapshot);
     free(refs);
     if (user) sqlite3_close(user);
     if (source) sqlite3_close(source);
@@ -2079,9 +2531,11 @@ static int zsp_measure_reads(const zsp_artifact_t *compat,
     sqlite3 *source = NULL;
     sqlite3 *user = NULL;
     single_file_node_ref_t *refs = NULL;
+    cbm_zova_workspace_snapshot_t snapshot = {0};
     int ref_count = 0;
     cbm_store_t *compat_store = NULL;
     cbm_store_t *flagged_store = NULL;
+    cbm_zova_repository_t *repository = NULL;
     int rc = -1;
     if (sqlite3_open_v2(compat->db, &source, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
         sqlite3_open_v2(flagged->zova, &user, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
@@ -2089,8 +2543,11 @@ static int zsp_measure_reads(const zsp_artifact_t *compat,
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX] = {0};
     int64_t generation = 0;
     if (zsp_workspace_generation(user, workspace_id, sizeof(workspace_id), &generation) != 0 ||
-        single_file_compare_nodes(source, user, compat->project, workspace_id,
-                                  &refs, &ref_count) < 0 || ref_count == 0) goto done;
+        cbm_zova_repository_export_incremental_snapshot(
+            flagged->zova, workspace_id, &snapshot) != CBM_ZOVA_SNAPSHOT_OK ||
+        single_file_compare_snapshot_nodes(source, compat->project, workspace_id, &snapshot,
+                                           &refs, &ref_count) < 0 ||
+        ref_count == 0) goto done;
     compat_store = cbm_store_open_path_query(compat->db);
     flagged_store = cbm_store_open_zova_workspace_query(flagged->zova, workspace_id);
     if (!compat_store || !flagged_store) goto done;
@@ -2107,21 +2564,17 @@ static int zsp_measure_reads(const zsp_artifact_t *compat,
     }
     snprintf(keyword, sizeof(keyword), "%s", sqlite3_column_text(sample, 0));
     sqlite3_finalize(sample);
-    sqlite3_stmt *flagged_id_stmt = NULL;
     int64_t flagged_start_id = 0;
-    if (sqlite3_prepare_v2(cbm_store_get_db(flagged_store),
-                           "SELECT cbm_stable_numeric_id(node_id) FROM cbm_nodes_v1 "
-                           "WHERE workspace_key=(SELECT workspace_key FROM "
-                           "cbm_workspace_registry WHERE workspace_id=?1) AND node_id=?2",
-                           -1, &flagged_id_stmt, NULL) != SQLITE_OK ||
-        sqlite3_bind_text(flagged_id_stmt, 1, workspace_id, -1, SQLITE_STATIC) != SQLITE_OK ||
-        sqlite3_bind_text(flagged_id_stmt, 2, refs[0].stable_id, -1, SQLITE_STATIC) != SQLITE_OK ||
-        sqlite3_step(flagged_id_stmt) != SQLITE_ROW) {
-        if (flagged_id_stmt) sqlite3_finalize(flagged_id_stmt);
+    repository = cbm_zova_repository_open(flagged->zova, flagged->project);
+    cbm_node_t *flagged_start = calloc(1, sizeof(*flagged_start));
+    if (!repository || !flagged_start ||
+        cbm_zova_repository_find_node_by_stable_id(
+            repository, workspace_id, refs[0].stable_id, flagged_start) != CBM_STORE_OK) {
+        free(flagged_start);
         goto done;
     }
-    flagged_start_id = sqlite3_column_int64(flagged_id_stmt, 0);
-    sqlite3_finalize(flagged_id_stmt);
+    flagged_start_id = flagged_start->id;
+    cbm_store_free_nodes(flagged_start, 1);
     if (flagged_start_id == 0) goto done;
     const char *keywords[] = {keyword};
     const char *edge_types[] = {"CALLS"};
@@ -2227,8 +2680,10 @@ static int zsp_measure_reads(const zsp_artifact_t *compat,
     report->vector_single_p95_ms = zsp_percentile(vector_single, 95);
     rc = 0;
 done:
+    if (repository) cbm_zova_repository_close(repository);
     if (flagged_store) cbm_store_close(flagged_store);
     if (compat_store) cbm_store_close(compat_store);
+    cbm_zova_workspace_snapshot_free(&snapshot);
     free(refs);
     if (user) sqlite3_close(user);
     if (source) sqlite3_close(source);
@@ -2467,8 +2922,12 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             "    \"native_graph\": %.3f, \"native_graph_materialize\": %.3f, "
             "\"native_graph_reset\": %.3f,\n"
             "    \"native_graph_nodes\": %.3f, \"native_graph_edges\": %.3f, "
-            "\"native_graph_validate\": %.3f, \"native_graph_cleanup\": %.3f,\n"
-            "    \"native_vectors\": %.3f, \"readback\": %.3f, "
+            "\"native_graph_validate\": %.3f, "
+            "\"native_graph_key_generation\": %.3f, "
+            "\"native_graph_cleanup\": %.3f,\n"
+            "    \"native_vectors\": %.3f, \"fresh_validation\": %.3f, "
+            "\"fresh_index\": %.3f, \"fresh_commit\": %.3f, "
+            "\"fresh_build\": %.3f, \"readback\": %.3f, "
             "\"digests\": %.3f, \"verify\": %.3f,\n"
             "    \"publish\": %.6f, \"pipeline\": %.6f\n"
             "  },\n"
@@ -2496,6 +2955,16 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             "  \"snapshot\": {\n"
             "    \"completed\": %s, \"generation\": %lld,\n"
             "    \"base_ms\": %.6f, \"optional_ms\": %.6f,\n"
+            "    \"base_phase_mask\": %u,\n"
+            "    \"open_ms\": %.6f, \"header_ms\": %.6f, \"integrity_ms\": %.6f,\n"
+            "    \"nodes_sql_ms\": %.6f, \"nodes_native_ms\": %.6f, "
+            "\"nodes_finalize_ms\": %.6f,\n"
+            "    \"edges_sql_ms\": %.6f, \"edges_native_ms\": %.6f, "
+            "\"edges_finalize_ms\": %.6f,\n"
+            "    \"hashes_summary_ms\": %.6f, \"close_ms\": %.6f, "
+            "\"graph_buffer_ms\": %.6f,\n"
+            "    \"node_rows\": %llu, \"edge_rows\": %llu, "
+            "\"file_hash_rows\": %llu,\n"
             "    \"hydrated_components\": %u, \"topology_rows\": %llu,\n"
             "    \"node_vector_rows\": %llu, \"token_vector_rows\": %llu\n"
             "  },\n"
@@ -2553,8 +3022,13 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             selected->publish_stats.native_graph_nodes_ms,
             selected->publish_stats.native_graph_edges_ms,
             selected->publish_stats.native_graph_validate_ms,
+            selected->publish_stats.native_graph_key_generation_ms,
             selected->publish_stats.native_graph_cleanup_ms,
             selected->publish_stats.native_vectors_ms,
+            selected->publish_stats.fresh_validation_ms,
+            selected->publish_stats.fresh_index_ms,
+            selected->publish_stats.fresh_commit_ms,
+            selected->publish_stats.fresh_build_ms,
             selected->publish_stats.readback_ms,
             selected->publish_stats.model_digests_ms,
             selected->publish_stats.finalize_ms,
@@ -2602,6 +3076,22 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             (long long)selected->publish_stats.snapshot_generation,
             selected->publish_stats.snapshot_base_ms,
             selected->publish_stats.snapshot_optional_ms,
+            selected->publish_stats.snapshot_base_phase_mask,
+            selected->publish_stats.snapshot_open_ms,
+            selected->publish_stats.snapshot_header_ms,
+            selected->publish_stats.snapshot_integrity_ms,
+            selected->publish_stats.snapshot_nodes_sql_ms,
+            selected->publish_stats.snapshot_nodes_native_ms,
+            selected->publish_stats.snapshot_nodes_finalize_ms,
+            selected->publish_stats.snapshot_edges_sql_ms,
+            selected->publish_stats.snapshot_edges_native_ms,
+            selected->publish_stats.snapshot_edges_finalize_ms,
+            selected->publish_stats.snapshot_hashes_summary_ms,
+            selected->publish_stats.snapshot_close_ms,
+            selected->publish_stats.snapshot_graph_buffer_ms,
+            (unsigned long long)selected->publish_stats.snapshot_node_rows,
+            (unsigned long long)selected->publish_stats.snapshot_edge_rows,
+            (unsigned long long)selected->publish_stats.snapshot_file_hash_rows,
             selected->publish_stats.snapshot_hydrated_components,
             (unsigned long long)selected->publish_stats.snapshot_topology_rows,
             (unsigned long long)selected->publish_stats.snapshot_node_vector_rows,
@@ -2643,21 +3133,23 @@ TEST(zova_single_file_promotion_pure_sqlite_selector_is_explicit) {
 }
 
 TEST(zova_single_file_optimization_contract_is_explicit) {
-    const char *old_report_value = getenv("CBM_ZOVA_OPTIMIZATION_REPORT");
-    const char *old_route_value = getenv("CBM_ZOVA_OPTIMIZATION_ROUTE");
+    const char *old_pure_report_value = getenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
+    const char *old_single_report_value = getenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
     const char *old_workload_value = getenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
-    char *old_report = old_report_value ? strdup(old_report_value) : NULL;
-    char *old_route = old_route_value ? strdup(old_route_value) : NULL;
+    char *old_pure_report = old_pure_report_value ? strdup(old_pure_report_value) : NULL;
+    char *old_single_report = old_single_report_value ? strdup(old_single_report_value) : NULL;
     char *old_workload = old_workload_value ? strdup(old_workload_value) : NULL;
-    ASSERT_TRUE((!old_report_value || old_report) && (!old_route_value || old_route) &&
+    ASSERT_TRUE((!old_pure_report_value || old_pure_report) &&
+                (!old_single_report_value || old_single_report) &&
                 (!old_workload_value || old_workload));
 
-    cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_REPORT");
-    cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_ROUTE");
+    cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
+    cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
     cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
     ASSERT_FALSE(zsp_optimization_requested());
-    cbm_setenv("CBM_ZOVA_OPTIMIZATION_REPORT", "/tmp/report.json", 1);
-    cbm_setenv("CBM_ZOVA_OPTIMIZATION_ROUTE", "single", 1);
+    cbm_setenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT", "/tmp/pure-report.json", 1);
+    ASSERT_FALSE(zsp_optimization_requested());
+    cbm_setenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT", "/tmp/single-report.json", 1);
     cbm_setenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD", "incremental", 1);
     ASSERT_TRUE(zsp_optimization_requested());
     ASSERT_STR_EQ(zsp_optimization_pipeline_mode("full"), "CBM_MODE_FULL");
@@ -2668,8 +3160,8 @@ TEST(zova_single_file_optimization_contract_is_explicit) {
     ASSERT_FALSE(zsp_route_matches_workload(CBM_PIPELINE_ROUTE_FULL, "incremental"));
     ASSERT_FALSE(zsp_route_matches_workload(CBM_PIPELINE_ROUTE_UNKNOWN, "full"));
 
-    zsp_restore_env("CBM_ZOVA_OPTIMIZATION_REPORT", old_report);
-    zsp_restore_env("CBM_ZOVA_OPTIMIZATION_ROUTE", old_route);
+    zsp_restore_env("CBM_ZOVA_OPTIMIZATION_PURE_REPORT", old_pure_report);
+    zsp_restore_env("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT", old_single_report);
     zsp_restore_env("CBM_ZOVA_OPTIMIZATION_WORKLOAD", old_workload);
     PASS();
 }
@@ -2753,6 +3245,8 @@ TEST(zova_single_file_promotion_real_repository_state) {
     zsp_artifact_t compat_artifact = {0}, flagged_artifact = {0};
     ASSERT_EQ(zsp_run_route(repo, compat_cache, 0, state, &compat_artifact), 0);
     ASSERT_EQ(zsp_run_route(repo, flagged_cache, 1, state, &flagged_artifact), 0);
+    ASSERT_STR_EQ(compat_artifact.project, repository);
+    ASSERT_STR_EQ(flagged_artifact.project, repository);
     ASSERT_STR_EQ(compat_artifact.project, flagged_artifact.project);
     zsp_state_report_t state_report = {0};
     state_report.compatibility_artifact_count = zsp_flagged_artifacts(&flagged_artifact);
@@ -2762,6 +3256,7 @@ TEST(zova_single_file_promotion_real_repository_state) {
     if (strcmp(state, "incremental") == 0) {
         zsp_artifact_t fresh_artifact = {0};
         ASSERT_EQ(zsp_run_route(repo, fresh_cache, 0, "full", &fresh_artifact), 0);
+        ASSERT_STR_EQ(fresh_artifact.project, repository);
         zsp_state_report_t fresh_report = {0};
         ASSERT_EQ(zsp_compare_pair(&fresh_artifact, &flagged_artifact, &fresh_report, 0), 0);
         state_report.fresh_full_mismatches = fresh_report.metadata_mismatches +
@@ -2781,27 +3276,31 @@ TEST(zova_single_file_promotion_real_repository_state) {
         state_report.token_vectors_upserted = state_report.token_vectors_total;
     }
     if (zsp_optimization_requested()) {
-        const char *optimization_route = getenv("CBM_ZOVA_OPTIMIZATION_ROUTE");
+        const char *pure_report = getenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
+        const char *single_report = getenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
         const char *optimization_workload = getenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
         ASSERT_STR_EQ(state, optimization_workload);
         ASSERT_EQ(zsp_optimization_inspect_single(&flagged_artifact, &state_report), 0);
-        if (strcmp(optimization_route, "single") == 0) {
-            const cbm_pipeline_zova_publish_stats_t *stats = &flagged_artifact.publish_stats;
-            ASSERT_TRUE(stats->completed);
-            ASSERT_EQ(stats->delta, strcmp(optimization_workload, "incremental") == 0);
-            state_report.full_clear_count = (int)stats->full_clear_count;
-            state_report.unchanged_rewrite_count = (int64_t)stats->unchanged_rewrite_count;
-            state_report.nodes_inserted = (int64_t)stats->nodes_inserted;
-            state_report.nodes_updated = (int64_t)stats->nodes_updated;
-            state_report.nodes_deleted = (int64_t)stats->nodes_deleted;
-            state_report.edges_inserted = (int64_t)stats->edges_inserted;
-            state_report.edges_deleted = (int64_t)stats->edges_deleted;
-            state_report.node_vectors_upserted = (int64_t)stats->node_vectors_upserted;
-            state_report.node_vectors_deleted = (int64_t)stats->node_vectors_deleted;
-            state_report.token_vectors_upserted = (int64_t)stats->token_vectors_upserted;
-            state_report.token_vectors_deleted = (int64_t)stats->token_vectors_deleted;
-        }
-        ASSERT_EQ(zsp_write_optimization_report(report, optimization_route,
+        zsp_state_report_t pure_state_report = state_report;
+        const cbm_pipeline_zova_publish_stats_t *stats = &flagged_artifact.publish_stats;
+        ASSERT_TRUE(stats->completed);
+        ASSERT_EQ(stats->delta, strcmp(optimization_workload, "incremental") == 0);
+        state_report.full_clear_count = (int)stats->full_clear_count;
+        state_report.unchanged_rewrite_count = (int64_t)stats->unchanged_rewrite_count;
+        state_report.nodes_inserted = (int64_t)stats->nodes_inserted;
+        state_report.nodes_updated = (int64_t)stats->nodes_updated;
+        state_report.nodes_deleted = (int64_t)stats->nodes_deleted;
+        state_report.edges_inserted = (int64_t)stats->edges_inserted;
+        state_report.edges_deleted = (int64_t)stats->edges_deleted;
+        state_report.node_vectors_upserted = (int64_t)stats->node_vectors_upserted;
+        state_report.node_vectors_deleted = (int64_t)stats->node_vectors_deleted;
+        state_report.token_vectors_upserted = (int64_t)stats->token_vectors_upserted;
+        state_report.token_vectors_deleted = (int64_t)stats->token_vectors_deleted;
+        ASSERT_EQ(zsp_write_optimization_report(pure_report, "pure",
+                                                optimization_workload,
+                                                &compat_artifact, &flagged_artifact,
+                                                &pure_state_report), 0);
+        ASSERT_EQ(zsp_write_optimization_report(single_report, "single",
                                                 optimization_workload,
                                                 &compat_artifact, &flagged_artifact,
                                                 &state_report), 0);
@@ -2817,5 +3316,8 @@ void suite_zova_single_file_promotion_real_repo(void) {
     RUN_TEST(zova_single_file_promotion_pure_sqlite_selector_is_explicit);
     RUN_TEST(zova_single_file_optimization_contract_is_explicit);
     RUN_TEST(zova_single_file_optimization_report_uses_actual_route);
+    RUN_TEST(zova_single_file_edge_parity_streams_once);
+    RUN_TEST(zova_single_file_cypher_parity_bounds_large_repositories);
+    RUN_TEST(zova_single_file_promotion_uses_repository_label_for_project_name);
     RUN_TEST(zova_single_file_promotion_real_repository_state);
 }

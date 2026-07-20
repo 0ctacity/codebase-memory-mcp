@@ -710,6 +710,26 @@ TEST(c_struct) {
     PASS();
 }
 
+/* Linux arch/x86/kernel/espfix_64.c reaches this expression without the
+ * generated kernel configuration includes. Undefined identifiers become 0
+ * during preprocessing, so the derived shift count is negative. Extraction
+ * must reject/fold that expression without executing an invalid C++ shift. */
+TEST(c_preprocessor_invalid_shift_does_not_trap) {
+    CBMFileResult *r = extract(
+        "#define ESPFIX_PAGE_SPACE (1UL << (P4D_SHIFT-PAGE_SHIFT-16))\n"
+        "#define ESPFIX_MAX_CPUS (ESPFIX_STACKS_PER_PAGE * ESPFIX_PAGE_SPACE)\n"
+        "#if CONFIG_NR_CPUS > ESPFIX_MAX_CPUS\n"
+        "#error too many CPUs\n"
+        "#endif\n"
+        "void init_espfix(void) {}\n",
+        CBM_LANG_C, "linux", "arch/x86/kernel/espfix_64.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "init_espfix"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C++ --- */
 TEST(cpp_class) {
     CBMFileResult *r = extract(
@@ -3573,6 +3593,7 @@ SUITE(extraction) {
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
     RUN_TEST(c_struct);
+    RUN_TEST(c_preprocessor_invalid_shift_does_not_trap);
     RUN_TEST(cpp_class);
 
     /* Scripting */

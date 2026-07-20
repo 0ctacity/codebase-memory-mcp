@@ -44,7 +44,13 @@ echo "PASS: zova test workflow builds once and runs requested suites directly"
 grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ROOT/build.zig"
 grep -q 'zova_graph_edge_delete_many' "$ROOT/build.zig"
 grep -q 'zova_vector_delete_many' "$ROOT/build.zig"
-echo "PASS: CBM build guard requires the format-8 Zova ABI surface"
+grep -q 'zova_graph_build_fresh_keyed' "$ROOT/build.zig"
+grep -q 'zova_graph_build_fresh_prepared_keyed' "$ROOT/build.zig"
+grep -q 'zova_graph_build_fresh_prepared_keyed_with_payloads' "$ROOT/build.zig"
+grep -q 'zova_graph_edge_payload_get_many' "$ROOT/build.zig"
+grep -q 'zova_graph_edge_payload_replace_many' "$ROOT/build.zig"
+grep -q 'zova_fresh_build_begin' "$ROOT/build.zig"
+echo "PASS: CBM build guard requires the format-9 Zova ABI surface"
 
 FAKE_ZOVA="$TMP/zova-source"
 PINNED_ZOVA="$TMP/zova-pinned"
@@ -53,8 +59,16 @@ cat > "$FAKE_ZOVA/include/zova.h" <<'EOF'
 typedef int zova_status;
 typedef struct zova_graph_edge_delete_many_request zova_graph_edge_delete_many_request;
 typedef struct zova_vector_delete_many_request zova_vector_delete_many_request;
+typedef struct zova_graph_build_fresh_keyed_request zova_graph_build_fresh_keyed_request;
+typedef struct zova_graph_build_fresh_prepared_keyed_with_payloads_request zova_graph_build_fresh_prepared_keyed_with_payloads_request;
 zova_status zova_graph_edge_delete_many(const zova_graph_edge_delete_many_request *request);
 zova_status zova_vector_delete_many(const zova_vector_delete_many_request *request);
+zova_status zova_graph_build_fresh_keyed(const zova_graph_build_fresh_keyed_request *request);
+zova_status zova_graph_build_fresh_prepared_keyed(const zova_graph_build_fresh_keyed_request *request);
+zova_status zova_graph_build_fresh_prepared_keyed_with_payloads(const zova_graph_build_fresh_prepared_keyed_with_payloads_request *request);
+zova_status zova_graph_edge_payload_get_many(const void *request);
+zova_status zova_graph_edge_payload_replace_many(const void *request);
+zova_status zova_fresh_build_begin(const void *request);
 EOF
 printf 'archive-v1\n' > "$FAKE_ZOVA/zig-out/lib/libzova_c.a"
 printf 'root-v1\n' > "$FAKE_ZOVA/src/root.zig"
@@ -62,13 +76,13 @@ printf 'dependency-v1\n' > "$FAKE_ZOVA/src/zova.zig"
 cat > "$FAKE_ZOVA/src/version.zig" <<'EOF'
 pub const package_version = "0.24.0";
 pub const abi_version_string = "0.24.0";
-pub const format_version = "8";
+pub const format_version = "9";
 EOF
 git -C "$FAKE_ZOVA" init -q
 git -C "$FAKE_ZOVA" config user.name "CBM Test"
 git -C "$FAKE_ZOVA" config user.email "cbm-test@example.invalid"
 git -C "$FAKE_ZOVA" add include/zova.h src/root.zig src/zova.zig src/version.zig
-git -C "$FAKE_ZOVA" commit -q -m "fake format-8 sdk"
+git -C "$FAKE_ZOVA" commit -q -m "fake format-9 sdk"
 FAKE_COMMIT=$(git -C "$FAKE_ZOVA" rev-parse HEAD)
 
 CBM_ZOVA_PIN_ROOT="$PINNED_ZOVA" \
@@ -77,14 +91,31 @@ ZOVA_SOURCE_ROOT="$FAKE_ZOVA" \
 
 grep -q 'zova_graph_edge_delete_many' "$PINNED_ZOVA/include/zova.h"
 grep -q 'zova_vector_delete_many' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_graph_build_fresh_keyed' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_graph_build_fresh_prepared_keyed' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_graph_build_fresh_prepared_keyed_with_payloads' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_graph_edge_payload_get_many' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_graph_edge_payload_replace_many' "$PINNED_ZOVA/include/zova.h"
+grep -q 'zova_fresh_build_begin' "$PINNED_ZOVA/include/zova.h"
 grep -qx 'archive-v1' "$PINNED_ZOVA/zig-out/lib/libzova_c.a"
 grep -qx 'root-v1' "$PINNED_ZOVA/src/root.zig"
 grep -qx 'dependency-v1' "$PINNED_ZOVA/src/zova.zig"
 grep -qx "source_commit=$FAKE_COMMIT" "$PINNED_ZOVA/manifest.txt"
-grep -qx 'format_version=8' "$PINNED_ZOVA/manifest.txt"
+grep -qx 'format_version=9' "$PINNED_ZOVA/manifest.txt"
 grep -qx 'abi_version=0.24.0' "$PINNED_ZOVA/manifest.txt"
 grep -qx 'graph_edge_delete_many_symbol=zova_graph_edge_delete_many' "$PINNED_ZOVA/manifest.txt"
 grep -qx 'vector_delete_many_symbol=zova_vector_delete_many' "$PINNED_ZOVA/manifest.txt"
+grep -qx 'graph_build_fresh_keyed_symbol=zova_graph_build_fresh_keyed' \
+  "$PINNED_ZOVA/manifest.txt"
+grep -qx 'graph_build_fresh_prepared_keyed_symbol=zova_graph_build_fresh_prepared_keyed' \
+  "$PINNED_ZOVA/manifest.txt"
+grep -qx 'graph_build_fresh_prepared_keyed_with_payloads_symbol=zova_graph_build_fresh_prepared_keyed_with_payloads' \
+  "$PINNED_ZOVA/manifest.txt"
+grep -qx 'graph_edge_payload_get_many_symbol=zova_graph_edge_payload_get_many' \
+  "$PINNED_ZOVA/manifest.txt"
+grep -qx 'graph_edge_payload_replace_many_symbol=zova_graph_edge_payload_replace_many' \
+  "$PINNED_ZOVA/manifest.txt"
+grep -qx 'fresh_build_begin_symbol=zova_fresh_build_begin' "$PINNED_ZOVA/manifest.txt"
 expected_header_hash=$(shasum -a 256 "$FAKE_ZOVA/include/zova.h" | awk '{print $1}')
 expected_library_hash=$(shasum -a 256 "$FAKE_ZOVA/zig-out/lib/libzova_c.a" | awk '{print $1}')
 grep -qx "header_sha256=$expected_header_hash" "$PINNED_ZOVA/manifest.txt"

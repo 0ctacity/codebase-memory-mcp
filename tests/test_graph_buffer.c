@@ -432,6 +432,22 @@ TEST(gbuf_many_nodes) {
     PASS();
 }
 
+TEST(gbuf_reserve_for_snapshot_load) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_EQ(cbm_gbuf_reserve(gb, 2048, 8192), 0);
+    ASSERT_EQ(cbm_gbuf_reserve(gb, 16, 32), 0);
+    ASSERT_EQ(cbm_gbuf_reserve(NULL, 1, 1), -1);
+    ASSERT_EQ(cbm_gbuf_reserve(gb, -1, 1), -1);
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "a", "a.c", 1, 1, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "b", "b.c", 1, 1, "{}");
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}"), 0);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 2);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Node edge cases ───────────────────────────────────────────── */
 
 TEST(gbuf_upsert_null_qn) {
@@ -644,14 +660,44 @@ TEST(gbuf_edge_dedup_merges_properties) {
     ASSERT_EQ(eid1, eid2);
     ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
 
-    /* Verify second insert's properties win (merge = replace) */
+    /* Duplicate properties resolve canonically, independent of insertion order. */
     const cbm_gbuf_edge_t **edges = NULL;
     int count = 0;
     cbm_gbuf_find_edges_by_source_type(gb, a, "CALLS", &edges, &count);
     ASSERT_EQ(count, 1);
-    ASSERT_STR_EQ(edges[0]->properties_json, "{\"weight\":5}");
+    ASSERT_STR_EQ(edges[0]->properties_json, "{\"weight\":1}");
 
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(gbuf_edge_dedup_properties_are_order_independent) {
+    cbm_gbuf_t *forward = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_t *reverse = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+
+    cbm_gbuf_insert_edge(forward, 1, 2, "CALLS", "{\"line\":5,\"args\":\"later\"}");
+    cbm_gbuf_insert_edge(forward, 1, 2, "CALLS", "{\"line\":4,\"args\":\"earlier\"}");
+    cbm_gbuf_insert_edge(reverse, 1, 2, "CALLS", "{\"line\":4,\"args\":\"earlier\"}");
+    cbm_gbuf_insert_edge(reverse, 1, 2, "CALLS", "{\"line\":5,\"args\":\"later\"}");
+
+    const cbm_gbuf_edge_t **forward_edges = NULL;
+    const cbm_gbuf_edge_t **reverse_edges = NULL;
+    int forward_count = 0;
+    int reverse_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(forward, 1, "CALLS", &forward_edges,
+                                                 &forward_count),
+              0);
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(reverse, 1, "CALLS", &reverse_edges,
+                                                 &reverse_count),
+              0);
+    ASSERT_EQ(forward_count, 1);
+    ASSERT_EQ(reverse_count, 1);
+    ASSERT_STR_EQ(forward_edges[0]->properties_json, reverse_edges[0]->properties_json);
+
+    cbm_gbuf_free(forward);
+    cbm_gbuf_free(reverse);
     PASS();
 }
 
@@ -1047,6 +1093,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_dump_empty);
     RUN_TEST(gbuf_flush_to_store);
     RUN_TEST(gbuf_many_nodes);
+    RUN_TEST(gbuf_reserve_for_snapshot_load);
 
     /* Node edge cases */
     RUN_TEST(gbuf_upsert_null_qn);
@@ -1065,6 +1112,7 @@ SUITE(graph_buffer) {
     /* Edge edge cases */
     RUN_TEST(gbuf_edge_nonexistent_endpoints);
     RUN_TEST(gbuf_edge_dedup_merges_properties);
+    RUN_TEST(gbuf_edge_dedup_properties_are_order_independent);
     RUN_TEST(gbuf_edge_count_empty);
     RUN_TEST(gbuf_edge_count_by_type_missing);
     RUN_TEST(gbuf_delete_edges_preserves_other_types);

@@ -91,7 +91,7 @@ report = {
     "binary_sha256": digest(build),
     "test_runner_sha256": digest(runner),
     "cbm_schema_version": 6,
-    "zova_format_version": 8,
+    "zova_format_version": 9,
     "machine": {"platform": platform.platform(), "machine": platform.machine()},
     "baseline_sha256": {
         name: digest(baselines / f"{name}.json")

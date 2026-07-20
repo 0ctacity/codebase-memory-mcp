@@ -626,7 +626,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                  int file_count);
 int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
                                       cbm_file_info_t *files, int file_count,
-                                      cbm_zova_workspace_snapshot_t *snapshot);
+                                      cbm_zova_workspace_snapshot_t *snapshot,
+                                      cbm_gbuf_t *preloaded_graph);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);

@@ -104,9 +104,15 @@ fn checkZovaInputs(b: *std.Build, cfg: Config) void {
         !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_in") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_by_id_in") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_graph_edge_delete_many") or
-        !std.mem.containsAtLeast(u8, header, 1, "zova_vector_delete_many"))
+        !std.mem.containsAtLeast(u8, header, 1, "zova_vector_delete_many") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_build_fresh_keyed") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_build_fresh_prepared_keyed") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_build_fresh_prepared_keyed_with_payloads") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_edge_payload_get_many") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_graph_edge_payload_replace_many") or
+        !std.mem.containsAtLeast(u8, header, 1, "zova_fresh_build_begin"))
     {
-        std.debug.panic("error: Zova C ABI 0.24.0 format-8 header with SQL callbacks, candidate vector search, and batch deletion is required: {s}", .{header_path});
+        std.debug.panic("error: Zova C ABI 0.24.0 format-9 header with SQL callbacks, candidate vector search, batch deletion, prepared payload graph builds, edge payload access, and fresh-build sessions is required: {s}", .{header_path});
     }
 }
 
@@ -444,6 +450,7 @@ const native_sources = [_][]const u8{
     "src/store/store.c",
     "src/zova/cbm_zova.c",
     "src/zova/cbm_zova_publish_model.c",
+    "src/zova/cbm_zova_edge_payload.c",
     "src/zova/cbm_zova_delta.c",
     "src/zova/cbm_zova_operations.c",
     "src/zova/cbm_zova_migration.c",

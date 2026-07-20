@@ -56,6 +56,10 @@ cbm_gbuf_t *cbm_gbuf_new(const char *project, const char *root_path);
 cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
                                     _Atomic int64_t *id_source);
 
+/* Pre-size the primary node/edge storage for a known snapshot. Never shrinks.
+ * Returns 0 on success, -1 for invalid input or allocation failure. */
+int cbm_gbuf_reserve(cbm_gbuf_t *gb, int node_count, int edge_count);
+
 /* Free the graph buffer and all owned data. NULL-safe. */
 void cbm_gbuf_free(cbm_gbuf_t *gb);
 
@@ -170,6 +174,10 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
  * before the global semantic pass recomputes the complete corpus. */
 void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb);
 
+/* Mark both semantic vector collections unchanged for the next authoritative
+ * delta publication. Valid only when the graph buffer contains no vectors. */
+int cbm_gbuf_reuse_zova_semantic_vectors(cbm_gbuf_t *gb);
+
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 
 /* Dump the entire buffer to a SQLite file using the direct page writer.
@@ -178,6 +186,9 @@ void cbm_gbuf_clear_semantic_vectors(cbm_gbuf_t *gb);
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 /* Finalize stable node/edge/vector identities without creating a SQLite file. */
 int cbm_gbuf_prepare_zova_dump(cbm_gbuf_t *gb);
+/* Incremental publication retains the delta publication model and therefore
+ * only finalizes dense dump arrays. */
+int cbm_gbuf_prepare_zova_dump_delta(cbm_gbuf_t *gb);
 
 /* Create the optional Zova sidecar after the SQLite dump has completed.
  * In i8-vector mode it writes typed collections from the finalized in-memory
@@ -188,7 +199,7 @@ int cbm_gbuf_finalize_zova_sidecar(const cbm_gbuf_t *gb, const char *path);
  * caller owns the optional file-hash and summary inputs and the result is
  * filled by cbm_zova_user_database_publish_workspace(). */
 int cbm_gbuf_publish_zova_user_database(
-    const cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
+    cbm_gbuf_t *gb, const cbm_zova_file_hash_input_t *file_hashes,
     int file_hash_count, const cbm_zova_project_summary_input_t *project_summary,
     cbm_zova_workspace_generation_result_t *out_result);
 int cbm_gbuf_publish_zova_user_database_delta(

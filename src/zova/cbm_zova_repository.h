@@ -5,6 +5,7 @@
 #include "zova/cbm_zova.h"
 
 typedef struct cbm_zova_repository cbm_zova_repository_t;
+typedef struct cbm_gbuf cbm_gbuf_t;
 
 typedef uint32_t cbm_zova_snapshot_components_t;
 
@@ -25,9 +26,42 @@ typedef enum {
     CBM_ZOVA_SNAPSHOT_STALE = -2,
 } cbm_zova_snapshot_status_t;
 
+enum {
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_OPEN = 1u << 0,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_HEADER = 1u << 1,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_INTEGRITY = 1u << 2,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_NODES = 1u << 3,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_EDGES = 1u << 4,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_HASHES_SUMMARY = 1u << 5,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_CLOSE = 1u << 6,
+    CBM_ZOVA_SNAPSHOT_BASE_PHASE_ALL = (1u << 7) - 1,
+};
+
 typedef struct {
     double base_ms;
     double optional_ms;
+    double open_ms;
+    double header_ms;
+    double integrity_ms;
+    double nodes_sql_ms;
+    double nodes_native_ms;
+    double nodes_finalize_ms;
+    double edges_sql_ms;
+    double edges_native_ms;
+    double edges_finalize_ms;
+    double hashes_summary_ms;
+    double close_ms;
+    double graph_buffer_ms;
+    uint32_t base_phase_mask;
+    uint64_t node_rows;
+    uint64_t edge_rows;
+    uint64_t edge_scan_pages;
+    uint64_t edge_native_rows;
+    uint64_t edge_logical_rows;
+    uint64_t edge_keyed_read_count;
+    uint64_t edge_string_arena_chunks;
+    uint64_t edge_string_arena_bytes;
+    uint64_t file_hash_rows;
     cbm_zova_snapshot_components_t hydrated_components;
     uint64_t topology_rows;
     uint64_t node_vector_rows;
@@ -50,11 +84,13 @@ typedef struct cbm_zova_workspace_snapshot {
     int64_t generation;
     CBMDumpNode *nodes;
     char **node_stable_ids;
+    int64_t *zova_node_keys;
     uint64_t *node_source_ordinals;
     int node_count;
     CBMDumpEdge *edges;
     char **edge_ids;
     int edge_count;
+    void *edge_string_arena;
     cbm_zova_snapshot_topology_edge_t *topology_edges;
     int topology_edge_count;
     CBMDumpVector *node_vectors;
@@ -81,6 +117,26 @@ int cbm_zova_repository_find_node_by_qn(cbm_zova_repository_t *repo, const char 
 int cbm_zova_repository_find_node_by_stable_id(cbm_zova_repository_t *repo,
                                                 const char *workspace_id,
                                                 const char *stable_id, cbm_node_t *out);
+int cbm_zova_repository_find_nodes_by_stable_ids(cbm_zova_repository_t *repo,
+                                                  const char *workspace_id,
+                                                  const char *const *stable_ids,
+                                                  int count, cbm_node_t **out);
+int cbm_zova_repository_find_nodes_by_keys(cbm_zova_repository_t *repo,
+                                           const char *workspace_id,
+                                           const int64_t *node_keys,
+                                           int count, cbm_node_t **out);
+int cbm_zova_repository_find_node_by_numeric_id(cbm_zova_repository_t *repo,
+                                                 const char *workspace_id,
+                                                 int64_t numeric_id, cbm_node_t *out);
+int cbm_zova_repository_find_nodes_by_file_overlap(cbm_zova_repository_t *repo,
+                                                    const char *workspace_id,
+                                                    const char *file_path,
+                                                    int start_line, int end_line,
+                                                    cbm_node_t **out, int *out_count);
+int cbm_zova_repository_stable_id_for_numeric_id(cbm_zova_repository_t *repo,
+                                                  const char *workspace_id,
+                                                  int64_t numeric_id, char *out,
+                                                  size_t out_size);
 int cbm_zova_repository_find_edges(cbm_zova_repository_t *repo, const char *workspace_id,
                                    const char *stable_id,
                                    const char *direction, cbm_edge_t **out, int *out_count);
@@ -104,9 +160,15 @@ int cbm_zova_repository_export_snapshot(const char *zova_path, const char *works
  * incremental delta, including the authoritative native vector payloads. */
 int cbm_zova_repository_export_incremental_snapshot(
     const char *zova_path, const char *workspace_id, cbm_zova_workspace_snapshot_t *out);
+int cbm_zova_repository_export_incremental_snapshot_to_graph(
+    const char *zova_path, const char *workspace_id, cbm_zova_workspace_snapshot_t *out,
+    cbm_gbuf_t *graph);
 int cbm_zova_repository_hydrate_incremental_components(
     const char *zova_path, const char *workspace_id, int64_t expected_generation,
     cbm_zova_snapshot_components_t requested, cbm_zova_workspace_snapshot_t *snapshot);
+int cbm_zova_workspace_snapshot_format_edge_id(
+    const cbm_zova_workspace_snapshot_t *snapshot, int edge_index,
+    char *out, size_t out_size);
 void cbm_zova_workspace_snapshot_free(cbm_zova_workspace_snapshot_t *snapshot);
 
 #endif

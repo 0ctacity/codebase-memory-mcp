@@ -11,7 +11,7 @@
 #define CBM_WITH_ZOVA 0
 #endif
 
-#define CBM_ZOVA_DATABASE_SCHEMA_VERSION 6
+#define CBM_ZOVA_DATABASE_SCHEMA_VERSION 7
 
 #if CBM_WITH_ZOVA
 typedef struct zova_database zova_database;
@@ -45,6 +45,7 @@ typedef struct {
 typedef struct cbm_zova_vector_session cbm_zova_vector_session_t;
 typedef struct cbm_zova_graph_session cbm_zova_graph_session_t;
 typedef struct cbm_zova_publish_model cbm_zova_publish_model_t;
+typedef struct cbm_zova_publish_model cbm_zova_prepared_view_t;
 typedef struct cbm_zova_workspace_delta cbm_zova_workspace_delta_t;
 
 typedef struct {
@@ -171,6 +172,8 @@ const char *cbm_zova_repack_phase_name(cbm_zova_repack_phase_t phase);
 int cbm_zova_workspace_id_validate(const char *workspace_id);
 int cbm_zova_workspace_id_for_root(const char *root_path, char *out_workspace_id,
                                    size_t out_workspace_id_size);
+int cbm_zova_workspace_token_id_v1(const char *workspace_id, const char *token,
+                                   char *out, size_t out_size);
 
 int cbm_zova_sidecar_path(const char *db_path, char *out, size_t out_sz);
 int cbm_zova_workspace_registry_path(char *out, size_t out_size);
@@ -328,8 +331,13 @@ typedef struct {
     double native_graph_nodes_ms;
     double native_graph_edges_ms;
     double native_graph_validate_ms;
+    double native_graph_key_generation_ms;
     double native_graph_cleanup_ms;
     double native_vectors_ms;
+    double fresh_validation_ms;
+    double fresh_index_ms;
+    double fresh_commit_ms;
+    double fresh_build_ms;
     double readback_ms;
     uint64_t full_clear_count;
     uint64_t unchanged_rewrite_count;
@@ -358,10 +366,13 @@ typedef struct {
     uint64_t database_open_count;
     uint64_t database_close_count;
     uint64_t database_handle_open_count;
+    uint64_t fresh_page_size_vacuum_count;
     uint64_t transaction_count;
     uint64_t full_clear_count;
     uint64_t canonical_node_fts_passes;
     uint64_t canonical_edge_passes;
+    uint64_t native_graph_fresh_calls;
+    uint64_t native_graph_prepared_calls;
     uint64_t native_graph_node_calls;
     uint64_t native_graph_edge_calls;
     uint64_t native_node_vector_calls;
@@ -380,6 +391,7 @@ typedef struct {
     uint64_t full_fts_trigger_rows_avoided;
     uint64_t full_node_guard_validation_statements;
     uint64_t full_edge_guard_validation_statements;
+    uint64_t readback_count_scan_count;
 } cbm_zova_publish_test_metrics_t;
 
 void cbm_zova_publish_test_metrics_reset(void);
@@ -399,6 +411,9 @@ int cbm_zova_user_database_publish_model_tx(
 #endif
 int cbm_zova_user_database_publish_model(
     const char *zova_path, const cbm_zova_publish_model_t *model,
+    cbm_zova_workspace_generation_result_t *out_result);
+int cbm_zova_user_database_publish_prepared_view(
+    const char *zova_path, const cbm_zova_prepared_view_t *view,
     cbm_zova_workspace_generation_result_t *out_result);
 int cbm_zova_user_database_publish_delta(
     const char *zova_path, const cbm_zova_publish_model_t *after,
