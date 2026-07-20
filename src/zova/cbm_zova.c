@@ -1321,6 +1321,7 @@ static int open_zova(const char *path, bool read_only, cbm_zova_db_t *out) {
         zova_message_free(&err);
         return -1;
     }
+    user_publish_test_metrics.database_handle_open_count++;
     zova_message_free(&err);
     if (cbm_zova_register_sql_functions(out->db) != 0 ||
         zova_database_exec(&(zova_database_exec_request){
@@ -1493,26 +1494,34 @@ static int prepare_zova(zova_database *db, const char *sql, zova_statement **out
     return status_ok(zova_database_prepare(&req), db, phase);
 }
 
-static int configure_new_zova_page_size(const char *path) {
-    sqlite3 *db = NULL;
-    sqlite3_stmt *stmt = NULL;
-    int page_size = 0;
-    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
-    if (rc == SQLITE_OK)
-        rc = sqlite3_exec(db,
-                          "PRAGMA page_size=65536; VACUUM; PRAGMA journal_mode=WAL",
-                          NULL, NULL, NULL);
-    if (rc == SQLITE_OK)
-        rc = sqlite3_prepare_v2(db, "PRAGMA page_size", -1, &stmt, NULL);
-    if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW)
-        page_size = sqlite3_column_int(stmt, 0);
-    if (stmt) sqlite3_finalize(stmt);
-    if (db) sqlite3_close(db);
-    return rc == SQLITE_OK && page_size == 65536 ? 0 : -1;
+static int configure_new_zova_page_size(zova_database *db) {
+    zova_statement *stmt = NULL;
+    int64_t page_size = 0;
+    int rc = status_ok(zova_database_exec(&(zova_database_exec_request){
+                           .db = db,
+                           .sql = "PRAGMA page_size=65536;VACUUM;PRAGMA journal_mode=WAL"}),
+                       db, "zova.page_size_configure");
+    if (rc == 0)
+        rc = prepare_zova(db, "PRAGMA page_size", &stmt, "zova.page_size_prepare");
+    zova_step_result step = ZOVA_STEP_DONE;
+    if (rc == 0)
+        rc = status_ok(zova_statement_step(&(zova_statement_step_request){
+                           .statement = stmt, .out_result = &step}),
+                       db, "zova.page_size_step");
+    if (rc == 0 && step == ZOVA_STEP_ROW)
+        rc = status_ok(zova_statement_column_int64(
+                           &(zova_statement_column_int64_request){
+                               .statement = stmt, .index = 0, .out_value = &page_size}),
+                       db, "zova.page_size_column");
+    else if (rc == 0)
+        rc = -1;
+    if (stmt && zova_statement_finalize(stmt) != ZOVA_OK) rc = -1;
+    return rc == 0 && page_size == 65536 ? 0 : -1;
 }
 
 static int open_or_create_zova(const char *path, cbm_zova_db_t *out) {
-    if (cbm_file_exists(path)) {
+    bool exists = cbm_file_exists(path);
+    if (exists) {
         return open_zova(path, false, out);
     }
     memset(out, 0, sizeof(*out));
@@ -1529,13 +1538,19 @@ static int open_or_create_zova(const char *path, cbm_zova_db_t *out) {
         zova_message_free(&err);
         return -1;
     }
+    user_publish_test_metrics.database_handle_open_count++;
     zova_message_free(&err);
-    /* Zova initializes its private catalog at SQLite's 4 KiB default. Close
-     * the still-empty database, select the same 64 KiB pages used by the
-     * compatibility artifacts, then reopen through Zova before callers create
-     * user schema or write data. */
-    close_zova(out);
-    if (configure_new_zova_page_size(path) != 0 || open_zova(path, false, out) != 0) {
+    /* The private catalog is still empty enough to VACUUM into 64 KiB pages.
+     * Keep the newly created Zova handle instead of closing it, configuring
+     * the file through raw SQLite, format-checking, and reopening it. */
+    if (configure_new_zova_page_size(out->db) != 0) {
+        close_zova(out);
+        cbm_unlink(path);
+        return -1;
+    }
+    if (cbm_zova_register_sql_functions(out->db) != 0 ||
+        zova_database_exec(&(zova_database_exec_request){
+            .db = out->db, .sql = "PRAGMA foreign_keys=ON"}) != ZOVA_OK) {
         close_zova(out);
         cbm_unlink(path);
         return -1;

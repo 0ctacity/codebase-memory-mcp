@@ -46,6 +46,7 @@ struct cbm_zova_publish_model {
     cbm_zova_workspace_generation_input_t input;
     model_node_t *nodes;
     int node_count;
+    const char **dense_ids;
     model_id_map_t *id_map;
     model_edge_t *edges;
     int edge_count;
@@ -75,6 +76,15 @@ static void *model_calloc(size_t count, size_t size) {
     return index == model_fail_allocation_at ? NULL : calloc(count, size);
 }
 
+static char *model_dup(const char *value) {
+    if (!value) return NULL;
+    size_t length = strlen(value);
+    char *copy = model_malloc(length + 1);
+    if (!copy) return NULL;
+    memcpy(copy, value, length + 1);
+    return copy;
+}
+
 void cbm_zova_publish_model_test_fail_allocation_at(int64_t index) {
     model_fail_allocation_at = index;
     model_allocation_count = 0;
@@ -96,15 +106,6 @@ static double model_elapsed_ms(const struct timespec *started,
                                const struct timespec *finished) {
     return (double)(finished->tv_sec - started->tv_sec) * 1000.0 +
            (double)(finished->tv_nsec - started->tv_nsec) / 1000000.0;
-}
-
-static char *model_dup(const char *value) {
-    if (!value) return NULL;
-    size_t length = strlen(value);
-    char *copy = model_malloc(length + 1);
-    if (!copy) return NULL;
-    memcpy(copy, value, length + 1);
-    return copy;
 }
 
 static int model_nonzero(const uint8_t *values, int length) {
@@ -266,6 +267,10 @@ static int model_token_vector_compare(const void *left_ptr, const void *right_pt
 }
 
 static const char *model_lookup(const cbm_zova_publish_model_t *model, int64_t dump_id) {
+    if (model->dense_ids) {
+        if (dump_id <= 0 || dump_id > model->node_count) return NULL;
+        return model->dense_ids[dump_id - 1];
+    }
     int low = 0;
     int high = model->node_count;
     while (low < high) {
@@ -323,9 +328,10 @@ static int model_build_nodes(cbm_zova_publish_model_t *model) {
     int count = model->input.node_count;
     if (count == 0) return 0;
     model->nodes = model_calloc((size_t)count, sizeof(*model->nodes));
-    model->id_map = model_calloc((size_t)count, sizeof(*model->id_map));
-    if (!model->nodes || !model->id_map) return -1;
+    model->dense_ids = model_calloc((size_t)count, sizeof(*model->dense_ids));
+    if (!model->nodes || !model->dense_ids) return -1;
     model->node_count = count;
+    int dense_ids = 1;
     for (int i = 0; i < count; i++) {
         const CBMDumpNode *node = &model->input.nodes[i];
         char stable_id[MODEL_ID_CAP];
@@ -343,14 +349,29 @@ static int model_build_nodes(cbm_zova_publish_model_t *model) {
             .source = node, .stable_id = owned_id, .ordinal = 0,
             .source_ordinal = (uint64_t)i};
         model->nodes[i].fts_name = fts_name;
-        model->id_map[i] = (model_id_map_t){.dump_id = node->id, .stable_id = owned_id};
+        if (node->id > count || model->dense_ids[node->id - 1]) {
+            dense_ids = 0;
+        } else {
+            model->dense_ids[node->id - 1] = owned_id;
+        }
         model->metrics.stable_node_id_computations++;
         model->metrics.camel_split_computations++;
     }
-    qsort(model->id_map, (size_t)count, sizeof(*model->id_map), model_id_compare);
-    model->metrics.global_sorts++;
-    for (int i = 1; i < count; i++)
-        if (model->id_map[i - 1].dump_id == model->id_map[i].dump_id) return -1;
+    if (!dense_ids) {
+        free(model->dense_ids);
+        model->dense_ids = NULL;
+        model->id_map = model_calloc((size_t)count, sizeof(*model->id_map));
+        if (!model->id_map) return -1;
+        for (int i = 0; i < count; i++) {
+            model->id_map[i] = (model_id_map_t){
+                .dump_id = model->nodes[i].value.source->id,
+                .stable_id = model->nodes[i].value.stable_id};
+        }
+        qsort(model->id_map, (size_t)count, sizeof(*model->id_map), model_id_compare);
+        model->metrics.global_sorts++;
+        for (int i = 1; i < count; i++)
+            if (model->id_map[i - 1].dump_id == model->id_map[i].dump_id) return -1;
+    }
     qsort(model->nodes, (size_t)count, sizeof(*model->nodes), model_node_compare);
     model->metrics.global_sorts++;
     for (int i = 0; i < count; i++) {
@@ -652,6 +673,7 @@ void cbm_zova_publish_model_free(cbm_zova_publish_model_t *model) {
     for (int i = 0; i < model->token_vector_count; i++)
         free((char *)model->token_vectors[i].value.token_id);
     free(model->nodes);
+    free(model->dense_ids);
     free(model->id_map);
     free(model->edges);
     free(model->topology);

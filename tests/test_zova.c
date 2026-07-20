@@ -3020,6 +3020,7 @@ TEST(zova_atomic_workspace_publisher_commits_complete_generation) {
     cbm_zova_publish_test_metrics_get(&publish_metrics);
     ASSERT_EQ(publish_metrics.database_open_count, 1);
     ASSERT_EQ(publish_metrics.database_close_count, 1);
+    ASSERT_EQ(publish_metrics.database_handle_open_count, 1);
     ASSERT_EQ(publish_metrics.transaction_count, 1);
     ASSERT_EQ(publish_metrics.full_clear_count, 1);
     ASSERT_EQ(publish_metrics.canonical_node_fts_passes, 1);
@@ -4416,7 +4417,10 @@ TEST(zova_publish_model_is_deterministic_and_validates_identity) {
     ASSERT_EQ(metrics.token_id_computations, 1);
     ASSERT_EQ(metrics.camel_split_computations, 2);
     ASSERT_EQ(metrics.endpoint_lookups, 4);
-    ASSERT_TRUE(metrics.global_sorts <= 7);
+    /* Dense graph-buffer IDs are already a complete 1..node_count keyspace.
+     * The publication model must resolve them directly instead of sorting a
+     * second dump-ID lookup table. */
+    ASSERT_EQ(metrics.global_sorts, 6);
 
     CBMDumpNode reversed_nodes[] = {nodes[1], nodes[0]};
     CBMDumpEdge reversed_edges[] = {edges[1], edges[0]};
@@ -4438,6 +4442,30 @@ TEST(zova_publish_model_is_deterministic_and_validates_identity) {
     ASSERT_STR_EQ(first_digest->node_vector_sha256, second_digest->node_vector_sha256);
     ASSERT_STR_EQ(first_digest->token_vector_sha256, second_digest->token_vector_sha256);
     cbm_zova_publish_model_free(second);
+
+    CBMDumpNode sparse_nodes[] = {nodes[0], nodes[1]};
+    sparse_nodes[0].id = 20;
+    sparse_nodes[1].id = 10;
+    CBMDumpEdge sparse_edge = edges[0];
+    sparse_edge.source_id = 10;
+    sparse_edge.target_id = 20;
+    CBMDumpVector sparse_vector = node_vectors[0];
+    sparse_vector.node_id = 10;
+    cbm_zova_workspace_generation_input_t sparse = input;
+    sparse.nodes = sparse_nodes;
+    sparse.edges = &sparse_edge;
+    sparse.edge_count = 1;
+    sparse.node_vectors = &sparse_vector;
+    sparse.node_vector_count = 1;
+    cbm_zova_publish_model_t *sparse_model = NULL;
+    ASSERT_EQ(cbm_zova_publish_model_build(workspace_id, &sparse, &sparse_model), 0);
+    ASSERT_NOT_NULL(cbm_zova_publish_model_stable_id_for_dump_id(sparse_model, 10));
+    ASSERT_NOT_NULL(cbm_zova_publish_model_stable_id_for_dump_id(sparse_model, 20));
+    ASSERT_NULL(cbm_zova_publish_model_stable_id_for_dump_id(sparse_model, 1));
+    cbm_zova_publish_model_metrics_t sparse_metrics = {0};
+    cbm_zova_publish_model_metrics(sparse_model, &sparse_metrics);
+    ASSERT_EQ(sparse_metrics.global_sorts, 7);
+    cbm_zova_publish_model_free(sparse_model);
 
     cbm_zova_publish_model_test_fail_allocation_at(-1);
     cbm_zova_publish_model_t *allocation_probe = NULL;

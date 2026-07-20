@@ -357,6 +357,7 @@ typedef struct {
 typedef struct {
     uint64_t database_open_count;
     uint64_t database_close_count;
+    uint64_t database_handle_open_count;
     uint64_t transaction_count;
     uint64_t full_clear_count;
     uint64_t canonical_node_fts_passes;
