@@ -1,26 +1,49 @@
-# codebase-memory-mcp
+# codebase-memory-mcp — Zova-native fork
 
-[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![GitHub Release](https://img.shields.io/github/v/release/0ctacity/codebase-memory-mcp?style=flat&color=blue)](https://github.com/0ctacity/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![CI](https://img.shields.io/github/actions/workflow/status/0ctacity/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/0ctacity/codebase-memory-mcp/actions/workflows/dry-run.yml)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-9_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agents-11-purple)](https://github.com/DeusData/codebase-memory-mcp)
-[![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
-[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
-[![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
-[![VirusTotal](https://img.shields.io/badge/VirusTotal-scanned_every_release-brightgreen?logo=virustotal)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
+[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/0ctacity/codebase-memory-mcp/releases/latest)
 [![arXiv](https://img.shields.io/badge/arXiv-2603.27277-b31b1b?logo=arxiv)](https://arxiv.org/abs/2603.27277)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
+> [!IMPORTANT]
+> This repository is a fork of the original [DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp). It tracks upstream loosely: useful fixes and features are adopted selectively, but this fork does not mirror upstream releases or preserve identical storage behavior.
+
+This fork combines codebase-memory-mcp's tree-sitter/LSP indexing and MCP tools with a **Zova-native shared database**. Zova owns graph topology and vector search in full-authority mode, enabling fast incremental publication, native traversal, compact large-repository storage, and searches spanning several indexed repositories.
 
 High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, and Rust — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
 
+## This fork
+
+The current development version uses **CBM schema 7** with a pinned **Zova format 9 / ABI 0.25.0** SDK. Compared with the original pure-SQLite implementation, it adds:
+
+- **One shared database** — multiple repositories live as isolated workspaces in `cbm.zova`.
+- **Cross-repository discovery** — one `search_graph` request can search selected projects or every healthy workspace and identifies the owning project for each result.
+- **Native graph and vectors** — topology, edge payloads, traversal indexes, and int8 vector collections use Zova's native stores rather than duplicate SQLite projections.
+- **Incremental-first performance** — unchanged records are not republished; native delta APIs update only the affected graph, metadata, FTS, and vector records.
+- **Exact compatibility checks** — benchmarked Zova results are required to match the pure-SQLite CBM result set exactly, with no unexpected fallback.
+
+The Zova full-authority route is still opt-in while operational tooling and performance work continue. The original per-project SQLite route remains available for comparison and rollback.
+
+### Latest Zova-native results
+
+ReleaseSafe medians compare this fork's Zova-native mode with the same CBM build using pure SQLite. Lower indexing time, storage, and vector p95 are better.
+
+| Area | TOPS vs pure SQLite | Deno vs pure SQLite |
+|---|---:|---:|
+| Full indexing | 5.7% slower | 6.1% slower |
+| Incremental indexing | 76.9% faster | 51.6% faster |
+| Storage | 12.9% larger | 2.4% smaller |
+| Vector p95 | 76.6% faster | 86.2% faster |
+| Correctness | Exact | Exact |
+
+Full indexing remains the current tradeoff. Zova's advantage is strongest for repeated indexing and vector retrieval; its fixed database overhead is more visible on a small repository such as TOPS, while it is already smaller than pure SQLite on Deno.
+
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
-> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. That is what it is designed to do. If you prefer to audit before running, the [full source is here](https://github.com/DeusData/codebase-memory-mcp) — every release binary is signed, checksummed, and scanned by 70+ antivirus engines. All processing happens 100% locally; your code never leaves your machine. Found a security issue? We want to know — see [SECURITY.md](SECURITY.md). Security is Priority #1 for us.
+> **Security & Trust** — This tool reads your codebase and writes to your agent configuration files. Audit the [fork source](https://github.com/0ctacity/codebase-memory-mcp) before running if required. Indexing and queries run locally; source code is not sent to a hosted service. Report security issues through [SECURITY.md](SECURITY.md).
 
 <p align="center">
   <img src="docs/graph-ui-screenshot.png" alt="Graph visualization UI showing the codebase-memory-mcp knowledge graph" width="800">
@@ -28,9 +51,11 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
   <em>Built-in 3D graph visualization (UI variant) — explore your knowledge graph at localhost:9749</em>
 </p>
 
-## Why codebase-memory-mcp
+## Why this fork
 
-- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline: LZ4 compression, in-memory SQLite, fused Aho-Corasick pattern matching. Memory released after indexing.
+- **Fast updates after the first index** — native delta publication makes incremental indexing 51.6%–76.9% faster in the current TOPS and Deno benchmarks.
+- **Cross-repository context** — search frontend, backend, libraries, or any other selected project set in one query without requiring repository names such as `frontend` or `backend`.
+- **Exact results** — Zova-native benchmark parity is checked against the pure-SQLite implementation.
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
@@ -184,10 +209,10 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
 - **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, and Rust — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
-- **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
+- **Prepared Zova publication**: finalized nodes, grouped topology edges with compact payloads, metadata, FTS rows, and vectors are published atomically into the shared database.
 
 ### Distribution & operation
-- **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Single static binary, zero infrastructure**: Zova embeds SQLite and persists the shared full-authority store at `~/.cache/codebase-memory-mcp/cbm.zova`.
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*"}'`
@@ -227,7 +252,7 @@ Agent: presents the call chain in plain English
 
 ## Performance
 
-Benchmarked on Apple M3 Pro:
+The Zova-native comparison above is the current fork benchmark. The following upstream-scale figures remain useful as parser and query reference points, but they are not measurements of the current Zova full-authority route:
 
 | Operation | Time | Notes |
 |-----------|------|-------|
@@ -507,9 +532,10 @@ CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 scripts/zova-single-file-validation.sh
 It retains only a JSON report on success; normal indexing and the default
 `.db`/sidecar authority are unchanged.
 
-The current flagged schema is CBM v6 on Zova format v8. It removes projection
+The current flagged schema is CBM v7 on Zova format v9. It removes projection
 tables, duplicate workspace FTS/rowmaps, compatibility-vector tables, and the
-separate native norm table. Full publication uses one normalized model;
+separate native norm table. Native topology edges carry compact CBM payloads,
+and fresh full publication uses Zova's prepared builder;
 `CBM_MODE_INCREMENTAL` computes and commits an atomic delta without clearing
 the workspace or rewriting unchanged rows. Migration from v5/v7 uses a
 verified temporary database and resumable atomic replacement. The flag remains
@@ -740,7 +766,8 @@ src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
-  store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
+  store/              Query/storage compatibility layer and cross-workspace search
+  zova/               Shared database, native graph/vector publication, migration, and operations
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor
   discover/           File discovery (.gitignore, .cbmignore, symlink handling)
@@ -753,26 +780,10 @@ internal/cbm/         Vendored tree-sitter grammars (158 languages) + AST extrac
 
 ## Security
 
-Every release binary is verified through a multi-layer pipeline before publication:
-
-- **VirusTotal** — all binaries scanned by 70+ antivirus engines (zero detections required to publish)
-- **SLSA Level 3** — cryptographic build provenance generated by GitHub Actions; verify with `gh attestation verify <file> --repo DeusData/codebase-memory-mcp`
-- **Sigstore cosign** — keyless signatures on all artifacts; bundles included in every release
-- **SHA-256 checksums** — `checksums.txt` published with every release; verified by both install scripts before extraction
-- **CodeQL SAST** — blocks release pipeline if any open alerts remain
-- **Zero runtime dependencies** — no transitive supply chain; all libraries vendored at compile time
-
-### v0.7.0 VirusTotal scans
-
-| Binary | SHA-256 | VirusTotal |
-|--------|---------|-----------|
-| `linux-amd64` | `8e12bb2d6ead7f20a6d3...` | [0/72 ✅](https://www.virustotal.com/gui/file/8e12bb2d6ead7f20a6d3bf2be1e51f978c38acce810f0734f510d134b039d152/detection) |
-| `linux-arm64` | `10f7136bfbf3950c6b2a...` | [0/72 ✅](https://www.virustotal.com/gui/file/10f7136bfbf3950c6b2a1a950bbf85e88b97ee55ab00b4dfbc2a5e9c2ede8672/detection) |
-| `darwin-arm64` | `7062a7408906344bf4f8...` | [0/72 ✅](https://www.virustotal.com/gui/file/7062a7408906344bf4f835e9580048af85d12dd2b7cec0edf869df93ad9a0592/detection) |
-| `darwin-amd64` | `28c6d640e1a0ac7bfcab...` | [0/72 ✅](https://www.virustotal.com/gui/file/28c6d640e1a0ac7bfcab5094c2186eced5264a20dcdffcb4455a1b28c5df2171/detection) |
-| `windows-amd64` | `9c3ddcf78368fd4fa891...` | [0/72 ✅](https://www.virustotal.com/gui/file/9c3ddcf78368fd4fa89156a553641bf1e03640b4fb6dd29a12c84aa5bc98cd86/detection) |
-
-Scan links for every release are also included in the GitHub Release notes automatically.
+Indexing, storage, vector search, and graph queries run locally. The project does not upload source
+code or require a hosted database, API key, or model service. Release archives include SHA-256
+checksums, and the installers verify the selected archive before extraction. See
+[SECURITY.md](SECURITY.md) for vulnerability reporting and the current security policy.
 
 ## License
 
