@@ -2534,6 +2534,10 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "search_graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
     ASSERT(strstr(instr, "get_code_snippet") != NULL);
+    ASSERT(strstr(instr, "list_projects") != NULL);
+    ASSERT(strstr(instr, "projects=[\"*\"]") != NULL);
+    ASSERT(strstr(instr, "AnotherFolder/codebase-memory-mcp") != NULL);
+    ASSERT(strstr(instr, "returned `project`") != NULL);
     PASS();
 }
 

@@ -3,9 +3,11 @@
 #include "zova/cbm_zova.h"
 #include "zova/cbm_zova_edge_payload.h"
 #include "foundation/compat.h"
+#include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/sha256.h"
 #include "graph_buffer/graph_buffer.h"
+#include "pipeline/pipeline.h"
 
 #include <limits.h>
 #include <stdio.h>
@@ -18,9 +20,17 @@
 struct cbm_zova_repository {
     zova_database *db;
     char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
-    char project[256];
+    char project[CBM_SZ_4K];
     int64_t workspace_key;
     int64_t generation;
+};
+
+struct cbm_zova_catalog {
+    zova_database *db;
+    cbm_zova_catalog_project_t *projects;
+    int count;
+    bool transaction_open;
+    char error[512];
 };
 
 enum {
@@ -235,19 +245,45 @@ static double repo_elapsed_ms(struct timespec started) {
 
 cbm_zova_repository_t *cbm_zova_repository_open(const char *path, const char *project) {
     if (!path || !path[0] || !project || !project[0]) return NULL;
+    char *stored_project = strdup(project);
+    if (!stored_project) return NULL;
+    cbm_zova_catalog_t *catalog = cbm_zova_catalog_open(path);
+    if (catalog) {
+        const char *selectors[] = {project};
+        cbm_zova_catalog_scope_t scope = {0};
+        if (cbm_zova_catalog_resolve(catalog, selectors, 1, false, &scope) == CBM_STORE_OK &&
+            scope.count == 1) {
+            char *resolved = strdup(scope.projects[0].project);
+            if (!resolved) {
+                cbm_zova_catalog_scope_free(&scope);
+                cbm_zova_catalog_close(catalog);
+                free(stored_project);
+                return NULL;
+            }
+            free(stored_project);
+            stored_project = resolved;
+        }
+        cbm_zova_catalog_scope_free(&scope);
+        cbm_zova_catalog_close(catalog);
+    }
     cbm_zova_repository_t *repo = calloc(1, sizeof(*repo));
-    if (!repo) return NULL;
+    if (!repo) {
+        free(stored_project);
+        return NULL;
+    }
     zova_message error = {0};
     if (zova_database_open_with_options(&(zova_database_open_options_request){
             .path = path, .flags = ZOVA_OPEN_READ_ONLY, .busy_timeout_ms = 5000,
             .out_db = &repo->db, .out_error_message = &error}) != ZOVA_OK || !repo->db) {
         zova_message_free(&error);
         free(repo);
+        free(stored_project);
         return NULL;
     }
     zova_message_free(&error);
     if (cbm_zova_register_sql_functions(repo->db) != 0) {
         cbm_zova_repository_close(repo);
+        free(stored_project);
         return NULL;
     }
     zova_statement *stmt = NULL;
@@ -259,9 +295,10 @@ cbm_zova_repository_t *cbm_zova_repository_open(const char *path, const char *pr
         "FROM cbm_database_generation_v1 g2 WHERE g2.workspace_key=p.workspace_key "
         "AND g2.state='ready') AND NOT EXISTS (SELECT 1 FROM cbm_workspace_health_v1 h "
         "WHERE h.workspace_key=p.workspace_key AND h.state='rebuild_required')";
-    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, project) != 0) {
+    if (repo_prepare(repo, sql, &stmt) != 0 || repo_bind_text(stmt, 1, stored_project) != 0) {
         if (stmt) (void)zova_statement_finalize(stmt);
         cbm_zova_repository_close(repo);
+        free(stored_project);
         return NULL;
     }
     zova_step_result step = ZOVA_STEP_DONE;
@@ -279,11 +316,13 @@ cbm_zova_repository_t *cbm_zova_repository_open(const char *path, const char *pr
         strlen(project) >= sizeof(repo->project)) {
         free(workspace);
         cbm_zova_repository_close(repo);
+        free(stored_project);
         return NULL;
     }
     strcpy(repo->workspace_id, workspace);
     strcpy(repo->project, project);
     free(workspace);
+    free(stored_project);
     return repo;
 }
 
@@ -291,6 +330,781 @@ void cbm_zova_repository_close(cbm_zova_repository_t *repo) {
     if (!repo) return;
     if (repo->db) (void)zova_database_close(repo->db);
     free(repo);
+}
+
+static void catalog_project_free(cbm_zova_catalog_project_t *project) {
+    if (!project) return;
+    free(project->selector);
+    free(project->project);
+    free(project->root_path);
+    free(project->indexed_at);
+    free(project->model_fingerprint);
+    free(project->health_reason);
+    memset(project, 0, sizeof(*project));
+}
+
+static int catalog_project_copy(cbm_zova_catalog_project_t *destination,
+                                const cbm_zova_catalog_project_t *source) {
+    if (!destination || !source) return -1;
+    *destination = (cbm_zova_catalog_project_t){
+        .workspace_key = source->workspace_key,
+        .vector_dimensions = source->vector_dimensions,
+        .generation = source->generation,
+        .ready = source->ready,
+        .healthy = source->healthy,
+    };
+    memcpy(destination->workspace_id, source->workspace_id,
+           sizeof(destination->workspace_id));
+#define CATALOG_COPY(field) \
+    do { \
+        destination->field = strdup(source->field ? source->field : ""); \
+        if (!destination->field) goto error; \
+    } while (0)
+    CATALOG_COPY(selector);
+    CATALOG_COPY(project);
+    CATALOG_COPY(root_path);
+    CATALOG_COPY(indexed_at);
+    CATALOG_COPY(model_fingerprint);
+    CATALOG_COPY(health_reason);
+#undef CATALOG_COPY
+    return 0;
+error:
+    catalog_project_free(destination);
+    return -1;
+}
+
+static bool catalog_selector_used(const cbm_zova_catalog_t *catalog, int before,
+                                  const char *selector) {
+    for (int i = 0; i < before; i++) {
+        if (catalog->projects[i].selector &&
+            strcmp(catalog->projects[i].selector, selector) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static char *catalog_selector_disambiguate(const char *selector, const char *root_path,
+                                           int64_t workspace_key) {
+    uint64_t hash = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)root_path; p && *p; p++)
+        hash = (hash ^ *p) * 1099511628211ULL;
+    size_t needed = strlen(selector) + 1 + 16 + 1 + 20 + 1;
+    char *result = malloc(needed);
+    if (!result) return NULL;
+    snprintf(result, needed, "%s-%016llx-%lld", selector, (unsigned long long)hash,
+             (long long)workspace_key);
+    return result;
+}
+
+static int catalog_assign_selectors(cbm_zova_catalog_t *catalog) {
+    for (int i = 0; i < catalog->count; i++) {
+        size_t parent_levels = 0;
+        char *selector = cbm_project_selector_from_path(catalog->projects[i].root_path,
+                                                        parent_levels);
+        if (!selector) return -1;
+        while (catalog_selector_used(catalog, i, selector)) {
+            char *next = cbm_project_selector_from_path(catalog->projects[i].root_path,
+                                                        ++parent_levels);
+            if (!next) {
+                free(selector);
+                return -1;
+            }
+            if (strcmp(next, selector) == 0) {
+                free(next);
+                next = catalog_selector_disambiguate(
+                    selector, catalog->projects[i].root_path,
+                    catalog->projects[i].workspace_key);
+                if (!next) {
+                    free(selector);
+                    return -1;
+                }
+            }
+            free(selector);
+            selector = next;
+        }
+        catalog->projects[i].selector = selector;
+    }
+    return 0;
+}
+
+static int catalog_project_selector_compare(const void *left, const void *right) {
+    const cbm_zova_catalog_project_t *a = left;
+    const cbm_zova_catalog_project_t *b = right;
+    return strcmp(a->selector, b->selector);
+}
+
+cbm_zova_catalog_t *cbm_zova_catalog_open(const char *path) {
+    if (!path || !path[0]) return NULL;
+    cbm_zova_catalog_t *catalog = calloc(1, sizeof(*catalog));
+    if (!catalog) return NULL;
+    zova_message error = {0};
+    if (zova_database_open_with_options(&(zova_database_open_options_request){
+            .path = path, .flags = ZOVA_OPEN_READ_ONLY, .busy_timeout_ms = 5000,
+            .out_db = &catalog->db, .out_error_message = &error}) != ZOVA_OK || !catalog->db) {
+        zova_message_free(&error);
+        cbm_zova_catalog_close(catalog);
+        return NULL;
+    }
+    zova_message_free(&error);
+    if (cbm_zova_register_sql_functions(catalog->db) != 0 ||
+        zova_database_exec(&(zova_database_exec_request){
+            .db = catalog->db, .sql = "BEGIN"}) != ZOVA_OK) {
+        cbm_zova_catalog_close(catalog);
+        return NULL;
+    }
+    catalog->transaction_open = true;
+
+    cbm_zova_repository_t reader = {.db = catalog->db};
+    zova_statement *statement = NULL;
+    const char *sql =
+        "SELECT r.workspace_id,r.workspace_key,r.canonical_root,COALESCE(p.project,''),"
+        "COALESCE(p.indexed_at,''),COALESCE(s.model_fingerprint,''),"
+        "COALESCE(s.vector_dimensions,0),r.active_generation,"
+        "CASE WHEN g.state='ready' THEN 1 ELSE 0 END,"
+        "COALESCE(h.state,'healthy'),COALESCE(h.reason,'') "
+        "FROM cbm_workspace_registry r "
+        "LEFT JOIN cbm_projects_v1 p ON p.workspace_key=r.workspace_key "
+        "LEFT JOIN cbm_workspace_index_state_v1 s ON s.workspace_key=r.workspace_key "
+        "LEFT JOIN cbm_database_generation_v1 g ON g.workspace_key=r.workspace_key "
+        "AND g.generation=r.active_generation "
+        "LEFT JOIN cbm_workspace_health_v1 h ON h.workspace_key=r.workspace_key "
+        "ORDER BY r.workspace_key";
+    if (repo_prepare(&reader, sql, &statement) != 0) {
+        cbm_zova_catalog_close(catalog);
+        return NULL;
+    }
+    int capacity = 8;
+    catalog->projects = calloc((size_t)capacity, sizeof(*catalog->projects));
+    if (!catalog->projects) {
+        (void)zova_statement_finalize(statement);
+        cbm_zova_catalog_close(catalog);
+        return NULL;
+    }
+    for (;;) {
+        zova_step_result step = ZOVA_STEP_DONE;
+        if (repo_step(statement, &step) != 0) goto error;
+        if (step == ZOVA_STEP_DONE) break;
+        if (catalog->count == capacity) {
+            if (capacity > INT_MAX / 2) goto error;
+            int old_capacity = capacity;
+            capacity *= 2;
+            cbm_zova_catalog_project_t *grown =
+                realloc(catalog->projects, (size_t)capacity * sizeof(*grown));
+            if (!grown) goto error;
+            catalog->projects = grown;
+            memset(catalog->projects + old_capacity, 0,
+                   (size_t)(capacity - old_capacity) * sizeof(*catalog->projects));
+        }
+        cbm_zova_catalog_project_t *project = &catalog->projects[catalog->count];
+        char *workspace_id = repo_column_text(statement, 0);
+        project->workspace_key = repo_column_i64(statement, 1);
+        project->root_path = repo_column_text(statement, 2);
+        project->project = repo_column_text(statement, 3);
+        project->indexed_at = repo_column_text(statement, 4);
+        project->model_fingerprint = repo_column_text(statement, 5);
+        project->vector_dimensions = (int)repo_column_i64(statement, 6);
+        project->generation = repo_column_i64(statement, 7);
+        project->ready = repo_column_i64(statement, 8) != 0;
+        char *health = repo_column_text(statement, 9);
+        project->health_reason = repo_column_text(statement, 10);
+        project->healthy = health && strcmp(health, "rebuild_required") != 0;
+        if (!workspace_id || !workspace_id[0] ||
+            strlen(workspace_id) >= sizeof(project->workspace_id) ||
+            !project->root_path || !project->project || !project->indexed_at ||
+            !project->model_fingerprint || !health || !project->health_reason) {
+            free(workspace_id);
+            free(health);
+            catalog_project_free(project);
+            goto error;
+        }
+        strcpy(project->workspace_id, workspace_id);
+        free(workspace_id);
+        free(health);
+        catalog->count++;
+    }
+    (void)zova_statement_finalize(statement);
+    if (catalog_assign_selectors(catalog) != 0) {
+        cbm_zova_catalog_close(catalog);
+        return NULL;
+    }
+    qsort(catalog->projects, (size_t)catalog->count, sizeof(*catalog->projects),
+          catalog_project_selector_compare);
+    return catalog;
+error:
+    (void)zova_statement_finalize(statement);
+    cbm_zova_catalog_close(catalog);
+    return NULL;
+}
+
+void cbm_zova_catalog_close(cbm_zova_catalog_t *catalog) {
+    if (!catalog) return;
+    if (catalog->db && catalog->transaction_open) {
+        (void)zova_database_exec(&(zova_database_exec_request){
+            .db = catalog->db, .sql = "ROLLBACK"});
+    }
+    for (int i = 0; i < catalog->count; i++) catalog_project_free(&catalog->projects[i]);
+    free(catalog->projects);
+    if (catalog->db) (void)zova_database_close(catalog->db);
+    free(catalog);
+}
+
+void cbm_zova_catalog_scope_free(cbm_zova_catalog_scope_t *scope) {
+    if (!scope) return;
+    for (int i = 0; i < scope->count; i++) catalog_project_free(&scope->projects[i]);
+    for (int i = 0; i < scope->excluded_count; i++)
+        catalog_project_free(&scope->excluded_projects[i]);
+    free(scope->projects);
+    free(scope->excluded_projects);
+    memset(scope, 0, sizeof(*scope));
+}
+
+int cbm_zova_catalog_list(cbm_zova_catalog_t *catalog, cbm_zova_catalog_scope_t *out) {
+    if (!catalog || !out) return CBM_STORE_ERR;
+    memset(out, 0, sizeof(*out));
+    if (catalog->count == 0) return CBM_STORE_OK;
+    out->projects = calloc((size_t)catalog->count, sizeof(*out->projects));
+    if (!out->projects) return CBM_STORE_ERR;
+    for (int i = 0; i < catalog->count; i++) {
+        if (catalog_project_copy(&out->projects[out->count], &catalog->projects[i]) != 0) {
+            cbm_zova_catalog_scope_free(out);
+            return CBM_STORE_ERR;
+        }
+        out->count++;
+    }
+    return CBM_STORE_OK;
+}
+
+const char *cbm_zova_catalog_error(const cbm_zova_catalog_t *catalog) {
+    return catalog && catalog->error[0] ? catalog->error : "";
+}
+
+int cbm_zova_catalog_resolve(cbm_zova_catalog_t *catalog, const char *const *selectors,
+                             int selector_count, bool wildcard,
+                             cbm_zova_catalog_scope_t *out) {
+    if (!catalog || !out || (!wildcard && (!selectors || selector_count <= 0)))
+        return CBM_STORE_ERR;
+    catalog->error[0] = '\0';
+    memset(out, 0, sizeof(*out));
+    int wanted = wildcard ? catalog->count : selector_count;
+    out->projects = wanted ? calloc((size_t)wanted, sizeof(*out->projects)) : NULL;
+    if (wanted && !out->projects) return CBM_STORE_ERR;
+
+    if (wildcard) {
+        out->excluded_projects = wanted ? calloc((size_t)wanted, sizeof(*out->excluded_projects))
+                                        : NULL;
+        if (wanted && !out->excluded_projects) goto error;
+        for (int i = 0; i < catalog->count; i++) {
+            if (!catalog->projects[i].ready || !catalog->projects[i].healthy) {
+                if (catalog_project_copy(&out->excluded_projects[out->excluded_count],
+                                         &catalog->projects[i]) != 0)
+                    goto error;
+                out->excluded_count++;
+            } else {
+                if (catalog_project_copy(&out->projects[out->count], &catalog->projects[i]) != 0)
+                    goto error;
+                out->count++;
+            }
+        }
+    } else {
+        for (int i = 0; i < selector_count; i++) {
+            const cbm_zova_catalog_project_t *match = NULL;
+            for (int j = 0; j < catalog->count; j++) {
+                if (strcmp(catalog->projects[j].selector, selectors[i]) == 0) {
+                    match = &catalog->projects[j];
+                    break;
+                }
+            }
+            if (!match) {
+                snprintf(catalog->error, sizeof(catalog->error),
+                         "project '%s' was not found", selectors[i]);
+                cbm_zova_catalog_scope_free(out);
+                return CBM_STORE_NOT_FOUND;
+            }
+            if (!match->ready || !match->healthy) {
+                snprintf(catalog->error, sizeof(catalog->error), "project '%s' is unavailable: %s",
+                         selectors[i], !match->ready ? "no ready generation"
+                                                    : (match->health_reason[0]
+                                                           ? match->health_reason
+                                                           : "workspace unhealthy"));
+                goto error;
+            }
+            if (catalog_project_copy(&out->projects[out->count], match) != 0) goto error;
+            out->count++;
+        }
+    }
+    return CBM_STORE_OK;
+error:
+    cbm_zova_catalog_scope_free(out);
+    return CBM_STORE_ERR;
+}
+
+static char *catalog_scope_cte(const cbm_zova_catalog_scope_t *scope, int *next_bind) {
+    if (!scope || scope->count <= 0 || !next_bind) return NULL;
+    size_t capacity = 64 + (size_t)scope->count * 32;
+    char *sql = malloc(capacity);
+    if (!sql) return NULL;
+    size_t used = (size_t)snprintf(sql, capacity,
+                                  "WITH scope(workspace_key,selector) AS (VALUES ");
+    int bind = 3;
+    for (int i = 0; i < scope->count; i++) {
+        int written = snprintf(sql + used, capacity - used, "%s(?%d,?%d)",
+                               i ? "," : "", bind, bind + 1);
+        if (written < 0 || (size_t)written >= capacity - used) {
+            free(sql);
+            return NULL;
+        }
+        used += (size_t)written;
+        bind += 2;
+    }
+    if (used + 3 > capacity) {
+        free(sql);
+        return NULL;
+    }
+    memcpy(sql + used, ") ", 3);
+    *next_bind = bind;
+    return sql;
+}
+
+static int catalog_bind_fts_scope(zova_statement *statement,
+                                  const cbm_zova_catalog_scope_t *scope,
+                                  const char *query, const char *file_pattern) {
+    if (repo_bind_text(statement, 1, query) != 0) return -1;
+    zova_status status = file_pattern && file_pattern[0]
+                             ? zova_statement_bind_text(&(zova_statement_bind_text_request){
+                                   .statement = statement, .index = 2,
+                                   .data = (const uint8_t *)file_pattern,
+                                   .len = strlen(file_pattern)})
+                             : zova_statement_bind_null(&(zova_statement_bind_null_request){
+                                   .statement = statement, .index = 2});
+    if (status != ZOVA_OK) return -1;
+    int bind = 3;
+    for (int i = 0; i < scope->count; i++) {
+        if (repo_bind_i64(statement, bind++, scope->projects[i].workspace_key) != 0 ||
+            repo_bind_text(statement, bind++, scope->projects[i].selector) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int cbm_zova_catalog_search_fts(cbm_zova_catalog_t *catalog,
+                                const cbm_zova_catalog_scope_t *scope,
+                                const char *query, const char *file_pattern,
+                                int limit, int offset, cbm_search_output_t *out) {
+    if (!catalog || !scope || scope->count <= 0 || !query || !query[0] || !out || offset < 0)
+        return CBM_STORE_ERR;
+    memset(out, 0, sizeof(*out));
+    if (limit <= 0) limit = 10;
+
+    int next_bind = 0;
+    char *cte = catalog_scope_cte(scope, &next_bind);
+    if (!cte) return CBM_STORE_ERR;
+    const char *count_tail =
+        "SELECT count(*) FROM scope sc JOIN cbm_nodes_v1 n "
+        "ON n.workspace_key=sc.workspace_key "
+        "JOIN cbm_nodes_fts_v1 f ON f.rowid=n.zova_node_key "
+        "JOIN cbm_files_v1 p ON p.file_key=n.file_key "
+        "WHERE cbm_nodes_fts_v1 MATCH ?1 "
+        "AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "AND (?2 IS NULL OR p.file_path GLOB ?2)";
+    size_t count_len = strlen(cte) + strlen(count_tail) + 1;
+    char *count_sql = malloc(count_len);
+    if (!count_sql) {
+        free(cte);
+        return CBM_STORE_ERR;
+    }
+    snprintf(count_sql, count_len, "%s%s", cte, count_tail);
+    cbm_zova_repository_t reader = {.db = catalog->db};
+    zova_statement *statement = NULL;
+    int rc = repo_prepare(&reader, count_sql, &statement);
+    if (rc == 0) rc = catalog_bind_fts_scope(statement, scope, query, file_pattern);
+    zova_step_result step = ZOVA_STEP_DONE;
+    if (rc == 0 && (repo_step(statement, &step) != 0 || step != ZOVA_STEP_ROW)) rc = -1;
+    int64_t total = rc == 0 ? repo_column_i64(statement, 0) : 0;
+    if (statement) (void)zova_statement_finalize(statement);
+    statement = NULL;
+    free(count_sql);
+    if (rc != 0 || total < 0 || total > INT_MAX) {
+        free(cte);
+        return CBM_STORE_ERR;
+    }
+
+    const char *data_tail =
+        "SELECT n.workspace_key,n.zova_node_key,sc.selector,n.label,n.name,"
+        "n.qualified_name,p.file_path,n.start_line,n.end_line,n.properties,"
+        "(bm25(cbm_nodes_fts_v1)-CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+        "WHEN n.label='Route' THEN 8.0 WHEN n.label IN "
+        "('Class','Interface','Type','Enum') THEN 5.0 ELSE 0.0 END) AS rank "
+        "FROM scope sc JOIN cbm_nodes_v1 n ON n.workspace_key=sc.workspace_key "
+        "JOIN cbm_nodes_fts_v1 f ON f.rowid=n.zova_node_key "
+        "JOIN cbm_files_v1 p ON p.file_key=n.file_key "
+        "WHERE cbm_nodes_fts_v1 MATCH ?1 "
+        "AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "AND (?2 IS NULL OR p.file_path GLOB ?2) "
+        "ORDER BY rank,sc.selector,n.qualified_name,n.zova_node_key ";
+    size_t data_capacity = strlen(cte) + strlen(data_tail) + 80;
+    char *data_sql = malloc(data_capacity);
+    if (!data_sql) {
+        free(cte);
+        return CBM_STORE_ERR;
+    }
+    snprintf(data_sql, data_capacity, "%s%sLIMIT ?%d OFFSET ?%d", cte, data_tail,
+             next_bind, next_bind + 1);
+    free(cte);
+    if (repo_prepare(&reader, data_sql, &statement) != 0 ||
+        catalog_bind_fts_scope(statement, scope, query, file_pattern) != 0 ||
+        repo_bind_i64(statement, next_bind, limit) != 0 ||
+        repo_bind_i64(statement, next_bind + 1, offset) != 0) {
+        free(data_sql);
+        if (statement) (void)zova_statement_finalize(statement);
+        return CBM_STORE_ERR;
+    }
+    free(data_sql);
+
+    int capacity = limit < 64 ? limit : 64;
+    if (capacity < 1) capacity = 1;
+    cbm_search_result_t *results = calloc((size_t)capacity, sizeof(*results));
+    int64_t *keys = calloc((size_t)capacity, sizeof(*keys));
+    int64_t *workspace_keys = calloc((size_t)capacity, sizeof(*workspace_keys));
+    int count = 0;
+    if (!results || !keys || !workspace_keys) goto search_error;
+    for (;;) {
+        step = ZOVA_STEP_DONE;
+        if (repo_step(statement, &step) != 0) goto search_error;
+        if (step == ZOVA_STEP_DONE) break;
+        if (count == capacity) {
+            int old_capacity = capacity;
+            if (capacity > INT_MAX / 2) goto search_error;
+            capacity *= 2;
+            cbm_search_result_t *grown_results =
+                realloc(results, (size_t)capacity * sizeof(*grown_results));
+            int64_t *grown_keys = realloc(keys, (size_t)capacity * sizeof(*grown_keys));
+            int64_t *grown_workspace_keys =
+                realloc(workspace_keys, (size_t)capacity * sizeof(*grown_workspace_keys));
+            if (!grown_results || !grown_keys || !grown_workspace_keys) {
+                if (grown_results) results = grown_results;
+                if (grown_keys) keys = grown_keys;
+                if (grown_workspace_keys) workspace_keys = grown_workspace_keys;
+                goto search_error;
+            }
+            results = grown_results;
+            keys = grown_keys;
+            workspace_keys = grown_workspace_keys;
+            memset(results + old_capacity, 0,
+                   (size_t)(capacity - old_capacity) * sizeof(*results));
+        }
+        workspace_keys[count] = repo_column_i64(statement, 0);
+        keys[count] = repo_column_i64(statement, 1);
+        cbm_node_t *node = &results[count].node;
+        node->project = repo_column_text(statement, 2);
+        node->label = repo_column_text(statement, 3);
+        node->name = repo_column_text(statement, 4);
+        node->qualified_name = repo_column_text(statement, 5);
+        node->file_path = repo_column_text(statement, 6);
+        node->start_line = (int)repo_column_i64(statement, 7);
+        node->end_line = (int)repo_column_i64(statement, 8);
+        node->properties_json = repo_column_text(statement, 9);
+        results[count].rank = repo_column_double(statement, 10);
+        if (!node->project || !node->label || !node->name || !node->qualified_name ||
+            !node->file_path || !node->properties_json) goto search_error;
+        count++;
+    }
+    (void)zova_statement_finalize(statement);
+    statement = NULL;
+
+    for (int p = 0; p < scope->count; p++) {
+        int project_count = 0;
+        for (int i = 0; i < count; i++) {
+            if (workspace_keys[i] == scope->projects[p].workspace_key) project_count++;
+        }
+        if (!project_count) continue;
+        int64_t *project_keys = malloc((size_t)project_count * sizeof(*project_keys));
+        int *positions = malloc((size_t)project_count * sizeof(*positions));
+        if (!project_keys || !positions) {
+            free(project_keys);
+            free(positions);
+            goto search_error;
+        }
+        int written = 0;
+        for (int i = 0; i < count; i++) {
+            if (workspace_keys[i] != scope->projects[p].workspace_key) continue;
+            project_keys[written] = keys[i];
+            positions[written++] = i;
+        }
+        cbm_zova_repository_t workspace = {.db = catalog->db};
+        workspace.workspace_key = scope->projects[p].workspace_key;
+        strcpy(workspace.workspace_id, scope->projects[p].workspace_id);
+        zova_graph_keyed_node_results native = {0};
+        if (repo_native_nodes_by_key(&workspace, project_keys, (size_t)project_count,
+                                     &native) != 0) {
+            free(project_keys);
+            free(positions);
+            goto search_error;
+        }
+        for (int i = 0; i < project_count; i++) {
+            int position = positions[i];
+            if (!native.items[i].found || !native.items[i].node_id || !native.items[i].kind) {
+                zova_graph_keyed_node_results_free(&native);
+                free(project_keys);
+                free(positions);
+                goto search_error;
+            }
+            results[position].node.id = stable_numeric_id(native.items[i].node_id);
+            free((char *)results[position].node.label);
+            results[position].node.label =
+                repo_dup((const uint8_t *)native.items[i].kind, native.items[i].kind_len);
+            if (!results[position].node.label) {
+                zova_graph_keyed_node_results_free(&native);
+                free(project_keys);
+                free(positions);
+                goto search_error;
+            }
+        }
+        zova_graph_keyed_node_results_free(&native);
+        free(project_keys);
+        free(positions);
+    }
+    free(keys);
+    free(workspace_keys);
+    out->results = results;
+    out->count = count;
+    out->total = (int)total;
+    return CBM_STORE_OK;
+
+search_error:
+    if (statement) (void)zova_statement_finalize(statement);
+    free(keys);
+    free(workspace_keys);
+    cbm_store_search_free(&(cbm_search_output_t){.results = results, .count = count});
+    return CBM_STORE_ERR;
+}
+
+static int catalog_search_result_compare(const void *left_ptr, const void *right_ptr) {
+    const cbm_search_result_t *left = left_ptr;
+    const cbm_search_result_t *right = right_ptr;
+    int compared = strcmp(left->node.name ? left->node.name : "",
+                          right->node.name ? right->node.name : "");
+    if (compared != 0) return compared;
+    compared = strcmp(left->node.qualified_name ? left->node.qualified_name : "",
+                      right->node.qualified_name ? right->node.qualified_name : "");
+    if (compared != 0) return compared;
+    compared = strcmp(left->node.project ? left->node.project : "",
+                      right->node.project ? right->node.project : "");
+    if (compared != 0) return compared;
+    return (left->node.id > right->node.id) - (left->node.id < right->node.id);
+}
+
+int cbm_zova_catalog_search(cbm_zova_catalog_t *catalog,
+                            const cbm_zova_catalog_scope_t *scope,
+                            const cbm_search_params_t *params, cbm_search_output_t *out) {
+    if (!catalog || !scope || scope->count <= 0 || !params || !out || params->offset < 0)
+        return CBM_STORE_ERR;
+    memset(out, 0, sizeof(*out));
+    cbm_search_result_t *combined = NULL;
+    int combined_count = 0;
+    int combined_capacity = 0;
+
+    for (int p = 0; p < scope->count; p++) {
+        cbm_zova_repository_t repository = {.db = catalog->db};
+        repository.workspace_key = scope->projects[p].workspace_key;
+        repository.generation = scope->projects[p].generation;
+        strcpy(repository.workspace_id, scope->projects[p].workspace_id);
+        if (strlen(scope->projects[p].project) >= sizeof(repository.project)) goto error;
+        strcpy(repository.project, scope->projects[p].project);
+
+        cbm_search_params_t local_params = *params;
+        local_params.project = scope->projects[p].project;
+        local_params.limit = INT_MAX;
+        local_params.offset = 0;
+        local_params.include_connected = false;
+        cbm_search_output_t local = {0};
+        if (cbm_zova_repository_search(&repository, repository.workspace_id,
+                                       &local_params, &local) != CBM_STORE_OK) {
+            cbm_store_search_free(&local);
+            goto error;
+        }
+        if (local.count > INT_MAX - combined_count) {
+            cbm_store_search_free(&local);
+            goto error;
+        }
+        int needed = combined_count + local.count;
+        if (needed > combined_capacity) {
+            int grown_capacity = combined_capacity ? combined_capacity : 64;
+            while (grown_capacity < needed) {
+                if (grown_capacity > INT_MAX / 2) {
+                    grown_capacity = needed;
+                    break;
+                }
+                grown_capacity *= 2;
+            }
+            cbm_search_result_t *grown =
+                realloc(combined, (size_t)grown_capacity * sizeof(*grown));
+            if (!grown) {
+                cbm_store_search_free(&local);
+                goto error;
+            }
+            combined = grown;
+            memset(combined + combined_capacity, 0,
+                   (size_t)(grown_capacity - combined_capacity) * sizeof(*combined));
+            combined_capacity = grown_capacity;
+        }
+        for (int i = 0; i < local.count; i++) {
+            char *selector = strdup(scope->projects[p].selector);
+            if (!selector) {
+                cbm_store_search_free(&local);
+                goto error;
+            }
+            free((char *)local.results[i].node.project);
+            local.results[i].node.project = selector;
+            combined[combined_count++] = local.results[i];
+            memset(&local.results[i], 0, sizeof(local.results[i]));
+        }
+        cbm_store_search_free(&local);
+    }
+
+    qsort(combined, (size_t)combined_count, sizeof(*combined), catalog_search_result_compare);
+    int limit = params->limit > 0 ? params->limit : 10;
+    int available = params->offset < combined_count ? combined_count - params->offset : 0;
+    int page_count = available < limit ? available : limit;
+    cbm_search_result_t *page =
+        page_count ? calloc((size_t)page_count, sizeof(*page)) : NULL;
+    if (page_count && !page) goto error;
+    for (int i = 0; i < page_count; i++) {
+        int source = params->offset + i;
+        page[i] = combined[source];
+        memset(&combined[source], 0, sizeof(combined[source]));
+    }
+    cbm_store_search_free(
+        &(cbm_search_output_t){.results = combined, .count = combined_count});
+    out->results = page;
+    out->count = page_count;
+    out->total = combined_count;
+    return CBM_STORE_OK;
+error:
+    cbm_store_search_free(
+        &(cbm_search_output_t){.results = combined, .count = combined_count});
+    return CBM_STORE_ERR;
+}
+
+int cbm_zova_catalog_search_semantic(
+    cbm_zova_catalog_t *catalog, const char *path, const cbm_zova_catalog_scope_t *scope,
+    const char **keywords, int keyword_count, int limit, int offset,
+    cbm_vector_result_t **out, int *out_count, int *out_total) {
+    if (!catalog || !path || !scope || scope->count <= 0 || !keywords || keyword_count <= 0 ||
+        !out || !out_count || !out_total) {
+        return CBM_STORE_ERR;
+    }
+    *out_total = 0;
+    const char *model = scope->projects[0].model_fingerprint;
+    int dimensions = scope->projects[0].vector_dimensions;
+    if (!model || !model[0] || dimensions <= 0) return CBM_ZOVA_CATALOG_INCOMPATIBLE_MODELS;
+    for (int i = 0; i < scope->count; i++) {
+        const cbm_zova_catalog_project_t *project = &scope->projects[i];
+        if (!project->model_fingerprint || strcmp(project->model_fingerprint, model) != 0 ||
+            project->vector_dimensions != dimensions) {
+            return CBM_ZOVA_CATALOG_INCOMPATIBLE_MODELS;
+        }
+    }
+
+    zova_statement *count_statement = NULL;
+    int rc = CBM_STORE_OK;
+    if (repo_prepare(&(cbm_zova_repository_t){.db = catalog->db},
+                     "SELECT node_vector_rows FROM cbm_generation_integrity_v2 "
+                     "WHERE workspace_key=?1 AND generation=?2", &count_statement) != 0) {
+        rc = CBM_STORE_ERR;
+    }
+    int *vector_counts = calloc((size_t)scope->count, sizeof(*vector_counts));
+    if (!vector_counts) rc = CBM_STORE_ERR;
+    int64_t total = 0;
+    for (int i = 0; rc == CBM_STORE_OK && i < scope->count; i++) {
+        if (zova_statement_reset(count_statement) != ZOVA_OK ||
+            zova_statement_clear_bindings(count_statement) != ZOVA_OK ||
+            repo_bind_i64(count_statement, 1, scope->projects[i].workspace_key) != 0 ||
+            repo_bind_i64(count_statement, 2, scope->projects[i].generation) != 0) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        zova_step_result step = ZOVA_STEP_DONE;
+        if (repo_step(count_statement, &step) != 0 || step != ZOVA_STEP_ROW) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        int64_t count = repo_column_i64(count_statement, 0);
+        if (count < 0 || total > INT_MAX - count) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        vector_counts[i] = (int)count;
+        total += count;
+    }
+    if (count_statement) (void)zova_statement_finalize(count_statement);
+    if (rc != CBM_STORE_OK) {
+        free(vector_counts);
+        return rc;
+    }
+    *out_total = (int)total;
+
+    cbm_zova_vector_workspace_t *workspaces =
+        calloc((size_t)scope->count, sizeof(*workspaces));
+    if (!workspaces) {
+        free(vector_counts);
+        return CBM_STORE_ERR;
+    }
+    int workspace_count = 0;
+    for (int i = 0; i < scope->count; i++) {
+        if (vector_counts[i] == 0) continue;
+        const cbm_zova_catalog_project_t *project = &scope->projects[i];
+        workspaces[workspace_count++] = (cbm_zova_vector_workspace_t){
+            .workspace_key = project->workspace_key,
+            .workspace_id = project->workspace_id,
+            .project = project->project,
+            .selector = project->selector,
+            .model_fingerprint = project->model_fingerprint,
+            .vector_dimensions = project->vector_dimensions,
+            .generation = project->generation,
+        };
+    }
+    free(vector_counts);
+    if (workspace_count > 0) {
+        rc = cbm_store_zova_multi_vector_search(
+            path, workspaces, workspace_count, keywords, keyword_count,
+            limit, offset, out, out_count);
+    } else {
+        *out = NULL;
+        *out_count = 0;
+    }
+    free(workspaces);
+
+    cbm_zova_catalog_t *current = rc == CBM_STORE_OK ? cbm_zova_catalog_open(path) : NULL;
+    const char **selectors = calloc((size_t)scope->count, sizeof(*selectors));
+    cbm_zova_catalog_scope_t verified = {0};
+    if (!current || !selectors) rc = CBM_STORE_ERR;
+    for (int i = 0; rc == CBM_STORE_OK && i < scope->count; i++)
+        selectors[i] = scope->projects[i].selector;
+    if (rc == CBM_STORE_OK &&
+        cbm_zova_catalog_resolve(current, selectors, scope->count, false, &verified) !=
+            CBM_STORE_OK) {
+        rc = CBM_ZOVA_CATALOG_STALE_SCOPE;
+    }
+    for (int i = 0; rc == CBM_STORE_OK && i < scope->count; i++) {
+        if (verified.projects[i].workspace_key != scope->projects[i].workspace_key ||
+            verified.projects[i].generation != scope->projects[i].generation ||
+            verified.projects[i].vector_dimensions != scope->projects[i].vector_dimensions ||
+            strcmp(verified.projects[i].model_fingerprint,
+                   scope->projects[i].model_fingerprint) != 0) {
+            rc = CBM_ZOVA_CATALOG_STALE_SCOPE;
+        }
+    }
+    free(selectors);
+    cbm_zova_catalog_scope_free(&verified);
+    cbm_zova_catalog_close(current);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_vector_results(*out, *out_count);
+        *out = NULL;
+        *out_count = 0;
+    }
+    return rc;
 }
 
 const char *cbm_zova_repository_workspace_id(const cbm_zova_repository_t *repo) {
@@ -2159,6 +2973,7 @@ int cbm_zova_repository_hydrate_incremental_components(
 
 #else
 struct cbm_zova_repository { int unused; };
+struct cbm_zova_catalog { int unused; };
 cbm_zova_repository_t *cbm_zova_repository_open(const char *p,const char *n){(void)p;(void)n;return NULL;}
 void cbm_zova_repository_close(cbm_zova_repository_t *r){(void)r;}
 const char *cbm_zova_repository_workspace_id(const cbm_zova_repository_t *r){(void)r;return "";}
@@ -2181,4 +2996,13 @@ int cbm_zova_repository_export_incremental_snapshot(const char*p,const char*w,cb
 int cbm_zova_repository_hydrate_incremental_components(const char*p,const char*w,int64_t g,cbm_zova_snapshot_components_t c,cbm_zova_workspace_snapshot_t*s){(void)p;(void)w;(void)g;(void)c;(void)s;return CBM_ZOVA_SNAPSHOT_ERROR;}
 int cbm_zova_workspace_snapshot_format_edge_id(const cbm_zova_workspace_snapshot_t*s,int i,char*o,size_t z){(void)s;(void)i;if(o&&z)o[0]='\0';return -1;}
 void cbm_zova_workspace_snapshot_free(cbm_zova_workspace_snapshot_t*s){if(s)memset(s,0,sizeof(*s));}
+cbm_zova_catalog_t *cbm_zova_catalog_open(const char*p){(void)p;return NULL;}
+void cbm_zova_catalog_close(cbm_zova_catalog_t*c){(void)c;}
+int cbm_zova_catalog_list(cbm_zova_catalog_t*c,cbm_zova_catalog_scope_t*o){(void)c;if(o)memset(o,0,sizeof(*o));return CBM_STORE_ERR;}
+const char *cbm_zova_catalog_error(const cbm_zova_catalog_t*c){(void)c;return "";}
+int cbm_zova_catalog_resolve(cbm_zova_catalog_t*c,const char*const*s,int n,bool w,cbm_zova_catalog_scope_t*o){(void)c;(void)s;(void)n;(void)w;if(o)memset(o,0,sizeof(*o));return CBM_STORE_ERR;}
+int cbm_zova_catalog_search_fts(cbm_zova_catalog_t*c,const cbm_zova_catalog_scope_t*s,const char*q,const char*f,int l,int x,cbm_search_output_t*o){(void)c;(void)s;(void)q;(void)f;(void)l;(void)x;if(o)memset(o,0,sizeof(*o));return CBM_STORE_ERR;}
+int cbm_zova_catalog_search(cbm_zova_catalog_t*c,const cbm_zova_catalog_scope_t*s,const cbm_search_params_t*p,cbm_search_output_t*o){(void)c;(void)s;(void)p;if(o)memset(o,0,sizeof(*o));return CBM_STORE_ERR;}
+int cbm_zova_catalog_search_semantic(cbm_zova_catalog_t*c,const char*p,const cbm_zova_catalog_scope_t*s,const char**k,int n,int l,int x,cbm_vector_result_t**o,int*z,int*t){(void)c;(void)p;(void)s;(void)k;(void)n;(void)l;(void)x;if(o)*o=NULL;if(z)*z=0;if(t)*t=0;return CBM_STORE_ERR;}
+void cbm_zova_catalog_scope_free(cbm_zova_catalog_scope_t*s){if(s)memset(s,0,sizeof(*s));}
 #endif

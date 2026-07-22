@@ -701,12 +701,23 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
 /* Result from vector similarity search. */
 typedef struct {
     int64_t node_id;
+    char *project;
     char *name;
     char *qualified_name;
     char *file_path;
     char *label;
     double score;
 } cbm_vector_result_t;
+
+typedef struct {
+    int64_t workspace_key;
+    const char *workspace_id;
+    const char *project;
+    const char *selector;
+    const char *model_fingerprint;
+    int vector_dimensions;
+    int64_t generation;
+} cbm_zova_vector_workspace_t;
 
 /* Optional stage timings for one vector-search call. Timings are populated
  * only for the Zova fast path; the compatibility API remains unchanged. */
@@ -736,6 +747,13 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
 int cbm_store_vector_search_ex(cbm_store_t *s, const char *project, const char **keywords,
                                int keyword_count, int limit, cbm_vector_result_t **out,
                                int *out_count, cbm_vector_search_metrics_t *metrics);
+
+/* Search several workspace-scoped native vector collections using one shared
+ * Zova session, then sort and paginate the combined result set once. */
+int cbm_store_zova_multi_vector_search(
+    const char *db_path, const cbm_zova_vector_workspace_t *workspaces, int workspace_count,
+    const char **keywords, int keyword_count, int limit, int offset,
+    cbm_vector_result_t **out, int *out_count);
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);

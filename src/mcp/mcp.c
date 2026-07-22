@@ -355,6 +355,10 @@ static const tool_def_t TOOLS[] = {
      "page by re-calling with offset=offset+limit until has_more is false. Narrow first via "
      "label/file_pattern/min_degree before paginating large result sets.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"projects\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Project selectors to search together. Use [\\\"*\\\"] for all "
+     "ready projects. Requires Zova full authority; ranking and pagination are global. "
+     "Every result includes its owning project. Mutually exclusive with project.\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
@@ -376,7 +380,7 @@ static const tool_def_t TOOLS[] = {
      "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
      "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
      "increment offset by limit and re-call while has_more is true.\"}},"
-     "\"required\":[\"project\"]}"},
+     "\"oneOf\":[{\"required\":[\"project\"]},{\"required\":[\"projects\"]}]}"},
 
     {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -777,6 +781,15 @@ static char *normalize_project_arg(char *project) {
         return project;
     }
 
+    /* Parent-qualified public selectors intentionally contain '/'. Only an
+     * existing absolute filesystem path is a legacy path-form project arg. */
+    bool absolute_path = project[0] == '/' ||
+                         (strlen(project) >= 3 && project[1] == ':' &&
+                          (project[2] == '/' || project[2] == '\\'));
+    if (!absolute_path || !cbm_file_exists(project)) {
+        return project;
+    }
+
     project = canonicalize_repo_path_if_exists(project);
     char *normalized = cbm_project_name_from_path(project);
     if (normalized) {
@@ -804,6 +817,98 @@ static char *get_project_arg(const char *args_json) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
     return normalize_project_arg(p);
+}
+
+typedef struct {
+    char *project;
+    char **projects;
+    size_t project_count;
+    bool wildcard;
+} cbm_mcp_project_scope_t;
+
+static void project_scope_free(cbm_mcp_project_scope_t *scope) {
+    if (!scope) return;
+    free(scope->project);
+    for (size_t i = 0; i < scope->project_count; i++) free(scope->projects[i]);
+    free(scope->projects);
+    memset(scope, 0, sizeof(*scope));
+}
+
+static int project_scope_parse(const char *args_json, cbm_mcp_project_scope_t *scope,
+                               const char **error) {
+    if (!scope || !error) return -1;
+    memset(scope, 0, sizeof(*scope));
+    *error = NULL;
+
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *projects = root ? yyjson_obj_get(root, "projects") : NULL;
+    scope->project = get_project_arg(args_json);
+    if (scope->project && projects) {
+        *error = "project and projects are mutually exclusive";
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    if (!projects) {
+        if (!scope->project || !scope->project[0]) {
+            *error = "exactly one of project or projects is required";
+            yyjson_doc_free(doc);
+            return -1;
+        }
+        yyjson_doc_free(doc);
+        return 0;
+    }
+    if (!yyjson_is_arr(projects) || yyjson_arr_size(projects) == 0) {
+        *error = "projects must be a non-empty array";
+        yyjson_doc_free(doc);
+        return -1;
+    }
+
+    size_t input_count = yyjson_arr_size(projects);
+    scope->projects = calloc(input_count, sizeof(*scope->projects));
+    if (!scope->projects) {
+        *error = "out of memory while parsing projects";
+        yyjson_doc_free(doc);
+        return -1;
+    }
+    size_t index = 0;
+    size_t maximum = 0;
+    yyjson_val *value = NULL;
+    yyjson_arr_foreach(projects, index, maximum, value) {
+        if (!yyjson_is_str(value) || !yyjson_get_str(value)[0]) {
+            *error = "projects entries must be non-empty strings";
+            yyjson_doc_free(doc);
+            return -1;
+        }
+        const char *name = yyjson_get_str(value);
+        bool duplicate = false;
+        for (size_t i = 0; i < scope->project_count; i++) {
+            if (strcmp(scope->projects[i], name) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+        scope->projects[scope->project_count] = strdup(name);
+        if (!scope->projects[scope->project_count]) {
+            *error = "out of memory while parsing projects";
+            yyjson_doc_free(doc);
+            return -1;
+        }
+        scope->project_count++;
+    }
+    scope->wildcard = scope->project_count == 1 && strcmp(scope->projects[0], "*") == 0;
+    if (!scope->wildcard) {
+        for (size_t i = 0; i < scope->project_count; i++) {
+            if (strcmp(scope->projects[i], "*") == 0) {
+                *error = "projects wildcard must be the sole array entry";
+                yyjson_doc_free(doc);
+                return -1;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return 0;
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -1395,11 +1500,59 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_arr_add_val(arr, p);
 }
 
-/* list_projects: scan cache directory for .db files.
- * Each project is a single .db file — no central registry needed. */
+static char *handle_list_zova_projects(void) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_val *projects = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_val(doc, root, "projects", projects);
+
+    char path[CBM_SZ_1K];
+    cbm_zova_catalog_t *catalog = NULL;
+    cbm_zova_catalog_scope_t listed = {0};
+    if (cbm_zova_user_database_path(path, sizeof(path)) == 0 && cbm_file_exists(path)) {
+        catalog = cbm_zova_catalog_open(path);
+        if (!catalog || cbm_zova_catalog_list(catalog, &listed) != CBM_STORE_OK) {
+            cbm_zova_catalog_close(catalog);
+            yyjson_mut_doc_free(doc);
+            return cbm_mcp_text_result("{\"error\":\"cannot read Zova project catalog\"}",
+                                       true);
+        }
+    }
+    for (int i = 0; i < listed.count; i++) {
+        const cbm_zova_catalog_project_t *project = &listed.projects[i];
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, entry, "name", project->selector);
+        yyjson_mut_obj_add_strcpy(doc, entry, "root_path", project->root_path);
+        yyjson_mut_obj_add_sint(doc, entry, "generation", project->generation);
+        yyjson_mut_obj_add_bool(doc, entry, "ready", project->ready);
+        yyjson_mut_obj_add_bool(doc, entry, "healthy", project->healthy);
+        yyjson_mut_obj_add_strcpy(doc, entry, "health_reason", project->health_reason);
+        yyjson_mut_obj_add_strcpy(doc, entry, "indexed_at", project->indexed_at);
+        yyjson_mut_obj_add_int(doc, entry, "vector_dimensions", project->vector_dimensions);
+        yyjson_mut_arr_add_val(projects, entry);
+    }
+    if (listed.count == 0) {
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "No projects indexed. Call index_repository(repo_path=...) first.");
+    }
+    cbm_zova_catalog_scope_free(&listed);
+    cbm_zova_catalog_close(catalog);
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
+/* list_projects: scan cache directory for .db files in compatibility mode.
+ * Full-authority Zova uses the workspace catalog in the shared database. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)srv;
     (void)args;
+
+    if (cbm_zova_route_for_project(NULL) == CBM_ZOVA_ROUTE_FULL_AUTHORITY)
+        return handle_list_zova_projects();
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
@@ -2012,6 +2165,8 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_val *sem_results = yyjson_mut_arr(doc);
     for (int v = 0; v < vcount; v++) {
         yyjson_mut_val *vitem = yyjson_mut_obj(doc);
+        if (vresults[v].project)
+            yyjson_mut_obj_add_strcpy(doc, vitem, "project", vresults[v].project);
         yyjson_mut_obj_add_strcpy(doc, vitem, "name", vresults[v].name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "qualified_name", vresults[v].qualified_name);
         yyjson_mut_obj_add_strcpy(doc, vitem, "label", vresults[v].label);
@@ -2054,8 +2209,231 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
     return type_error;
 }
 
+static void emit_catalog_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                        const cbm_search_output_t *out, int offset,
+                                        bool bm25) {
+    yyjson_mut_obj_add_int(doc, root, "total", out->total);
+    if (bm25) yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    for (int i = 0; i < out->count; i++) {
+        const cbm_search_result_t *result = &out->results[i];
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_str(doc, item, "project",
+                               result->node.project ? result->node.project : "");
+        yyjson_mut_obj_add_str(doc, item, "name", result->node.name ? result->node.name : "");
+        yyjson_mut_obj_add_str(doc, item, "qualified_name",
+                               result->node.qualified_name ? result->node.qualified_name : "");
+        yyjson_mut_obj_add_str(doc, item, "label", result->node.label ? result->node.label : "");
+        yyjson_mut_obj_add_str(doc, item, "file_path",
+                               result->node.file_path ? result->node.file_path : "");
+        yyjson_mut_obj_add_int(doc, item, "start_line", result->node.start_line);
+        yyjson_mut_obj_add_int(doc, item, "end_line", result->node.end_line);
+        if (bm25) {
+            yyjson_mut_obj_add_real(doc, item, "rank", result->rank);
+        } else {
+            yyjson_mut_obj_add_int(doc, item, "in_degree", result->in_degree);
+            yyjson_mut_obj_add_int(doc, item, "out_degree", result->out_degree);
+        }
+        yyjson_mut_arr_add_val(results, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", out->total > offset + out->count);
+}
+
+static void emit_catalog_scope(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                               const cbm_zova_catalog_scope_t *scope) {
+    yyjson_mut_val *scope_json = yyjson_mut_obj(doc);
+    yyjson_mut_val *projects = yyjson_mut_arr(doc);
+    yyjson_mut_val *generations = yyjson_mut_obj(doc);
+    for (int i = 0; i < scope->count; i++) {
+        yyjson_mut_arr_add_strcpy(doc, projects, scope->projects[i].selector);
+        yyjson_mut_obj_add_int(doc, generations, scope->projects[i].selector,
+                               scope->projects[i].generation);
+    }
+    yyjson_mut_obj_add_val(doc, scope_json, "projects", projects);
+    yyjson_mut_obj_add_val(doc, scope_json, "generations", generations);
+    yyjson_mut_val *excluded = yyjson_mut_arr(doc);
+    for (int i = 0; i < scope->excluded_count; i++) {
+        const cbm_zova_catalog_project_t *project = &scope->excluded_projects[i];
+        yyjson_mut_val *entry = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, entry, "project", project->selector);
+        yyjson_mut_obj_add_str(doc, entry, "reason",
+                               !project->ready ? "no ready generation"
+                                               : (project->health_reason &&
+                                                          project->health_reason[0]
+                                                      ? project->health_reason
+                                                      : "workspace unhealthy"));
+        yyjson_mut_arr_add_val(excluded, entry);
+    }
+    yyjson_mut_obj_add_val(doc, scope_json, "excluded_projects", excluded);
+    yyjson_mut_obj_add_val(doc, root, "scope", scope_json);
+}
+
+static char *handle_search_graph_catalog(const char *args,
+                                         const cbm_mcp_project_scope_t *requested) {
+    if (cbm_zova_route_for_project(NULL) != CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
+        return cbm_mcp_text_result(
+            "multi-project search requires Zova full authority", true);
+    }
+    if (cbm_mcp_get_bool_arg(args, "include_connected")) {
+        return cbm_mcp_text_result(
+            "include_connected is not supported for multi-project search", true);
+    }
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *semantic = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
+    if (semantic && (!yyjson_is_arr(semantic) || yyjson_arr_size(semantic) == 0)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result(
+            "semantic_query must be a non-empty array of keyword strings", true);
+    }
+    if (semantic) {
+        size_t index = 0;
+        size_t maximum = 0;
+        yyjson_val *keyword = NULL;
+        yyjson_arr_foreach(semantic, index, maximum, keyword) {
+            if (!yyjson_is_str(keyword) || !yyjson_get_str(keyword)[0]) {
+                yyjson_doc_free(args_doc);
+                return cbm_mcp_text_result(
+                    "semantic_query entries must be non-empty strings", true);
+            }
+        }
+    }
+
+    char path[CBM_SZ_1K];
+    if (cbm_zova_user_database_path(path, sizeof(path)) != 0) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("cannot resolve shared Zova database", true);
+    }
+    cbm_zova_catalog_t *catalog = cbm_zova_catalog_open(path);
+    if (!catalog) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("cannot open shared Zova catalog", true);
+    }
+    cbm_zova_catalog_scope_t scope = {0};
+    int resolve_status = cbm_zova_catalog_resolve(
+        catalog, (const char *const *)requested->projects, (int)requested->project_count,
+        requested->wildcard, &scope);
+    if (resolve_status != CBM_STORE_OK || scope.count == 0) {
+        const char *catalog_error = cbm_zova_catalog_error(catalog);
+        char *error_copy = catalog_error[0] ? strdup(catalog_error) : NULL;
+        cbm_zova_catalog_scope_free(&scope);
+        cbm_zova_catalog_close(catalog);
+        yyjson_doc_free(args_doc);
+        char *result = cbm_mcp_text_result(
+            error_copy ? error_copy
+                       : (resolve_status == CBM_STORE_NOT_FOUND
+                              ? "one or more requested projects were not found"
+                              : "no ready healthy projects matched the scope"),
+            true);
+        free(error_copy);
+        return result;
+    }
+
+    char *query = cbm_mcp_get_string_arg(args, "query");
+    char *label = cbm_mcp_get_string_arg(args, "label");
+    char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
+    char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
+    char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *relationship = cbm_mcp_get_string_arg(args, "relationship");
+    int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    int limit = cbm_mcp_get_int_arg(args, "limit",
+                                    query && query[0] ? BM25_DEFAULT_LIMIT
+                                                      : CBM_DEFAULT_SEARCH_LIMIT);
+    cbm_search_output_t output = {0};
+    cbm_vector_result_t *semantic_results = NULL;
+    int semantic_count = 0;
+    int semantic_total = 0;
+    int search_status = CBM_STORE_ERR;
+    if (semantic) {
+        enum { MAX_CATALOG_KEYWORDS = 32 };
+        const char *keywords[MAX_CATALOG_KEYWORDS];
+        int keyword_count = extract_semantic_keywords(
+            semantic, keywords, MAX_CATALOG_KEYWORDS);
+        search_status = keyword_count > 0
+                            ? cbm_zova_catalog_search_semantic(
+                                  catalog, path, &scope, keywords, keyword_count,
+                                  limit, offset, &semantic_results, &semantic_count,
+                                  &semantic_total)
+                            : CBM_STORE_ERR;
+    } else if (!relationship || validate_edge_type(relationship)) {
+        if (query && query[0]) {
+            search_status = cbm_zova_catalog_search_fts(
+                catalog, &scope, query, file_pattern, limit, offset, &output);
+        } else {
+            cbm_search_params_t params = {
+                .label = label,
+                .name_pattern = name_pattern,
+                .qn_pattern = qn_pattern,
+                .file_pattern = file_pattern,
+                .relationship = relationship,
+                .exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points"),
+                .limit = limit,
+                .offset = offset,
+                .min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND),
+                .max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND),
+            };
+            search_status = cbm_zova_catalog_search(catalog, &scope, &params, &output);
+        }
+    }
+
+    char *json = NULL;
+    if (search_status == CBM_STORE_OK) {
+        yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *root = yyjson_mut_obj(doc);
+        yyjson_mut_doc_set_root(doc, root);
+        if (semantic) {
+            emit_semantic_results(doc, root, semantic_results, semantic_count);
+            yyjson_mut_obj_add_int(doc, root, "total", semantic_total);
+            yyjson_mut_obj_add_bool(doc, root, "has_more",
+                                    semantic_total > offset + semantic_count);
+        } else {
+            emit_catalog_search_results(doc, root, &output, offset, query && query[0]);
+        }
+        emit_catalog_scope(doc, root, &scope);
+        json = yy_doc_to_str(doc);
+        yyjson_mut_doc_free(doc);
+    }
+    cbm_store_search_free(&output);
+    cbm_store_free_vector_results(semantic_results, semantic_count);
+    free(query);
+    free(label);
+    free(name_pattern);
+    free(qn_pattern);
+    free(file_pattern);
+    free(relationship);
+    cbm_zova_catalog_scope_free(&scope);
+    cbm_zova_catalog_close(catalog);
+    yyjson_doc_free(args_doc);
+    if (!json) {
+        if (search_status == CBM_ZOVA_CATALOG_INCOMPATIBLE_MODELS)
+            return cbm_mcp_text_result(
+                "selected projects use incompatible semantic models or dimensions", true);
+        if (search_status == CBM_ZOVA_CATALOG_STALE_SCOPE)
+            return cbm_mcp_text_result(
+                "project generations changed during semantic search; retry the request", true);
+        return cbm_mcp_text_result("multi-project search failed", true);
+    }
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *project = get_project_arg(args);
+    cbm_mcp_project_scope_t scope = {0};
+    const char *scope_error = NULL;
+    if (project_scope_parse(args, &scope, &scope_error) != 0) {
+        project_scope_free(&scope);
+        return cbm_mcp_text_result(scope_error ? scope_error : "invalid project scope", true);
+    }
+    if (scope.project_count > 0) {
+        char *result = handle_search_graph_catalog(args, &scope);
+        project_scope_free(&scope);
+        return result;
+    }
+    char *project = scope.project;
+    scope.project = NULL;
+    project_scope_free(&scope);
     if (cbm_zova_route_for_project(project) == CBM_ZOVA_ROUTE_FULL_AUTHORITY) {
         return handle_search_graph_flagged(args, project);
     }

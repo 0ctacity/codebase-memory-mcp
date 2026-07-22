@@ -572,6 +572,28 @@ promotion tests, not routine development tests.
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
 
+### Cross-repository search with Zova
+
+When Zova full authority is enabled, `search_graph` can search several repositories stored in the
+shared Zova database in one request:
+
+```json
+{"projects":["codebase-memory-mcp","AnotherFolder/codebase-memory-mcp"],"query":"update user profile"}
+```
+
+Use `{"projects":["*"]}` to search every ready, healthy workspace. BM25, structural filters, and
+`semantic_query` are ranked and paginated across the combined scope. Every result includes its
+owning `project`; pass that value and the returned `qualified_name` to `get_code_snippet`.
+
+Selectors come from canonical repository paths. The first registered repository claims its
+directory basename. A later basename collision receives the shortest unique parent-qualified
+name, such as `AnotherFolder/codebase-memory-mcp`. `list_projects` reports these selectors,
+canonical roots, generations, and health.
+
+This feature provides cross-repository discovery, not cross-workspace topology. `query_graph` and
+`trace_path` remain scoped to one repository; sharing a database does not create graph edges
+between unrelated workspaces.
+
 ## Graph Data Model
 
 ### Node Labels

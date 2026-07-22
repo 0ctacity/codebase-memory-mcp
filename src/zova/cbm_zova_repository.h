@@ -5,7 +5,35 @@
 #include "zova/cbm_zova.h"
 
 typedef struct cbm_zova_repository cbm_zova_repository_t;
+typedef struct cbm_zova_catalog cbm_zova_catalog_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
+
+typedef struct {
+    int64_t workspace_key;
+    char workspace_id[CBM_ZOVA_WORKSPACE_ID_MAX];
+    char *selector;
+    char *project;
+    char *root_path;
+    char *indexed_at;
+    char *model_fingerprint;
+    char *health_reason;
+    int vector_dimensions;
+    int64_t generation;
+    bool ready;
+    bool healthy;
+} cbm_zova_catalog_project_t;
+
+typedef struct {
+    cbm_zova_catalog_project_t *projects;
+    int count;
+    cbm_zova_catalog_project_t *excluded_projects;
+    int excluded_count;
+} cbm_zova_catalog_scope_t;
+
+enum {
+    CBM_ZOVA_CATALOG_STALE_SCOPE = -3,
+    CBM_ZOVA_CATALOG_INCOMPATIBLE_MODELS = -4,
+};
 
 typedef uint32_t cbm_zova_snapshot_components_t;
 
@@ -170,5 +198,25 @@ int cbm_zova_workspace_snapshot_format_edge_id(
     const cbm_zova_workspace_snapshot_t *snapshot, int edge_index,
     char *out, size_t out_size);
 void cbm_zova_workspace_snapshot_free(cbm_zova_workspace_snapshot_t *snapshot);
+
+cbm_zova_catalog_t *cbm_zova_catalog_open(const char *path);
+void cbm_zova_catalog_close(cbm_zova_catalog_t *catalog);
+int cbm_zova_catalog_list(cbm_zova_catalog_t *catalog, cbm_zova_catalog_scope_t *out);
+const char *cbm_zova_catalog_error(const cbm_zova_catalog_t *catalog);
+int cbm_zova_catalog_resolve(cbm_zova_catalog_t *catalog, const char *const *selectors,
+                             int selector_count, bool wildcard,
+                             cbm_zova_catalog_scope_t *out);
+int cbm_zova_catalog_search_fts(cbm_zova_catalog_t *catalog,
+                                const cbm_zova_catalog_scope_t *scope,
+                                const char *query, const char *file_pattern,
+                                int limit, int offset, cbm_search_output_t *out);
+int cbm_zova_catalog_search(cbm_zova_catalog_t *catalog,
+                            const cbm_zova_catalog_scope_t *scope,
+                            const cbm_search_params_t *params, cbm_search_output_t *out);
+int cbm_zova_catalog_search_semantic(
+    cbm_zova_catalog_t *catalog, const char *path, const cbm_zova_catalog_scope_t *scope,
+    const char **keywords, int keyword_count, int limit, int offset,
+    cbm_vector_result_t **out, int *out_count, int *out_total);
+void cbm_zova_catalog_scope_free(cbm_zova_catalog_scope_t *scope);
 
 #endif

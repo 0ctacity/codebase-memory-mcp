@@ -6603,6 +6603,7 @@ void cbm_store_free_vector_results(cbm_vector_result_t *results, int count) {
         return;
     }
     for (int i = 0; i < count; i++) {
+        free(results[i].project);
         free(results[i].name);
         free(results[i].qualified_name);
         free(results[i].file_path);
@@ -6844,6 +6845,7 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
         *cap = nc;
     }
     int idx = (*count)++;
+    memset(&results[idx], 0, sizeof(results[idx]));
     results[idx].node_id = sqlite3_column_int64(stmt, 0);
     const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
     const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
@@ -7545,4 +7547,188 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
                             int *out_count) {
     return cbm_store_vector_search_ex(s, project, keywords, keyword_count, limit, out, out_count,
                                       NULL);
+}
+
+static int multi_vector_result_compare(const void *left, const void *right) {
+    const cbm_vector_result_t *a = left;
+    const cbm_vector_result_t *b = right;
+    if (a->score > b->score) return -1;
+    if (a->score < b->score) return 1;
+    int by_project = strcmp(a->project, b->project);
+    if (by_project != 0) return by_project;
+    int by_qn = strcmp(a->qualified_name, b->qualified_name);
+    if (by_qn != 0) return by_qn;
+    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
+}
+
+int cbm_store_zova_multi_vector_search(
+    const char *db_path, const cbm_zova_vector_workspace_t *workspaces, int workspace_count,
+    const char **keywords, int keyword_count, int limit, int offset,
+    cbm_vector_result_t **out, int *out_count) {
+    if (!out || !out_count) return CBM_STORE_ERR;
+    *out = NULL;
+    *out_count = 0;
+    if (!db_path || !workspaces || workspace_count <= 0 || !keywords || keyword_count <= 0 ||
+        limit <= 0 || offset < 0 || offset > INT_MAX - limit) {
+        return CBM_STORE_ERR;
+    }
+    int needed = offset + limit;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(db_path);
+    if (!store || !session) {
+        cbm_store_close(store);
+        cbm_zova_vector_session_close(session);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *hydrate = NULL;
+    if (sqlite3_prepare_v2(
+            store->db,
+            "SELECT n.label,n.name,n.qualified_name,f.file_path FROM cbm_nodes_v1 n "
+            "JOIN cbm_files_v1 f ON f.file_key=n.file_key WHERE n.workspace_key=?1 "
+            "AND n.zova_node_key=?2",
+            -1, &hydrate, NULL) != SQLITE_OK) {
+        cbm_store_close(store);
+        cbm_zova_vector_session_close(session);
+        return CBM_STORE_ERR;
+    }
+
+    cbm_vector_result_t *combined = NULL;
+    int combined_count = 0;
+    int combined_capacity = 0;
+    int rc = CBM_STORE_OK;
+    for (int w = 0; w < workspace_count && rc == CBM_STORE_OK; w++) {
+        const cbm_zova_vector_workspace_t *workspace = &workspaces[w];
+        if (!workspace->workspace_id || !workspace->selector || !workspace->model_fingerprint ||
+            workspace->vector_dimensions != VS_VEC_DIM) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        int8_t query_vectors[VS_MAX_KW][VS_VEC_DIM];
+        int query_count = 0;
+        for (int k = 0; k < keyword_count && query_count < VS_MAX_KW; k++) {
+            if (!keywords[k] || !keywords[k][0]) continue;
+            int8_t token_vector[VS_VEC_DIM];
+            bool found = false;
+            float values[VS_VEC_DIM] = {0};
+            if (cbm_zova_vector_session_get_workspace_token_i8(
+                    session, workspace->workspace_id, workspace->model_fingerprint,
+                    workspace->vector_dimensions, keywords[k], token_vector,
+                    sizeof(token_vector), &found) != 0) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            if (found) {
+                for (int d = 0; d < VS_VEC_DIM; d++)
+                    values[d] = (float)token_vector[d] / CBM_STORE_INT8_MAX;
+            } else {
+                vs_fill_sparse_random(keywords[k], values);
+            }
+            if (vs_normalize_and_quantize(values, query_vectors[query_count])) query_count++;
+        }
+        if (rc != CBM_STORE_OK || query_count == 0) continue;
+
+        char collection[CBM_ZOVA_WORKSPACE_ID_MAX + 384];
+        if (cbm_zova_workspace_node_vector_collection_name(
+                workspace->workspace_id, workspace->model_fingerprint,
+                workspace->vector_dimensions, collection, sizeof(collection)) != 0) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        int prefilter = query_count > 1 && needed <= INT_MAX / ST_COL_5
+                            ? needed * ST_COL_5
+                            : needed;
+        cbm_zova_vector_hit_t *hits = NULL;
+        int hit_count = 0;
+        if (cbm_zova_vector_session_search_collection_i8(
+                session, collection, &query_vectors[0][0], query_count, VS_VEC_DIM,
+                prefilter, needed, &hits, &hit_count) != 0) {
+            rc = CBM_STORE_ERR;
+            break;
+        }
+        for (int i = 0; i < hit_count && rc == CBM_STORE_OK; i++) {
+            char *end = NULL;
+            long long key = hits[i].vector_id ? strtoll(hits[i].vector_id, &end, 10) : 0;
+            if (!hits[i].vector_id || end == hits[i].vector_id || *end != '\0' || key <= 0 ||
+                sqlite3_reset(hydrate) != SQLITE_OK ||
+                sqlite3_clear_bindings(hydrate) != SQLITE_OK ||
+                sqlite3_bind_int64(hydrate, 1, workspace->workspace_key) != SQLITE_OK ||
+                sqlite3_bind_int64(hydrate, 2, (int64_t)key) != SQLITE_OK) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            if (sqlite3_step(hydrate) != SQLITE_ROW) {
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            const char *label = (const char *)sqlite3_column_text(hydrate, 0);
+            if (!label || (strcmp(label, "Function") != 0 && strcmp(label, "Method") != 0 &&
+                           strcmp(label, "Class") != 0)) {
+                continue;
+            }
+            if (combined_count == combined_capacity) {
+                if (combined_capacity > INT_MAX / 2) {
+                    rc = CBM_STORE_ERR;
+                    break;
+                }
+                int next = combined_capacity ? combined_capacity * 2 : CBM_SZ_16;
+                cbm_vector_result_t *grown =
+                    realloc(combined, (size_t)next * sizeof(*combined));
+                if (!grown) {
+                    rc = CBM_STORE_ERR;
+                    break;
+                }
+                combined = grown;
+                combined_capacity = next;
+            }
+            cbm_vector_result_t *result = &combined[combined_count];
+            memset(result, 0, sizeof(*result));
+            result->node_id = (int64_t)key;
+            result->project = strdup(workspace->selector);
+            result->label = strdup(label);
+            const char *name = (const char *)sqlite3_column_text(hydrate, 1);
+            const char *qn = (const char *)sqlite3_column_text(hydrate, 2);
+            const char *file = (const char *)sqlite3_column_text(hydrate, 3);
+            result->name = strdup(name ? name : "");
+            result->qualified_name = strdup(qn ? qn : "");
+            result->file_path = strdup(file ? file : "");
+            result->score = hits[i].score;
+            if (!result->project || !result->label || !result->name ||
+                !result->qualified_name || !result->file_path) {
+                free(result->project);
+                free(result->label);
+                free(result->name);
+                free(result->qualified_name);
+                free(result->file_path);
+                memset(result, 0, sizeof(*result));
+                rc = CBM_STORE_ERR;
+                break;
+            }
+            combined_count++;
+        }
+        cbm_zova_vector_hits_free(hits, hit_count);
+    }
+    sqlite3_finalize(hydrate);
+    cbm_store_close(store);
+    cbm_zova_vector_session_close(session);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_free_vector_results(combined, combined_count);
+        return rc;
+    }
+    qsort(combined, (size_t)combined_count, sizeof(*combined), multi_vector_result_compare);
+    int start = offset < combined_count ? offset : combined_count;
+    int end = start + limit < combined_count ? start + limit : combined_count;
+    int page_count = end - start;
+    cbm_vector_result_t *page = page_count ? calloc((size_t)page_count, sizeof(*page)) : NULL;
+    if (page_count && !page) {
+        cbm_store_free_vector_results(combined, combined_count);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < page_count; i++) {
+        page[i] = combined[start + i];
+        memset(&combined[start + i], 0, sizeof(*combined));
+    }
+    cbm_store_free_vector_results(combined, combined_count);
+    *out = page;
+    *out_count = page_count;
+    return CBM_STORE_OK;
 }

@@ -16,6 +16,7 @@
 #define CBM_PIPELINE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Forward declarations */
@@ -258,6 +259,9 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
  * Replaces / and : with -, collapses --, trims leading -.
  * Caller must free() the returned string. */
 char *cbm_project_name_from_path(const char *abs_path);
+/* Public MCP selector derived from the final path component plus
+ * `parent_levels` parents. The returned separator is always '/'. */
+char *cbm_project_selector_from_path(const char *abs_path, size_t parent_levels);
 
 /* ── Function Registry ──────────────────────────────────────────── */
 

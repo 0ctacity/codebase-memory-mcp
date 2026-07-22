@@ -3075,6 +3075,157 @@ TEST(zova_user_database_imports_workspace_metadata_and_fts) {
     PASS();
 }
 
+TEST(zova_catalog_assigns_stable_shortest_path_selectors) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-catalog-selectors-%d-%p.zova", cbm_tmpdir(),
+             (int)getpid(), (void *)path);
+    cbm_unlink(path);
+
+    const CBMDumpNode first_node = {
+        .id = 1, .project = "internal-a", .label = "Function", .name = "ClientCall",
+        .qualified_name = "internal-a.ClientCall", .file_path = "src/client.c",
+        .start_line = 1, .end_line = 2, .properties = "{}"};
+    const CBMDumpNode second_node = {
+        .id = 1, .project = "internal-b", .label = "Function", .name = "ServiceHandler",
+        .qualified_name = "internal-b.ServiceHandler", .file_path = "src/service.c",
+        .start_line = 1, .end_line = 2, .properties = "{}"};
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(
+                  path, "/tmp/Primary/shared-project", "internal-a", 1,
+                  &first_node, 1, NULL, 0),
+              0);
+    ASSERT_EQ(cbm_zova_user_database_import_workspace(
+                  path, "/tmp/AnotherFolder/shared-project", "internal-b", 1,
+                  &second_node, 1, NULL, 0),
+              0);
+
+    cbm_zova_catalog_t *catalog = cbm_zova_catalog_open(path);
+    ASSERT_NOT_NULL(catalog);
+    cbm_zova_catalog_scope_t scope = {0};
+    ASSERT_EQ(cbm_zova_catalog_resolve(catalog, NULL, 0, true, &scope), CBM_STORE_OK);
+    ASSERT_EQ(scope.count, 2);
+    ASSERT_STR_EQ(scope.projects[0].selector, "AnotherFolder/shared-project");
+    ASSERT_STR_EQ(scope.projects[0].project, "internal-b");
+    ASSERT_STR_EQ(scope.projects[1].selector, "shared-project");
+    ASSERT_STR_EQ(scope.projects[1].project, "internal-a");
+    cbm_zova_repository_t *selected = cbm_zova_repository_open(path, "shared-project");
+    ASSERT_NOT_NULL(selected);
+    ASSERT_STR_EQ(cbm_zova_repository_workspace_id(selected), scope.projects[1].workspace_id);
+    cbm_zova_repository_close(selected);
+    cbm_search_output_t search = {0};
+    ASSERT_EQ(cbm_zova_catalog_search_fts(catalog, &scope, "Client OR Service", NULL, 10, 0,
+                                          &search),
+              CBM_STORE_OK);
+    ASSERT_EQ(search.total, 2);
+    ASSERT_EQ(search.count, 2);
+    ASSERT_STR_EQ(search.results[0].node.project, "AnotherFolder/shared-project");
+    ASSERT_STR_EQ(search.results[1].node.project, "shared-project");
+    cbm_store_search_free(&search);
+    cbm_search_params_t regular_params = {
+        .min_degree = -1, .max_degree = -1, .limit = 1, .offset = 1};
+    ASSERT_EQ(cbm_zova_catalog_search(catalog, &scope, &regular_params, &search),
+              CBM_STORE_OK);
+    ASSERT_EQ(search.total, 2);
+    ASSERT_EQ(search.count, 1);
+    ASSERT_STR_EQ(search.results[0].node.name, "ServiceHandler");
+    ASSERT_STR_EQ(search.results[0].node.project, "AnotherFolder/shared-project");
+    cbm_store_search_free(&search);
+    cbm_zova_catalog_scope_free(&scope);
+    cbm_zova_catalog_close(catalog);
+
+    zova_database *writer = NULL;
+    zova_message writer_error = {0};
+    ASSERT_EQ(zova_database_open(&(zova_database_open_request){
+                  .path=path,.out_db=&writer,.out_error_message=&writer_error}), ZOVA_OK);
+    zova_message_free(&writer_error);
+    ASSERT_EQ(zova_database_exec(&(zova_database_exec_request){
+                  .db=writer,
+                  .sql="INSERT INTO cbm_workspace_health_v1(workspace_key,state,reason,"
+                       "checked_generation,checked_at) SELECT workspace_key,'rebuild_required',"
+                       "'fixture requires rebuild',1,'2026-07-22T00:00:00Z' FROM "
+                       "cbm_projects_v1 WHERE project='internal-b' ON CONFLICT(workspace_key) "
+                       "DO UPDATE SET state=excluded.state,reason=excluded.reason"}),
+              ZOVA_OK);
+    ASSERT_EQ(zova_database_close(writer), ZOVA_OK);
+    catalog = cbm_zova_catalog_open(path);
+    ASSERT_NOT_NULL(catalog);
+    ASSERT_EQ(cbm_zova_catalog_resolve(catalog, NULL, 0, true, &scope), CBM_STORE_OK);
+    ASSERT_EQ(scope.count, 1);
+    ASSERT_EQ(scope.excluded_count, 1);
+    ASSERT_STR_EQ(scope.excluded_projects[0].selector, "AnotherFolder/shared-project");
+    ASSERT_STR_EQ(scope.excluded_projects[0].health_reason, "fixture requires rebuild");
+    cbm_zova_catalog_scope_free(&scope);
+    cbm_zova_catalog_close(catalog);
+    cbm_unlink(path);
+    PASS();
+}
+
+TEST(zova_catalog_semantic_search_merges_workspace_collections_globally) {
+    char path[TZ_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/cbm-catalog-semantic-%d-%p.zova", cbm_tmpdir(),
+             (int)getpid(), (void *)path);
+    cbm_unlink(path);
+    int8_t client_vector[768] = {0};
+    int8_t service_vector[768] = {0};
+    client_vector[0] = 127;
+    service_vector[1] = 127;
+    const CBMDumpNode client = {
+        .id=1,.project="internal-client",.label="Function",.name="ClientCall",
+        .qualified_name="internal-client.ClientCall",.file_path="src/client.c",.properties="{}"};
+    const CBMDumpNode service = {
+        .id=1,.project="internal-service",.label="Function",.name="ServiceHandler",
+        .qualified_name="internal-service.ServiceHandler",.file_path="src/service.c",.properties="{}"};
+    const CBMDumpVector client_node_vector = {
+        .node_id=1,.project="internal-client",.vector=(const uint8_t *)client_vector,
+        .vector_len=sizeof(client_vector)};
+    const CBMDumpVector service_node_vector = {
+        .node_id=1,.project="internal-service",.vector=(const uint8_t *)service_vector,
+        .vector_len=sizeof(service_vector)};
+    const CBMDumpTokenVec client_token = {
+        .id=1,.project="internal-client",.token="request",
+        .vector=(const uint8_t *)client_vector,.vector_len=sizeof(client_vector),.idf=1.0f};
+    const CBMDumpTokenVec service_token = {
+        .id=1,.project="internal-service",.token="request",
+        .vector=(const uint8_t *)client_vector,.vector_len=sizeof(client_vector),.idf=1.0f};
+    const cbm_zova_workspace_generation_input_t client_input = {
+        .root_path="/tmp/Primary/shared-project",.project="internal-client",
+        .indexed_at="2026-07-22T00:00:00Z",.model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions=768,.nodes=&client,.node_count=1,
+        .node_vectors=&client_node_vector,.node_vector_count=1,
+        .token_vectors=&client_token,.token_vector_count=1};
+    const cbm_zova_workspace_generation_input_t service_input = {
+        .root_path="/tmp/AnotherFolder/shared-project",.project="internal-service",
+        .indexed_at="2026-07-22T00:00:00Z",.model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions=768,.nodes=&service,.node_count=1,
+        .node_vectors=&service_node_vector,.node_vector_count=1,
+        .token_vectors=&service_token,.token_vector_count=1};
+    cbm_zova_workspace_generation_result_t published = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &client_input, &published), 0);
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &service_input, &published), 0);
+
+    cbm_zova_catalog_t *catalog = cbm_zova_catalog_open(path);
+    ASSERT_NOT_NULL(catalog);
+    cbm_zova_catalog_scope_t scope = {0};
+    ASSERT_EQ(cbm_zova_catalog_resolve(catalog, NULL, 0, true, &scope), CBM_STORE_OK);
+    const char *keywords[] = {"request"};
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    int total = 0;
+    ASSERT_EQ(cbm_zova_catalog_search_semantic(
+                  catalog, path, &scope, keywords, 1, 10, 0, &results, &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(total, 2);
+    ASSERT_STR_EQ(results[0].name, "ClientCall");
+    ASSERT_STR_EQ(results[0].project, "shared-project");
+    ASSERT_STR_EQ(results[1].name, "ServiceHandler");
+    ASSERT_STR_EQ(results[1].project, "AnotherFolder/shared-project");
+    cbm_store_free_vector_results(results, count);
+    cbm_zova_catalog_scope_free(&scope);
+    cbm_zova_catalog_close(catalog);
+    cbm_unlink(path);
+    PASS();
+}
+
 TEST(zova_user_database_delete_workspace_is_isolated_and_idempotent) {
     char path[TZ_PATH_MAX];
     snprintf(path, sizeof(path), "%s/cbm-user-delete-%d-%p.zova", cbm_tmpdir(), (int)getpid(),
@@ -5514,6 +5665,8 @@ SUITE(zova) {
     RUN_TEST(zova_atomic_publisher_reader_snapshot_is_generation_consistent);
     RUN_TEST(zova_user_database_capability_probe_covers_empty_schema_surface);
     RUN_TEST(zova_user_database_imports_workspace_metadata_and_fts);
+    RUN_TEST(zova_catalog_assigns_stable_shortest_path_selectors);
+    RUN_TEST(zova_catalog_semantic_search_merges_workspace_collections_globally);
     RUN_TEST(zova_user_database_delete_workspace_is_isolated_and_idempotent);
     RUN_TEST(zova_atomic_workspace_publisher_commits_complete_generation);
     RUN_TEST(zova_full_edge_publication_batches_128_rows);

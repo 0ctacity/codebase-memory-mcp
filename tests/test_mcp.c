@@ -878,17 +878,84 @@ TEST(tool_unknown_tool) {
 
 TEST(tool_search_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_mcp_server_set_project(srv, "basic-search");
+    ASSERT_EQ(cbm_store_upsert_project(cbm_mcp_server_store(srv), "basic-search",
+                                       "/tmp/basic-search"),
+              CBM_STORE_OK);
 
-    /* search_graph with no project → should work on empty store */
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"search_graph\","
-                                   "\"arguments\":{\"label\":\"Function\",\"limit\":10}}}");
+                                   "\"arguments\":{\"project\":\"basic-search\","
+                                   "\"label\":\"Function\",\"limit\":10}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(search_graph_schema_accepts_project_or_projects) {
+    const char *schema = cbm_mcp_tool_input_schema("search_graph");
+    ASSERT_NOT_NULL(schema);
+    yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *properties = yyjson_obj_get(root, "properties");
+    ASSERT_NOT_NULL(yyjson_obj_get(properties, "project"));
+    yyjson_val *projects = yyjson_obj_get(properties, "projects");
+    ASSERT_NOT_NULL(projects);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(projects, "type")), "array");
+    ASSERT_NULL(yyjson_obj_get(root, "required"));
+    ASSERT_NOT_NULL(yyjson_obj_get(root, "oneOf"));
+    yyjson_doc_free(doc);
+    PASS();
+}
+
+TEST(tool_search_graph_rejects_project_and_projects) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":131,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"one\",\"projects\":[\"one\",\"two\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "project and projects are mutually exclusive"));
+    ASSERT_NOT_NULL(strstr(resp, "isError"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_rejects_empty_projects) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{\"projects\":[]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "projects must be a non-empty array"));
+    ASSERT_NOT_NULL(strstr(resp, "isError"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_rejects_multi_project_compatibility_route) {
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"projects\":[\"one\",\"two\"],\"query\":\"handler\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "multi-project search requires Zova full authority"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    free(saved_flag_copy);
     PASS();
 }
 
@@ -1434,6 +1501,113 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
     free(status_baseline_normalized);
     free(cypher_active_normalized);
     free(cypher_baseline_normalized);
+    PASS();
+#endif
+}
+
+TEST(tool_search_graph_searches_two_zova_projects_globally) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-project-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+
+    char path[512];
+    ASSERT_EQ(cbm_zova_user_database_path(path, sizeof(path)), 0);
+    const CBMDumpNode client = {
+        .id = 1, .project = "internal-client", .label = "Function", .name = "ClientCall",
+        .qualified_name = "internal-client.ClientCall", .file_path = "src/client.c",
+        .start_line = 1, .end_line = 2, .properties = "{}"};
+    const CBMDumpNode service = {
+        .id = 1, .project = "internal-service", .label = "Function",
+        .name = "ServiceHandler", .qualified_name = "internal-service.ServiceHandler",
+        .file_path = "src/service.c", .start_line = 1, .end_line = 2, .properties = "{}"};
+    int8_t client_values[768] = {0};
+    int8_t service_values[768] = {0};
+    client_values[0] = 127;
+    service_values[1] = 127;
+    const CBMDumpVector client_vector = {
+        .node_id=1,.project="internal-client",.vector=(const uint8_t *)client_values,
+        .vector_len=sizeof(client_values)};
+    const CBMDumpVector service_vector = {
+        .node_id=1,.project="internal-service",.vector=(const uint8_t *)service_values,
+        .vector_len=sizeof(service_values)};
+    const CBMDumpTokenVec client_token = {
+        .id=1,.project="internal-client",.token="request",
+        .vector=(const uint8_t *)client_values,.vector_len=sizeof(client_values),.idf=1.0f};
+    const CBMDumpTokenVec service_token = {
+        .id=1,.project="internal-service",.token="request",
+        .vector=(const uint8_t *)client_values,.vector_len=sizeof(client_values),.idf=1.0f};
+    const cbm_zova_workspace_generation_input_t client_input = {
+        .root_path="/tmp/Primary/shared-project",.project="internal-client",
+        .indexed_at="2026-07-22T00:00:00Z",.model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions=768,.nodes=&client,.node_count=1,
+        .node_vectors=&client_vector,.node_vector_count=1,
+        .token_vectors=&client_token,.token_vector_count=1};
+    const cbm_zova_workspace_generation_input_t service_input = {
+        .root_path="/tmp/AnotherFolder/shared-project",.project="internal-service",
+        .indexed_at="2026-07-22T00:00:00Z",.model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions=768,.nodes=&service,.node_count=1,
+        .node_vectors=&service_vector,.node_vector_count=1,
+        .token_vectors=&service_token,.token_vector_count=1};
+    cbm_zova_workspace_generation_result_t published = {0};
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &client_input, &published), 0);
+    ASSERT_EQ(cbm_zova_user_database_publish_workspace(path, &service_input, &published), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":133,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"projects\":[\"shared-project\",\"AnotherFolder/shared-project\"],"
+             "\"query\":\"Client OR Service\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "ClientCall"));
+    ASSERT_NOT_NULL(strstr(response, "ServiceHandler"));
+    ASSERT_NOT_NULL(strstr(response, "AnotherFolder/shared-project"));
+    ASSERT_NOT_NULL(strstr(response, "scope"));
+    ASSERT_NOT_NULL(strstr(response, "generations"));
+    free(response);
+
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":134,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "shared-project"));
+    ASSERT_NOT_NULL(strstr(response, "AnotherFolder/shared-project"));
+    ASSERT_NOT_NULL(strstr(response, "/tmp/Primary/shared-project"));
+    ASSERT_NOT_NULL(strstr(response, "generation"));
+    ASSERT_NOT_NULL(strstr(response, "healthy"));
+    free(response);
+
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":135,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"projects\":[\"shared-project\",\"AnotherFolder/shared-project\"],"
+             "\"semantic_query\":[\"request\"],\"limit\":10}}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "semantic_results"));
+    ASSERT_NOT_NULL(strstr(response, "ClientCall"));
+    ASSERT_NOT_NULL(strstr(response, "ServiceHandler"));
+    ASSERT_NOT_NULL(strstr(response, "\"project\":\"shared-project\""));
+    free(response);
+    cbm_mcp_server_free(srv);
+
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    free(saved_cache_copy);
+    free(saved_flag_copy);
+    cbm_unlink(path);
+    cbm_rmdir(cache);
     PASS();
 #endif
 }
@@ -6009,7 +6183,12 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(search_graph_schema_accepts_project_or_projects);
+    RUN_TEST(tool_search_graph_rejects_project_and_projects);
+    RUN_TEST(tool_search_graph_rejects_empty_projects);
+    RUN_TEST(tool_search_graph_rejects_multi_project_compatibility_route);
     RUN_TEST(tool_search_graph_flagged_reads_user_database_without_project_db);
+    RUN_TEST(tool_search_graph_searches_two_zova_projects_globally);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);

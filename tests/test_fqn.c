@@ -377,6 +377,16 @@ TEST(project_name_unix_path) {
     PASS();
 }
 
+TEST(project_name_uses_repository_basename) {
+    ASSERT_FQN(cbm_project_selector_from_path(
+                   "/Users/atasesli/Desktop/VsCode/codebase-memory-mcp", 0),
+               "codebase-memory-mcp");
+    ASSERT_FQN(cbm_project_selector_from_path(
+                   "/Users/atasesli/Desktop/VsCode/codebase-memory-mcp", 1),
+               "VsCode/codebase-memory-mcp");
+    PASS();
+}
+
 TEST(project_name_windows_path) {
     ASSERT_FQN(cbm_project_name_from_path("C:\\Users\\dev\\project"), "C-Users-dev-project");
     PASS();
@@ -636,6 +646,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_folder_double_slash);
 
     /* project_name_from_path */
+    RUN_TEST(project_name_uses_repository_basename);
     RUN_TEST(project_name_unix_path);
     RUN_TEST(project_name_windows_path);
     RUN_TEST(project_name_with_colons);

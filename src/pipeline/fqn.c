@@ -507,3 +507,132 @@ char *cbm_project_name_from_path(const char *abs_path) {
     }
     return result;
 }
+
+static char *project_selector_component(const char *component) {
+    if (!component || !component[0]) {
+        return strdup("root");
+    }
+
+    size_t len = strlen(component);
+    char *mapped = malloc(len * 2 + 1);
+    if (!mapped) {
+        return NULL;
+    }
+    static const char hex_digits[] = "0123456789abcdef";
+    size_t used = 0;
+    char previous = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)component[i];
+        bool safe = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+        if (safe) {
+            if ((c == '-' && previous == '-') || (c == '.' && previous == '.')) {
+                continue;
+            }
+            mapped[used++] = (char)c;
+            previous = (char)c;
+        } else if (c >= 0x80) {
+            mapped[used++] = hex_digits[(c >> 4) & 0xf];
+            mapped[used++] = hex_digits[c & 0xf];
+            previous = mapped[used - 1];
+        } else if (previous != '-') {
+            mapped[used++] = '-';
+            previous = '-';
+        }
+    }
+    mapped[used] = '\0';
+
+    char *start = mapped;
+    while (*start == '-' || *start == '.') {
+        start++;
+    }
+    size_t clean_len = strlen(start);
+    while (clean_len > 0 && start[clean_len - 1] == '-') {
+        start[--clean_len] = '\0';
+    }
+    char *result = strdup(start[0] ? start : "root");
+    free(mapped);
+    return result ? fqn_bound_name_len(result) : NULL;
+}
+
+char *cbm_project_selector_from_path(const char *abs_path, size_t parent_levels) {
+    if (!abs_path || !abs_path[0] || path_is_root_syntax(abs_path)) {
+        return strdup("root");
+    }
+
+    char *path = strdup(abs_path);
+    if (!path) {
+        return NULL;
+    }
+    cbm_normalize_path_sep(path);
+    size_t len = strlen(path);
+    while (len > 0 && path[len - 1] == '/') {
+        path[--len] = '\0';
+    }
+    if (!len) {
+        free(path);
+        return strdup("root");
+    }
+
+    size_t component_capacity = len + 1;
+    char **components = malloc(component_capacity * sizeof(*components));
+    if (!components) {
+        free(path);
+        return NULL;
+    }
+    size_t component_count = 0;
+    char *cursor = path;
+    while (*cursor) {
+        while (*cursor == '/') cursor++;
+        if (!*cursor) break;
+        components[component_count++] = cursor;
+        while (*cursor && *cursor != '/') cursor++;
+        if (*cursor) *cursor++ = '\0';
+    }
+    if (!component_count) {
+        free(components);
+        free(path);
+        return strdup("root");
+    }
+
+    size_t wanted = parent_levels == SIZE_MAX ? component_count : parent_levels + 1;
+    if (wanted > component_count) wanted = component_count;
+    size_t first = component_count - wanted;
+    char **clean = calloc(wanted, sizeof(*clean));
+    size_t output_len = wanted > 0 ? wanted - 1 : 0;
+    if (!clean) {
+        free(components);
+        free(path);
+        return NULL;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < wanted; i++) {
+        clean[i] = project_selector_component(components[first + i]);
+        if (!clean[i]) {
+            ok = false;
+            break;
+        }
+        if (SIZE_MAX - output_len < strlen(clean[i])) {
+            ok = false;
+            break;
+        }
+        output_len += strlen(clean[i]);
+    }
+
+    char *result = ok ? malloc(output_len + 1) : NULL;
+    if (result) {
+        char *out = result;
+        for (size_t i = 0; i < wanted; i++) {
+            if (i) *out++ = '/';
+            size_t part_len = strlen(clean[i]);
+            memcpy(out, clean[i], part_len);
+            out += part_len;
+        }
+        *out = '\0';
+    }
+    for (size_t i = 0; i < wanted; i++) free(clean[i]);
+    free(clean);
+    free(components);
+    free(path);
+    return result;
+}
