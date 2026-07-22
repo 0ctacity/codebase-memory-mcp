@@ -4307,31 +4307,55 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     const double ratio = cbm_dump_verify_min_ratio();
     const int min_floor = CBM_DUMP_VERIFY_MIN_FLOOR;
 
-    cbm_store_t *store = resolve_store(srv, project_name);
+    cbm_store_t *store = NULL;
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
+    bool zova_authority = false;
 
-    if (!store) {
-        degraded = true;
-    } else {
-        nodes = cbm_store_count_nodes(store, project_name);
-        edges = cbm_store_count_edges(store, project_name);
-        if (nodes < 0) {
+#if CBM_WITH_ZOVA
+    zova_authority = cbm_zova_route_for_project(project_name) == CBM_ZOVA_ROUTE_FULL_AUTHORITY;
+    if (zova_authority) {
+        char zova_path[CBM_SZ_1K];
+        cbm_zova_repository_t *repository = NULL;
+        if (cbm_zova_user_database_path(zova_path, sizeof(zova_path)) != 0 ||
+            !(repository = cbm_zova_repository_open(zova_path, project_name))) {
             degraded = true;
-            nodes = 0;
-            edges = edges >= 0 ? edges : 0;
-        } else if (cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor)) {
-            (void)cbm_store_checkpoint(store);
-            int nodes2 = cbm_store_count_nodes(store, project_name);
-            int edges2 = cbm_store_count_edges(store, project_name);
-            if (nodes2 >= 0) {
-                nodes = nodes2;
+        } else {
+            const char *workspace_id = cbm_zova_repository_workspace_id(repository);
+            if (cbm_zova_repository_counts(repository, workspace_id, &nodes, &edges) !=
+                    CBM_STORE_OK ||
+                nodes < 0 || edges < 0) {
+                nodes = 0;
+                edges = 0;
+                degraded = true;
             }
-            if (edges2 >= 0) {
-                edges = edges2;
-            }
+            cbm_zova_repository_close(repository);
+        }
+        if (!degraded)
             degraded = cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor);
+    }
+#endif
+
+    if (!zova_authority) {
+        store = resolve_store(srv, project_name);
+        if (!store) {
+            degraded = true;
+        } else {
+            nodes = cbm_store_count_nodes(store, project_name);
+            edges = cbm_store_count_edges(store, project_name);
+            if (nodes < 0) {
+                degraded = true;
+                nodes = 0;
+                edges = edges >= 0 ? edges : 0;
+            } else if (cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor)) {
+                (void)cbm_store_checkpoint(store);
+                int nodes2 = cbm_store_count_nodes(store, project_name);
+                int edges2 = cbm_store_count_edges(store, project_name);
+                if (nodes2 >= 0) nodes = nodes2;
+                if (edges2 >= 0) edges = edges2;
+                degraded = cbm_dump_verify_is_degraded(exp_nodes, nodes, ratio, min_floor);
+            }
         }
     }
 
@@ -4343,7 +4367,14 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     }
 
     if (degraded) {
-        if (!store) {
+        if (zova_authority) {
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "Committed shared Zova workspace failed verification. "
+                "Re-run index_repository(repo_path=...) to rebuild.");
+            cbm_log_warn("dump.verify", "reason", "zova_workspace_verification_failed",
+                         "expected_nodes", exp_nodes >= 0 ? "set" : "unknown");
+        } else if (!store) {
             yyjson_mut_obj_add_str(doc, root, "hint",
                                    "Index database failed integrity check and was removed. "
                                    "Re-run index_repository(repo_path=...) to rebuild.");

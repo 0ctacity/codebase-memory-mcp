@@ -1624,6 +1624,81 @@ TEST(tool_search_graph_searches_two_zova_projects_globally) {
 #endif
 }
 
+TEST(tool_index_repository_reports_zova_committed_counts) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    char root[512];
+    char cache[512];
+    snprintf(root, sizeof(root), "%s/cbm-mcp-zova-index-status-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-zova-index-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char source_path[640];
+    snprintf(source_path, sizeof(source_path), "%s/main.c", root);
+    FILE *source = fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    fputs("int helper(void) { return 42; }\nint main(void) { return helper(); }\n", source);
+    ASSERT_EQ(fclose(source), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[1024];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"fast\",\"name\":\"zova-status\"}",
+             root);
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool indexed = response && response_contains_json_fragment(response, "\"status\":\"indexed\"");
+    bool counts_match = response && response_contains_json_fragment(response, "\"nodes\":6") &&
+                        response_contains_json_fragment(response, "\"edges\":6");
+    bool degraded = response && strstr(response, "degraded");
+
+    char user_db[640];
+    char project_db[640];
+    ASSERT_EQ(cbm_zova_user_database_path(user_db, sizeof(user_db)), 0);
+    snprintf(project_db, sizeof(project_db), "%s/zova-status.db", cache);
+    bool shared_exists = access(user_db, F_OK) == 0;
+    bool project_db_exists = access(project_db, F_OK) == 0;
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+    else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_cache_copy);
+    free(saved_mode_copy);
+    cbm_unlink(user_db);
+    char wal[672];
+    char shm[672];
+    char lock[672];
+    snprintf(wal, sizeof(wal), "%s-wal", user_db);
+    snprintf(shm, sizeof(shm), "%s-shm", user_db);
+    snprintf(lock, sizeof(lock), "%s.writer.lock", user_db);
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+    cbm_unlink(lock);
+    cbm_unlink(source_path);
+    cbm_rmdir(root);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(indexed);
+    ASSERT_TRUE(counts_match);
+    ASSERT_FALSE(degraded);
+    ASSERT_TRUE(shared_exists);
+    ASSERT_FALSE(project_db_exists);
+    PASS();
+#endif
+}
+
 /* Forward declarations for helpers defined later in this file */
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
@@ -6201,6 +6276,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_rejects_multi_project_compatibility_route);
     RUN_TEST(tool_search_graph_flagged_reads_user_database_without_project_db);
     RUN_TEST(tool_search_graph_searches_two_zova_projects_globally);
+    RUN_TEST(tool_index_repository_reports_zova_committed_counts);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);
