@@ -102,7 +102,7 @@ static char *rpd_edge_fingerprint(cbm_store_t *s, const char *project) {
 }
 
 /* Index `repo` into a freshly-unlinked isolated store and return the edge
- * fingerprint. Honors CBM_INDEX_SINGLE_THREAD from the environment. */
+ * fingerprint. Honors CBM_WORKERS from the environment. */
 static char *rpd_index_and_fingerprint(const char *repo, const char *dbpath) {
     unlink(dbpath);
     char wal[600], shm[600];
@@ -183,9 +183,9 @@ TEST(repro_seq_parallel_equivalence) {
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_seq_par.db", cbm_tmpdir());
 
-    setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    setenv("CBM_WORKERS", "0", 1);
     char *fp_st = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
-    unsetenv("CBM_INDEX_SINGLE_THREAD");
+    unsetenv("CBM_WORKERS");
     ASSERT_NOT_NULL(fp_st);
 
     char *fp_mt = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);

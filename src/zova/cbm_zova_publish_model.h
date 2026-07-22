@@ -51,9 +51,16 @@ typedef struct {
     uint64_t endpoint_lookups;
     uint64_t global_sorts;
     uint64_t digest_row_revisit_count;
+    uint64_t prepared_single_default_payload_count;
+    uint64_t prepared_payload_scratch_edge_count;
     double normalization_ms;
     double nodes_ms;
     double edges_ms;
+    double prepared_endpoint_ms;
+    double prepared_topology_sort_ms;
+    double prepared_topology_group_ms;
+    double prepared_payload_ms;
+    double prepared_topology_digest_ms;
     double hashes_ms;
     double vectors_ms;
     double digests_ms;

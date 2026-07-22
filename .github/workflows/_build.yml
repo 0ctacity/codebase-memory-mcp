@@ -1,318 +1,253 @@
-# Reusable: build binaries (standard + UI) on all platforms
-name: Build
+name: Build release artifacts
 
 on:
   workflow_call:
     inputs:
       version:
-        description: 'Version string (e.g. v0.8.0)'
+        description: Release version such as v1.2.3
+        required: true
         type: string
-        default: ''
 
 permissions:
   contents: read
 
 jobs:
-  build-unix:
+  unix:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
+          - runner: ubuntu-latest
+            os: linux
+            arch: amd64
             cc: gcc
             cxx: g++
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
+          - runner: ubuntu-24.04-arm
+            os: linux
+            arch: arm64
             cc: gcc
             cxx: g++
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
+          - runner: macos-14
+            os: darwin
+            arch: arm64
             cc: cc
             cxx: c++
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
+          - runner: macos-15-intel
+            os: darwin
+            arch: amd64
             cc: cc
             cxx: c++
-    runs-on: ${{ matrix.os }}
-    # Every leg is BLOCKING — no continue-on-error. The darwin-amd64 binary
-    # built on macos-15-intel must ship with every release; if that runner is
-    # unavailable the build fails loudly rather than silently publishing a
-    # release with no Intel macOS binary (a user-reported gap). macos-15-intel
-    # is GitHub's supported Intel image through Aug 2027 (the last x86_64 macOS
-    # runner); revisit the Intel leg before that retirement.
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Install deps (Ubuntu)
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        env:
-          VERSION: ${{ inputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX"
-          else
-            scripts/build.sh "CC=$CC" "CXX=$CXX"
-          fi
-
-      - name: Ad-hoc sign macOS binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Archive standard binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - name: Build UI binary
-        env:
-          VERSION: ${{ inputs.version }}
-          CC: ${{ matrix.cc }}
-          CXX: ${{ matrix.cxx }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX"
-          else
-            scripts/build.sh --with-ui "CC=$CC" "CXX=$CXX"
-          fi
-
-      - name: Ad-hoc sign macOS UI binary
-        if: startsWith(matrix.os, 'macos')
-        run: codesign --sign - --force build/c/codebase-memory-mcp
-
-      - name: Frontend integrity scan
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        run: scripts/security-ui.sh
-
-      - name: Archive UI binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          cp LICENSE install.sh build/c/
-          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
-          tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
-            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: "*.tar.gz"
-
-  build-windows:
-    runs-on: windows-latest
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: CLANG64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-x86_64-clang
-            mingw-w64-clang-x86_64-zlib
-            make
-            zip
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
-
-      - name: Archive standard binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Build UI binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
-          fi
-
-      - name: Archive UI binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-windows-amd64
-          path: "*.zip"
-
-  build-windows-arm64:
-    # Native ARM64 Windows binary via the CLANGARM64 toolchain on the
-    # windows-11-arm runner (the same toolchain the test suite already
-    # exercises). Without it, ARM-Windows users fall back to the x86_64
-    # binary under emulation, and npm/pip on native-ARM Node/Python 404.
-    runs-on: windows-11-arm
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
-        with:
-          msystem: CLANGARM64
-          path-type: inherit
-          install: >-
-            mingw-w64-clang-aarch64-clang
-            mingw-w64-clang-aarch64-zlib
-            make
-            zip
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: "22"
-
-      - name: Build standard binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh CC=clang CXX=clang++
-          fi
-
-      - name: Archive standard binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - name: Build UI binary
-        shell: msys2 {0}
-        env:
-          VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
-          else
-            scripts/build.sh --with-ui CC=clang CXX=clang++
-          fi
-
-      - name: Archive UI binary
-        shell: msys2 {0}
-        run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
-          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: binaries-windows-arm64
-          path: "*.zip"
-
-  build-linux-portable:
-    # Fully static Linux binaries (gcc -static on Ubuntu).
-    # Runs on any Linux distro without shared library dependencies.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Install deps
+      - name: Install Linux dependencies
+        if: matrix.os == 'linux'
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
-
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: "22"
+          node-version: '22'
+      - name: Install Bun
+        run: npm install --global bun@1.3.14
+      - uses: ./.github/actions/setup-zova
 
-      - name: Build standard binary (static)
+      - name: Build standard Zova-CBM
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: scripts/build.sh --version "$VERSION" "CC=$CC" "CXX=$CXX" CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
+      - name: Verify standard binary
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1
-          else
-            scripts/build.sh CC=gcc CXX=g++ STATIC=1
+          nm build/c/codebase-memory-mcp > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$(build/c/codebase-memory-mcp --version)" = "codebase-memory-mcp ${VERSION#v}"
+          if [[ "${{ matrix.os }}" == darwin ]]; then
+            codesign --sign - --force build/c/codebase-memory-mcp
           fi
-
-      - name: Verify static linking
-        run: |
-          file build/c/codebase-memory-mcp
-          ldd build/c/codebase-memory-mcp 2>&1 | grep -q "not a dynamic executable" || ldd build/c/codebase-memory-mcp 2>&1 | grep -q "statically linked"
-
       - name: Archive standard binary
         env:
+          OS: ${{ matrix.os }}
           ARCH: ${{ matrix.arch }}
         run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-${OS}-${ARCH}.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - name: Build UI Zova-CBM
+        env:
+          VERSION: ${{ inputs.version }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: scripts/build.sh --with-ui --version "$VERSION" "CC=$CC" "CXX=$CXX" CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
+      - name: Verify UI binary
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          nm build/c/codebase-memory-mcp > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$(build/c/codebase-memory-mcp --version)" = "codebase-memory-mcp ${VERSION#v}"
+          if [[ "${{ matrix.os }}" == darwin ]]; then
+            codesign --sign - --force build/c/codebase-memory-mcp
+          fi
+      - name: Archive UI binary
+        env:
+          OS: ${{ matrix.os }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          cp LICENSE install.sh build/c/
+          scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
+          tar -czf "codebase-memory-mcp-ui-${OS}-${ARCH}.tar.gz" \
+            -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.os }}-${{ matrix.arch }}
+          path: '*.tar.gz'
+          if-no-files-found: error
+
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: amd64
+            msystem: CLANG64
+            package_arch: x86_64
+            zig_target: x86_64-windows-gnu
+          - runner: windows-11-arm
+            arch: arm64
+            msystem: CLANGARM64
+            package_arch: aarch64
+            zig_target: aarch64-windows-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-${{ matrix.package_arch }}-clang
+            mingw-w64-clang-${{ matrix.package_arch }}-zlib
+            make
+            zip
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install Bun
+        shell: msys2 {0}
+        run: npm install --global bun@1.3.14
+      - uses: ./.github/actions/setup-zova
+        with:
+          target: ${{ matrix.zig_target }}
+
+      - name: Build standard Zova-CBM
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: scripts/build.sh --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
+      - name: Verify and archive standard binary
+        shell: msys2 {0}
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          BIN=build/c/codebase-memory-mcp.exe
+          nm "$BIN" > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$("$BIN" --version)" = "codebase-memory-mcp ${VERSION#v}"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip "codebase-memory-mcp-windows-${ARCH}.zip" codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Build UI Zova-CBM
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+          ZIG_TARGET: ${{ matrix.zig_target }}
+        run: scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
+      - name: Verify and archive UI binary
+        shell: msys2 {0}
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          BIN=build/c/codebase-memory-mcp.exe
+          nm "$BIN" > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$("$BIN" --version)" = "codebase-memory-mcp ${VERSION#v}"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip "codebase-memory-mcp-ui-windows-${ARCH}.zip" codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-windows-${{ matrix.arch }}
+          path: '*.zip'
+          if-no-files-found: error
+
+  linux-portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install Bun
+        run: npm install --global bun@1.3.14
+      - uses: ./.github/actions/setup-zova
+
+      - name: Build standard portable Zova-CBM
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/build.sh --version "$VERSION" CC=gcc CXX=g++ STATIC=1 CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
+      - name: Verify and archive standard portable binary
+        env:
+          ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          nm build/c/codebase-memory-mcp > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$(build/c/codebase-memory-mcp --version)" = "codebase-memory-mcp ${VERSION#v}"
+          LDD_OUTPUT=$(ldd build/c/codebase-memory-mcp 2>&1 || true)
+          grep -Eq 'not a dynamic executable|statically linked' <<< "$LDD_OUTPUT"
           cp LICENSE install.sh build/c/
           scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
           tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
 
-      - name: Build UI binary (static)
+      - name: Build UI portable Zova-CBM
         env:
           VERSION: ${{ inputs.version }}
-        run: |
-          if [ -n "$VERSION" ]; then
-            scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1
-          else
-            scripts/build.sh --with-ui CC=gcc CXX=g++ STATIC=1
-          fi
-
-      - name: Archive UI binary
+        run: scripts/build.sh --with-ui --version "$VERSION" CC=gcc CXX=g++ STATIC=1 CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
+      - name: Verify and archive UI portable binary
         env:
           ARCH: ${{ matrix.arch }}
+          VERSION: ${{ inputs.version }}
         run: |
+          nm build/c/codebase-memory-mcp > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+          test "$(build/c/codebase-memory-mcp --version)" = "codebase-memory-mcp ${VERSION#v}"
+          LDD_OUTPUT=$(ldd build/c/codebase-memory-mcp 2>&1 || true)
+          grep -Eq 'not a dynamic executable|statically linked' <<< "$LDD_OUTPUT"
           cp LICENSE install.sh build/c/
           scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
           tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
@@ -320,5 +255,6 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: binaries-linux-${{ matrix.arch }}-portable
-          path: "*.tar.gz"
+          name: release-linux-${{ matrix.arch }}-portable
+          path: '*-portable.tar.gz'
+          if-no-files-found: error

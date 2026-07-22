@@ -4,7 +4,7 @@ set -euo pipefail
 # install.sh — One-line installer for codebase-memory-mcp.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/install.sh | bash
 #   curl -fsSL ... | bash -s -- --ui          # Install the UI variant
 #   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
 #
@@ -17,10 +17,12 @@ set -euo pipefail
 # called because the final line hasn't arrived yet.
 main() {
 
-REPO="DeusData/codebase-memory-mcp"
+REPO="0ctacity/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 VARIANT="standard"
 SKIP_CONFIG=false
+REPLACE=false
+REPLACE_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
 # Security: reject non-HTTPS download URLs (defense-in-depth)
@@ -35,12 +37,16 @@ for arg in "$@"; do
         --standard)     VARIANT="standard" ;;
         --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
         --skip-config)  SKIP_CONFIG=true ;;
+        --replace)      REPLACE=true ;;
+        --replace-config) REPLACE_CONFIG=true ;;
         --help|-h)
-            echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config]"
+            echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config] [--replace] [--replace-config]"
             echo "  --ui           Install the UI variant (with graph visualization)"
             echo "  --standard     Install the standard variant (default)"
             echo "  --dir PATH     Install directory (default: ~/.local/bin)"
             echo "  --skip-config  Skip automatic agent configuration"
+            echo "  --replace      Replace a different binary already at the target"
+            echo "  --replace-config  Replace conflicting agent MCP entries"
             exit 0
             ;;
     esac
@@ -113,7 +119,14 @@ URL="${CBM_DOWNLOAD_URL}/${ARCHIVE}"
 
 # Download
 DLDIR=$(mktemp -d)
-trap 'rm -rf "$DLDIR"' EXIT
+INSTALL_TMP=""
+HASH_TMP=""
+cleanup() {
+    [ -z "$INSTALL_TMP" ] || rm -f "$INSTALL_TMP"
+    [ -z "$HASH_TMP" ] || rm -f "$HASH_TMP"
+    rm -rf "$DLDIR"
+}
+trap cleanup EXIT
 
 echo "Downloading ${ARCHIVE}..."
 if command -v curl &>/dev/null; then
@@ -170,23 +183,60 @@ if [ "$OS" = "darwin" ]; then
     codesign --sign - --force "$DLBIN" 2>/dev/null || true
 fi
 
-# Install
+# Install. Identical binaries are a true no-op. A different target is never
+# replaced unless the caller explicitly requested it.
 mkdir -p "$INSTALL_DIR"
 DEST="$INSTALL_DIR/codebase-memory-mcp"
-if [ -f "$DEST" ]; then
-    rm -f "$DEST"
-fi
-cp "$DLBIN" "$DEST"
-chmod 755 "$DEST"
+HASH_RECORD="$DEST.sha256"
+hash_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        echo "error: sha256sum or shasum required to install safely" >&2
+        return 1
+    fi
+}
 
-# Verify
-VERSION=$("$DEST" --version 2>&1) || {
+if [ -f "$DEST" ]; then
+    CURRENT_HASH=$(hash_file "$DEST")
+    INCOMING_HASH=$(hash_file "$DLBIN")
+    RECORDED_HASH=""
+    [ ! -f "$HASH_RECORD" ] || IFS= read -r RECORDED_HASH < "$HASH_RECORD"
+    if [ "$CURRENT_HASH" = "$INCOMING_HASH" ] || [ "$RECORDED_HASH" = "$INCOMING_HASH" ]; then
+        echo "already installed: $DEST"
+        exit 0
+    fi
+    if [ "$REPLACE" != true ]; then
+        echo "error: a different binary already exists at $DEST" >&2
+        echo "Re-run with --replace to replace it explicitly." >&2
+        exit 1
+    fi
+fi
+
+INSTALL_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.install.XXXXXX")
+cp "$DLBIN" "$INSTALL_TMP"
+chmod 755 "$INSTALL_TMP"
+
+# Verify the temporary binary before the atomic rename.
+VERSION=$("$INSTALL_TMP" --version 2>&1) || {
     echo "error: installed binary failed to run" >&2
     if [ "$OS" = "darwin" ]; then
         echo "  try: xattr -cr $DEST && codesign --force --sign - $DEST" >&2
     fi
     exit 1
 }
+if [ -e "$DEST" ] && [ "$REPLACE" != true ]; then
+    echo "error: install target appeared while installing: $DEST" >&2
+    exit 1
+fi
+mv -f "$INSTALL_TMP" "$DEST"
+INSTALL_TMP=""
+HASH_TMP=$(mktemp "$INSTALL_DIR/.codebase-memory-mcp.sha256.XXXXXX")
+printf '%s\n' "$(hash_file "$DLBIN")" > "$HASH_TMP"
+mv -f "$HASH_TMP" "$HASH_RECORD"
+HASH_TMP=""
 echo "Installed: $VERSION"
 
 # Configure agents
@@ -196,10 +246,13 @@ if [ "$SKIP_CONFIG" = true ]; then
 else
     echo ""
     echo "Configuring coding agents..."
-    "$DEST" install -y 2>&1 || {
+    CONFIG_ARGS=(install -y)
+    [ "$REPLACE_CONFIG" != true ] || CONFIG_ARGS+=(--replace-config)
+    "$DEST" "${CONFIG_ARGS[@]}" 2>&1 || {
         echo ""
-        echo "Agent configuration failed (non-fatal)."
-        echo "Run manually: codebase-memory-mcp install"
+        echo "error: agent configuration was not changed." >&2
+        echo "Resolve the reported conflict or re-run with --replace-config." >&2
+        exit 1
     }
 fi
 

@@ -5,6 +5,7 @@
 #include "foundation/sha256.h"
 #include "foundation/sha256_backend.h"
 #include "foundation/compat.h"
+#include "pipeline/worker_pool.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -130,22 +131,53 @@ static int model_node_id(const char *workspace_id, const CBMDumpNode *node,
     if (!node || !node->label || !node->name || !node->qualified_name || !node->file_path) {
         return -1;
     }
-    char path[MODEL_PATH_CAP];
-    if (snprintf(path, sizeof(path), "%s", node->file_path) >= (int)sizeof(path)) return -1;
-    for (char *cursor = path; *cursor; cursor++)
-        if (*cursor == '\\') *cursor = '/';
-    char discriminator[MODEL_DISCRIMINATOR_CAP];
-    if (node->qualified_name[0]) {
-        if (snprintf(discriminator, sizeof(discriminator), "named:%s", node->qualified_name) >=
-            (int)sizeof(discriminator)) return -1;
-    } else if (!node->name[0] || node->start_line < 0 || node->end_line < node->start_line ||
-               snprintf(discriminator, sizeof(discriminator), "local:%s:span:%d:%d", node->name,
-                        node->start_line, node->end_line) >= (int)sizeof(discriminator)) {
-        return -1;
+    size_t path_length = strlen(node->file_path);
+    size_t qualified_length = strlen(node->qualified_name);
+    if (path_length >= MODEL_PATH_CAP) return -1;
+
+    cbm_sha256_ctx hash;
+    uint8_t digest[CBM_SHA256_DIGEST_LEN];
+    char hex[33];
+    static const char digits[] = "0123456789abcdef";
+    cbm_sha256_init(&hash);
+    cbm_sha256_update(&hash, node->label, strlen(node->label));
+    cbm_sha256_update(&hash, "\0", 1);
+    const char *path = node->file_path;
+    const char *path_end = path + path_length;
+    while (path < path_end) {
+        const char *separator = strchr(path, '\\');
+        if (!separator || separator >= path_end) {
+            cbm_sha256_update(&hash, path, (size_t)(path_end - path));
+            break;
+        }
+        cbm_sha256_update(&hash, path, (size_t)(separator - path));
+        cbm_sha256_update(&hash, "/", 1);
+        path = separator + 1;
     }
-    return cbm_zova_workspace_node_id_v2(workspace_id, node->label, path,
-                                         node->qualified_name, discriminator,
-                                         out, MODEL_ID_CAP);
+    cbm_sha256_update(&hash, "\0", 1);
+    cbm_sha256_update(&hash, node->qualified_name, qualified_length);
+    cbm_sha256_update(&hash, "\0", 1);
+    if (node->qualified_name[0]) {
+        static const char prefix[] = "named:";
+        if (qualified_length > MODEL_DISCRIMINATOR_CAP - sizeof(prefix)) return -1;
+        cbm_sha256_update(&hash, prefix, sizeof(prefix) - 1);
+        cbm_sha256_update(&hash, node->qualified_name, qualified_length);
+    } else {
+        char discriminator[MODEL_DISCRIMINATOR_CAP];
+        if (!node->name[0] || node->start_line < 0 || node->end_line < node->start_line ||
+            snprintf(discriminator, sizeof(discriminator), "local:%s:span:%d:%d", node->name,
+                     node->start_line, node->end_line) >= (int)sizeof(discriminator)) return -1;
+        cbm_sha256_update(&hash, discriminator, strlen(discriminator));
+    }
+    cbm_sha256_update(&hash, "\0", 1);
+    cbm_sha256_final(&hash, digest);
+    for (size_t i = 0; i < 16; i++) {
+        hex[i * 2] = digits[digest[i] >> 4];
+        hex[i * 2 + 1] = digits[digest[i] & 0x0f];
+    }
+    hex[32] = '\0';
+    return snprintf(out, MODEL_ID_CAP, "n:v2:%s:%s", workspace_id, hex) < MODEL_ID_CAP
+        ? 0 : -1;
 }
 
 static int model_hash_id(const char *prefix, const char *workspace_id,
@@ -194,8 +226,9 @@ static int model_camel_boundary(const char *input, size_t length, size_t index) 
            next >= 'a' && next <= 'z';
 }
 
-static int model_camel_storage_size(const char *input, size_t *out_size) {
-    if (!input || !out_size) return -1;
+static int model_camel_storage_size(const char *input, size_t *out_size,
+                                    size_t *out_length) {
+    if (!input || !out_size || !out_length) return -1;
     size_t length = strlen(input);
     size_t boundaries = 0;
     for (size_t i = 0; i < length; i++)
@@ -203,14 +236,14 @@ static int model_camel_storage_size(const char *input, size_t *out_size) {
     if (length > (SIZE_MAX - 2) / 2 ||
         boundaries > SIZE_MAX - (length * 2) - 2) return -1;
     *out_size = length * 2 + boundaries + 2;
+    *out_length = length;
     return 0;
 }
 
-static int model_camel_name_into(const char *input, char *value, size_t capacity) {
-    size_t required = 0;
-    if (model_camel_storage_size(input, &required) != 0 || !value || capacity < required)
+static int model_camel_name_into(const char *input, size_t length, char *value,
+                                 size_t capacity) {
+    if (!input || !value || length > (SIZE_MAX - 2) / 2 || capacity < length * 2 + 2)
         return -1;
-    size_t length = strlen(input);
     memcpy(value, input, length);
     size_t output = length;
     value[output++] = ' ';
@@ -286,8 +319,42 @@ static int model_topology_compare(const void *left_ptr, const void *right_ptr) {
 
 typedef struct {
     const CBMDumpEdge *source;
+    uint64_t source_ordinal;
+    uint64_t target_ordinal;
+} prepared_topology_seed_t;
+
+static int prepared_topology_seed_compare(const void *left_ptr,
+                                          const void *right_ptr) {
+    const prepared_topology_seed_t *left = left_ptr;
+    const prepared_topology_seed_t *right = right_ptr;
+    if (left->source_ordinal != right->source_ordinal)
+        return left->source_ordinal < right->source_ordinal ? -1 : 1;
+    int comparison = left->source->type == right->source->type
+        ? 0 : strcmp(left->source->type, right->source->type);
+    if (comparison != 0) return comparison;
+    return left->target_ordinal < right->target_ordinal
+        ? -1 : left->target_ordinal > right->target_ordinal ? 1 : 0;
+}
+
+typedef struct {
+    const CBMDumpEdge *source;
     char edge_id[MODEL_ID_CAP];
 } prepared_group_edge_t;
+
+typedef struct {
+    size_t topology_index;
+    size_t edge_offset;
+    size_t edge_count;
+    size_t payload_size;
+} prepared_payload_group_t;
+
+static int prepared_edge_payload_is_default(const CBMDumpEdge *edge) {
+    const char *properties = edge && edge->properties ? edge->properties : "{}";
+    const char *url_path = edge && edge->url_path ? edge->url_path : "";
+    const char *local_name = edge && edge->local_name ? edge->local_name : "";
+    return edge && strcmp(properties, "{}") == 0 && url_path[0] == '\0' &&
+           local_name[0] == '\0';
+}
 
 static int prepared_group_edge_compare(const void *left_ptr, const void *right_ptr) {
     const prepared_group_edge_t *left = left_ptr;
@@ -408,6 +475,41 @@ static int model_validate_input(const char *workspace_id,
     return 0;
 }
 
+enum { MODEL_NODE_CHUNK_SIZE = 1024 };
+
+typedef struct {
+    cbm_zova_publish_model_t *model;
+    size_t id_stride;
+    size_t fts_bytes;
+    uint8_t *failed;
+} model_node_build_context_t;
+
+static void model_build_node_chunk(int chunk, void *opaque) {
+    model_node_build_context_t *context = opaque;
+    cbm_zova_publish_model_t *model = context->model;
+    int begin = chunk * MODEL_NODE_CHUNK_SIZE;
+    int end = begin + MODEL_NODE_CHUNK_SIZE;
+    if (end > model->node_count) end = model->node_count;
+    for (int i = begin; i < end; i++) {
+        model_node_t *row = &model->nodes[i];
+        const CBMDumpNode *node = row->value.source;
+        char *stable_id = model->node_id_storage + (size_t)i * context->id_stride;
+        char *fts_end = i + 1 < model->node_count
+            ? model->nodes[i + 1].fts_name
+            : model->node_fts_storage + context->fts_bytes;
+        size_t fts_capacity = (size_t)(fts_end - row->fts_name);
+        size_t name_length = (size_t)row->value.ordinal;
+        if (model_node_id(model->workspace_id, node, stable_id) != 0 ||
+            model_camel_name_into(node->name, name_length, row->fts_name,
+                                  fts_capacity) != 0) {
+            context->failed[chunk] = 1;
+            return;
+        }
+        row->value.stable_id = stable_id;
+        row->value.ordinal = 0;
+    }
+}
+
 static int model_build_nodes(cbm_zova_publish_model_t *model,
                              model_digest_state_t *digests) {
     int count = model->input.node_count;
@@ -415,6 +517,7 @@ static int model_build_nodes(cbm_zova_publish_model_t *model,
     model->nodes = model_calloc((size_t)count, sizeof(*model->nodes));
     model->dense_ids = model_calloc((size_t)count, sizeof(*model->dense_ids));
     model->dense_ordinals = model_calloc((size_t)count, sizeof(*model->dense_ordinals));
+    if (!model->nodes || !model->dense_ids || !model->dense_ordinals) return -1;
     size_t id_stride = 0;
     size_t id_bytes = 0;
     size_t fts_bytes = 0;
@@ -422,10 +525,14 @@ static int model_build_nodes(cbm_zova_publish_model_t *model,
         return -1;
     for (int i = 0; i < count; i++) {
         size_t row_bytes = 0;
+        size_t name_length = 0;
         if (!model->input.nodes[i].name ||
-            model_camel_storage_size(model->input.nodes[i].name, &row_bytes) != 0 ||
+            model_camel_storage_size(model->input.nodes[i].name, &row_bytes,
+                                     &name_length) != 0 ||
             row_bytes > SIZE_MAX - fts_bytes)
             return -1;
+        model->nodes[i].value.ordinal = (uint64_t)row_bytes;
+        model->nodes[i].value.source_ordinal = (uint64_t)name_length;
         fts_bytes += row_bytes;
     }
     model->node_id_storage = model_malloc(id_bytes);
@@ -439,16 +546,14 @@ static int model_build_nodes(cbm_zova_publish_model_t *model,
     for (int i = 0; i < count; i++) {
         const CBMDumpNode *node = &model->input.nodes[i];
         char *stable_id = model->node_id_storage + (size_t)i * id_stride;
-        size_t fts_capacity = 0;
+        size_t fts_capacity = (size_t)model->nodes[i].value.ordinal;
+        size_t name_length = (size_t)model->nodes[i].value.source_ordinal;
         if (node->id <= 0 || !node->project || strcmp(node->project, model->input.project) != 0 ||
-            !node->label || !node->name || !node->qualified_name || !node->file_path ||
-            model_node_id(model->workspace_id, node, stable_id) != 0 ||
-            model_camel_storage_size(node->name, &fts_capacity) != 0 ||
-            model_camel_name_into(node->name, fts_cursor, fts_capacity) != 0) {
+            !node->label || !node->name || !node->qualified_name || !node->file_path) {
             return -1;
         }
         model->nodes[i].value = (cbm_zova_publish_node_t){
-            .source = node, .stable_id = stable_id, .ordinal = 0,
+            .source = node, .stable_id = stable_id, .ordinal = (uint64_t)name_length,
             .source_ordinal = (uint64_t)i};
         model->nodes[i].fts_name = fts_cursor;
         fts_cursor += fts_capacity;
@@ -457,9 +562,24 @@ static int model_build_nodes(cbm_zova_publish_model_t *model,
         } else {
             model->dense_ids[node->id - 1] = stable_id;
         }
-        model->metrics.stable_node_id_computations++;
-        model->metrics.camel_split_computations++;
     }
+    int chunk_count = (count + MODEL_NODE_CHUNK_SIZE - 1) / MODEL_NODE_CHUNK_SIZE;
+    uint8_t *failed = model_calloc((size_t)chunk_count, sizeof(*failed));
+    if (!failed) return -1;
+    model_node_build_context_t context = {
+        .model = model, .id_stride = id_stride, .fts_bytes = fts_bytes,
+        .failed = failed};
+    cbm_parallel_for(chunk_count, model_build_node_chunk, &context,
+                     (cbm_parallel_for_opts_t){0});
+    for (int i = 0; i < chunk_count; i++) {
+        if (failed[i]) {
+            free(failed);
+            return -1;
+        }
+    }
+    free(failed);
+    model->metrics.stable_node_id_computations += (uint64_t)count;
+    model->metrics.camel_split_computations += (uint64_t)count;
     if (!dense_ids) {
         free(model->dense_ids);
         model->dense_ids = NULL;
@@ -685,141 +805,228 @@ static int model_build_prepared_topology(cbm_zova_publish_model_t *model,
     model->edge_count = count;
     if (count == 0) return 0;
     if (!model->dense_ids || !model->dense_ordinals) return -1;
+    struct timespec phase_started = {0}, phase_finished = {0};
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_started);
     model->topology = model_calloc((size_t)count, sizeof(*model->topology));
-    const CBMDumpEdge **grouped = model_malloc((size_t)count * sizeof(*grouped));
-    size_t *counts = model_calloc((size_t)count * 3, sizeof(*counts));
-    if (!model->topology || !grouped || !counts) {
-        free(grouped);
-        free(counts);
+    prepared_topology_seed_t *seeds =
+        model_malloc((size_t)count * sizeof(*seeds));
+    prepared_payload_group_t *payload_groups = NULL;
+    const CBMDumpEdge **payload_edges = NULL;
+    prepared_group_edge_t *ordered = NULL;
+    if (!model->topology || !seeds) {
+        free(seeds);
         return -1;
     }
     for (int i = 0; i < count; i++) {
         const CBMDumpEdge *edge = &model->input.edges[i];
-        const char *source = model_lookup(model, edge->source_id);
-        const char *target = model_lookup(model, edge->target_id);
+        const char *source = NULL;
+        const char *target = NULL;
         uint64_t source_ordinal = 0;
         uint64_t target_ordinal = 0;
         model->metrics.endpoint_lookups += 2;
-        if (!edge->project || strcmp(edge->project, model->input.project) != 0 ||
-            !edge->type || !edge->type[0] || !source || !target ||
-            model_lookup_ordinal(model, edge->source_id, &source_ordinal) != 0 ||
-            model_lookup_ordinal(model, edge->target_id, &target_ordinal) != 0) {
-            free(grouped);
-            free(counts);
-            return -1;
+        if (edge->source_id <= 0 || edge->source_id > model->node_count ||
+            edge->target_id <= 0 || edge->target_id > model->node_count) {
+            goto fail;
+        } else {
+            size_t source_index = (size_t)(edge->source_id - 1);
+            size_t target_index = (size_t)(edge->target_id - 1);
+            source = model->dense_ids[source_index];
+            target = model->dense_ids[target_index];
+            source_ordinal = model->dense_ordinals[source_index];
+            target_ordinal = model->dense_ordinals[target_index];
         }
-        model->topology[i].value = (cbm_zova_publish_edge_t){
+        if (!edge->project ||
+            (edge->project != model->input.project &&
+             strcmp(edge->project, model->input.project) != 0) ||
+            !edge->type || !edge->type[0] || !source || !target) {
+            goto fail;
+        }
+        seeds[i] = (prepared_topology_seed_t){
             .source = edge,
-            .source_stable_id = source,
-            .target_stable_id = target,
             .source_ordinal = source_ordinal,
             .target_ordinal = target_ordinal,
         };
     }
-    qsort(model->topology, (size_t)count, sizeof(*model->topology),
-          model_topology_compare);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
+    model->metrics.prepared_endpoint_ms =
+        model_elapsed_ms(&phase_started, &phase_finished);
+    phase_started = phase_finished;
+    qsort(seeds, (size_t)count, sizeof(*seeds), prepared_topology_seed_compare);
     model->metrics.global_sorts++;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
+    model->metrics.prepared_topology_sort_ms =
+        model_elapsed_ms(&phase_started, &phase_finished);
+    phase_started = phase_finished;
 
-    size_t *offsets = counts + count;
-    size_t *payload_sizes = offsets + count;
     int unique_topology = 0;
-    size_t grouped_count = 0;
+    size_t payload_group_count = 0;
+    size_t payload_edge_count = 0;
+    size_t payload_bytes = 0;
     for (int i = 0; i < count;) {
         int end = i + 1;
         while (end < count &&
-               model_topology_compare(&model->topology[i], &model->topology[end]) == 0)
+               prepared_topology_seed_compare(&seeds[i], &seeds[end]) == 0)
             end++;
-        cbm_zova_publish_edge_t row = model->topology[i].value;
+        const CBMDumpEdge *edge = seeds[i].source;
+        cbm_zova_publish_edge_t row = {
+            .source = edge,
+            .source_stable_id = model->dense_ids[edge->source_id - 1],
+            .target_stable_id = model->dense_ids[edge->target_id - 1],
+            .source_ordinal = seeds[i].source_ordinal,
+            .target_ordinal = seeds[i].target_ordinal,
+        };
         row.ordinal = (uint64_t)unique_topology;
         row.logical_edge_count = (uint64_t)(end - i);
         model->topology[unique_topology].value = row;
-        counts[unique_topology] = (size_t)(end - i);
-        offsets[unique_topology] = grouped_count;
-        for (int j = i; j < end; j++) grouped[grouped_count++] = model->topology[j].value.source;
-        model_digest_text(&digests->topology, row.source_stable_id);
-        model_digest_text(&digests->topology, row.source->type);
-        model_digest_text(&digests->topology, row.target_stable_id);
+        size_t group_edge_count = (size_t)(end - i);
+        if (group_edge_count == 1 && prepared_edge_payload_is_default(edge)) {
+            model->metrics.prepared_single_default_payload_count++;
+        } else if (group_edge_count == 1) {
+            const CBMDumpEdge *single_edge = edge;
+            if (cbm_zova_edge_payload_encoded_size(
+                    &single_edge, 1, &row.payload_len) != 0 ||
+                row.payload_len > SIZE_MAX - payload_bytes)
+                goto fail;
+            model->topology[unique_topology].value.payload_len = row.payload_len;
+            payload_bytes += row.payload_len;
+        } else {
+            payload_group_count++;
+            if (group_edge_count > SIZE_MAX - payload_edge_count) goto fail;
+            payload_edge_count += group_edge_count;
+        }
         unique_topology++;
         i = end;
     }
     model->topology_count = unique_topology;
+    model->metrics.prepared_payload_scratch_edge_count = payload_edge_count;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
+    model->metrics.prepared_topology_group_ms =
+        model_elapsed_ms(&phase_started, &phase_finished);
+    phase_started = phase_finished;
 
-    size_t payload_bytes = 0;
-    for (int i = 0; i < unique_topology; i++) {
-        const size_t offset = offsets[i];
-        if (counts[i] > 1) {
-            prepared_group_edge_t *ordered =
-                model_malloc(counts[i] * sizeof(*ordered));
-            if (!ordered) {
-                free(grouped);
-                free(counts);
-                return -1;
-            }
-            const cbm_zova_publish_edge_t *topology = &model->topology[i].value;
-            for (size_t j = 0; j < counts[i]; j++) {
-                ordered[j].source = grouped[offset + j];
+    if (payload_group_count > 0) {
+        payload_groups = model_calloc(payload_group_count, sizeof(*payload_groups));
+        payload_edges = model_malloc(payload_edge_count * sizeof(*payload_edges));
+        if (!payload_groups || !payload_edges) goto fail;
+    }
+    size_t payload_group_index = 0;
+    size_t payload_edge_offset = 0;
+    size_t topology_index = 0;
+    for (int i = 0; i < count;) {
+        int end = i + 1;
+        while (end < count &&
+               prepared_topology_seed_compare(&seeds[i], &seeds[end]) == 0)
+            end++;
+        size_t group_edge_count = (size_t)(end - i);
+        if (group_edge_count > 1) {
+            prepared_payload_group_t *group = &payload_groups[payload_group_index++];
+            *group = (prepared_payload_group_t){
+                .topology_index = topology_index,
+                .edge_offset = payload_edge_offset,
+                .edge_count = group_edge_count,
+            };
+            for (size_t j = 0; j < group_edge_count; j++)
+                payload_edges[payload_edge_offset + j] = seeds[i + (int)j].source;
+            ordered = model_malloc(group_edge_count * sizeof(*ordered));
+            if (!ordered) goto fail;
+            const cbm_zova_publish_edge_t *topology =
+                &model->topology[topology_index].value;
+            for (size_t j = 0; j < group_edge_count; j++) {
+                ordered[j].source = payload_edges[payload_edge_offset + j];
                 if (model_edge_id(model->workspace_id, topology->source_stable_id,
                                   topology->source->type,
                                   topology->target_stable_id,
                                   ordered[j].source->local_name
                                       ? ordered[j].source->local_name
                                       : "",
-                                  ordered[j].edge_id) != 0) {
-                    free(ordered);
-                    free(grouped);
-                    free(counts);
-                    return -1;
-                }
+                                  ordered[j].edge_id) != 0)
+                    goto fail;
                 model->metrics.edge_id_computations++;
             }
-            qsort(ordered, counts[i], sizeof(*ordered), prepared_group_edge_compare);
-            for (size_t j = 0; j < counts[i]; j++) {
-                if (j > 0 && strcmp(ordered[j - 1].edge_id, ordered[j].edge_id) == 0) {
-                    free(ordered);
-                    free(grouped);
-                    free(counts);
-                    return -1;
-                }
-                grouped[offset + j] = ordered[j].source;
+            qsort(ordered, group_edge_count, sizeof(*ordered),
+                  prepared_group_edge_compare);
+            for (size_t j = 0; j < group_edge_count; j++) {
+                if (j > 0 && strcmp(ordered[j - 1].edge_id,
+                                    ordered[j].edge_id) == 0)
+                    goto fail;
+                payload_edges[payload_edge_offset + j] = ordered[j].source;
             }
             free(ordered);
+            ordered = NULL;
+            if (cbm_zova_edge_payload_encoded_size(
+                    payload_edges + payload_edge_offset, group_edge_count,
+                    &group->payload_size) != 0 ||
+                group->payload_size > SIZE_MAX - payload_bytes)
+                goto fail;
+            model->topology[topology_index].value.payload_len = group->payload_size;
+            payload_bytes += group->payload_size;
+            payload_edge_offset += group_edge_count;
         }
-        if (cbm_zova_edge_payload_encoded_size(grouped + offset, counts[i],
-                                               &payload_sizes[i]) != 0 ||
-            payload_sizes[i] > SIZE_MAX - payload_bytes) {
-            free(grouped);
-            free(counts);
-            return -1;
-        }
-        payload_bytes += payload_sizes[i];
+        topology_index++;
+        i = end;
     }
+    if (payload_group_index != payload_group_count ||
+        payload_edge_offset != payload_edge_count)
+        goto fail;
     if (payload_bytes > 0) {
         model->edge_payload_storage = model_malloc(payload_bytes);
-        if (!model->edge_payload_storage) {
-            free(grouped);
-            free(counts);
-            return -1;
-        }
+        if (!model->edge_payload_storage) goto fail;
     }
     uint8_t *payload_cursor = model->edge_payload_storage;
+    size_t duplicate_group_index = 0;
     for (int i = 0; i < unique_topology; i++) {
         cbm_zova_publish_edge_t *row = &model->topology[i].value;
-        row->payload = payload_sizes[i] > 0 ? payload_cursor : NULL;
-        row->payload_len = payload_sizes[i];
-        size_t encoded = 0;
-        if (cbm_zova_edge_payload_encode(grouped + offsets[i], counts[i],
-                                         payload_cursor, payload_sizes[i], &encoded) != 0 ||
-            encoded != payload_sizes[i]) {
-            free(grouped);
-            free(counts);
-            return -1;
+        if (row->payload_len == 0) continue;
+        const CBMDumpEdge *single_edge = row->source;
+        const CBMDumpEdge *const *edges = &single_edge;
+        size_t edge_count = 1;
+        if (row->logical_edge_count > 1) {
+            prepared_payload_group_t *group =
+                &payload_groups[duplicate_group_index++];
+            if (group->topology_index != (size_t)i ||
+                group->payload_size != row->payload_len)
+                goto fail;
+            edges = payload_edges + group->edge_offset;
+            edge_count = group->edge_count;
         }
+        row->payload = payload_cursor;
+        size_t encoded = 0;
+        if (cbm_zova_edge_payload_encode(
+                edges, edge_count, payload_cursor, row->payload_len, &encoded) != 0 ||
+            encoded != row->payload_len)
+            goto fail;
         if (encoded > 0) payload_cursor += encoded;
+    }
+    if (duplicate_group_index != payload_group_count) goto fail;
+    free(payload_edges);
+    payload_edges = NULL;
+    free(payload_groups);
+    payload_groups = NULL;
+    free(seeds);
+    seeds = NULL;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
+    model->metrics.prepared_payload_ms =
+        model_elapsed_ms(&phase_started, &phase_finished);
+    phase_started = phase_finished;
+
+    for (int i = 0; i < unique_topology; i++) {
+        const cbm_zova_publish_edge_t *row = &model->topology[i].value;
+        model_digest_text(&digests->topology, row->source_stable_id);
+        model_digest_text(&digests->topology, row->source->type);
+        model_digest_text(&digests->topology, row->target_stable_id);
         model_digest_topology_payload(digests, row);
     }
-    free(grouped);
-    free(counts);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
+    model->metrics.prepared_topology_digest_ms =
+        model_elapsed_ms(&phase_started, &phase_finished);
     return 0;
+
+fail:
+    free(ordered);
+    free(payload_edges);
+    free(payload_groups);
+    free(seeds);
+    return -1;
 }
 
 static int model_build_hashes(cbm_zova_publish_model_t *model,

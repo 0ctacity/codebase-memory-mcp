@@ -41,7 +41,7 @@ if [[ -e "$test_home_first" || -e "$test_cache_first" ]]; then
 fi
 echo "PASS: zova test workflow builds once and runs requested suites directly"
 
-grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ROOT/build.zig"
+grep -q 'Zova C ABI, v0.' "$ROOT/build.zig"
 grep -q 'zova_graph_edge_delete_many' "$ROOT/build.zig"
 grep -q 'zova_vector_delete_many' "$ROOT/build.zig"
 grep -q 'zova_graph_build_fresh_keyed' "$ROOT/build.zig"
@@ -50,7 +50,11 @@ grep -q 'zova_graph_build_fresh_prepared_keyed_with_payloads' "$ROOT/build.zig"
 grep -q 'zova_graph_edge_payload_get_many' "$ROOT/build.zig"
 grep -q 'zova_graph_edge_payload_replace_many' "$ROOT/build.zig"
 grep -q 'zova_fresh_build_begin' "$ROOT/build.zig"
-echo "PASS: CBM build guard requires the format-9 Zova ABI surface"
+if grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ROOT/build.zig"; then
+  echo "error: CBM build guard must not couple a commit-pinned SDK to a release label" >&2
+  exit 1
+fi
+echo "PASS: CBM build guard requires the format-9 Zova ABI surface without release coupling"
 
 FAKE_ZOVA="$TMP/zova-source"
 PINNED_ZOVA="$TMP/zova-pinned"

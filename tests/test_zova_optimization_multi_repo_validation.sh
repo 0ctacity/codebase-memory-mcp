@@ -8,7 +8,7 @@ trap 'rm -rf "$TMP"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 mkdir -p "$TMP/bin" "$TMP/baseline"
-for repo in tops motive rvault CBM; do
+for repo in tops deno motive rvault CBM; do
   mkdir -p "$TMP/$repo"
   git -C "$TMP/$repo" init -q
   printf '%s\n' "$repo" >"$TMP/$repo/file"
@@ -32,9 +32,19 @@ cat >"$TMP/bin/repository" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 stage="$CBM_ZOVA_OPTIMIZATION_REPOSITORY:$CBM_ZOVA_OPTIMIZATION_ATTEMPT"
-echo "$stage" >>"$CBM_FAKE_LOG"
+scope=${1:-all}
+echo "$stage:$scope" >>"$CBM_FAKE_LOG"
 [[ "${CBM_FAKE_FAIL_STAGE:-}" != "$stage" ]] || exit 9
 mkdir -p "$CBM_ZOVA_OPTIMIZATION_RUN_ROOT"
+if [[ $scope == index-only ]]; then
+  attempt=$CBM_ZOVA_OPTIMIZATION_ATTEMPT
+  pure=$((attempt * 10))
+  single=$((attempt * 20))
+  cat >"$CBM_ZOVA_OPTIMIZATION_RUN_ROOT/optimization-report.json" <<JSON
+{"schema_version":1,"benchmark_scope":"index-only","repository":"$CBM_ZOVA_OPTIMIZATION_REPOSITORY","passed":true,"states":[{"route":"pure","timing_ms":{"pipeline":$pure,"publish":0},"storage":{"database_bytes":100}},{"route":"single","timing_ms":{"pipeline":$single,"publish":5},"storage":{"database_bytes":80}}]}
+JSON
+  exit 0
+fi
 printf '{"schema_version":1,"repository":"%s","source_commit":"%040d","build_sha256":"%064d","run_id":"%s","passed":true,"states":[]}\n' \
   "$CBM_ZOVA_OPTIMIZATION_REPOSITORY" 0 0 "$stage" \
   >"$CBM_ZOVA_OPTIMIZATION_RUN_ROOT/optimization-report.json"
@@ -86,6 +96,7 @@ invoke() {
   local output=$1
   CBM_FAKE_LOG="$TMP/log" CBM_ZOVA_OPTIMIZATION_FINAL_ROOT="$output" \
   CBM_ZOVA_OPTIMIZATION_TOPS_REPO="$TMP/tops" \
+  CBM_ZOVA_OPTIMIZATION_DENO_REPO="$TMP/deno" \
   CBM_ZOVA_OPTIMIZATION_MOTIVE_REPO="$TMP/motive" \
   CBM_ZOVA_OPTIMIZATION_RVAULT_REPO="$TMP/rvault" \
   CBM_ZOVA_OPTIMIZATION_CBM_REPO="$TMP/CBM" \
@@ -105,13 +116,13 @@ invoke "$TMP/output"
 expected='baseline
 build
 focused
-tops:1
-tops:2
-tops:3
+tops:1:all
+tops:2:all
+tops:3:all
 gate:tops
-motive:1
-rvault:1
-CBM:1
+motive:1:all
+rvault:1:all
+CBM:1:all
 gate:motive
 gate:rvault
 gate:CBM'
@@ -119,11 +130,40 @@ gate:CBM'
 [[ -s "$TMP/output/optimization.json" && -s "$TMP/output/optimization.md" ]] ||
   fail "aggregate outputs missing"
 
+: >"$TMP/index-log"
+CBM_FAKE_LOG="$TMP/index-log" CBM_ZOVA_OPTIMIZATION_FINAL_ROOT="$TMP/index-output" \
+CBM_ZOVA_OPTIMIZATION_TOPS_REPO="$TMP/tops" \
+CBM_ZOVA_OPTIMIZATION_DENO_REPO="$TMP/deno" \
+CBM_ZOVA_OPTIMIZATION_BUILD_BINARY="$TMP/bin/build" \
+CBM_ZOVA_OPTIMIZATION_TEST_RUNNER="$TMP/bin/test-runner" \
+CBM_ZOVA_OPTIMIZATION_BUILD_ONCE="$TMP/bin/build-once" \
+CBM_ZOVA_OPTIMIZATION_REPOSITORY_RUNNER="$TMP/bin/repository" \
+CBM_WORKERS=4 "$SCRIPT" index-only >/dev/null
+expected_index='build
+tops:1:index-only
+tops:2:index-only
+deno:1:index-only
+deno:2:index-only'
+[[ $(cat "$TMP/index-log") == "$expected_index" ]] ||
+  { cat "$TMP/index-log" >&2; fail "index-only stage order wrong"; }
+python3 - "$TMP/index-output/index-only-average.json" <<'PY'
+import json, pathlib, sys
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["benchmark_scope"] == "index-only"
+assert report["workers"] == "4"
+assert [item["repository"] for item in report["repositories"]] == ["tops", "deno"]
+for item in report["repositories"]:
+    assert item["sample_count"] == 2
+    assert item["average"]["pure_sqlite_full_ms"] == 15
+    assert item["average"]["zova_native_full_ms"] == 30
+PY
+
 : >"$TMP/fail-log"
 set +e
 CBM_FAKE_FAIL_STAGE=tops:2 CBM_FAKE_LOG="$TMP/fail-log" \
 CBM_ZOVA_OPTIMIZATION_FINAL_ROOT="$TMP/fail-output" \
 CBM_ZOVA_OPTIMIZATION_TOPS_REPO="$TMP/tops" \
+CBM_ZOVA_OPTIMIZATION_DENO_REPO="$TMP/deno" \
 CBM_ZOVA_OPTIMIZATION_MOTIVE_REPO="$TMP/motive" \
 CBM_ZOVA_OPTIMIZATION_RVAULT_REPO="$TMP/rvault" \
 CBM_ZOVA_OPTIMIZATION_CBM_REPO="$TMP/CBM" \

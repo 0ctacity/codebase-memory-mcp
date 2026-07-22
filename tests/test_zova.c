@@ -4733,6 +4733,10 @@ TEST(zova_publish_model_is_deterministic_and_validates_identity) {
     ASSERT_STR_EQ(first_digest->topology_sha256, prepared_digest->topology_sha256);
     ASSERT_STR_EQ(first_digest->node_vector_sha256, prepared_digest->node_vector_sha256);
     ASSERT_STR_EQ(first_digest->token_vector_sha256, prepared_digest->token_vector_sha256);
+    cbm_zova_publish_model_metrics_t prepared_metrics = {0};
+    cbm_zova_publish_model_metrics(prepared, &prepared_metrics);
+    ASSERT_EQ(prepared_metrics.prepared_single_default_payload_count, 0);
+    ASSERT_EQ(prepared_metrics.prepared_payload_scratch_edge_count, 2);
     cbm_zova_prepared_view_free(prepared);
 
     CBMDumpNode sparse_nodes[] = {nodes[0], nodes[1]};
@@ -5231,7 +5235,240 @@ TEST(zova_atomic_delta_publisher_preserves_old_generation_on_every_fault) {
     PASS();
 }
 
+TEST(zova_prepared_view_uses_implicit_default_edge_payload) {
+    const CBMDumpNode nodes[] = {
+        {.id=1,.project="payload_fast",.label="Function",.name="Source",
+         .qualified_name="payload_fast.Source",.file_path="src/payload.c",
+         .start_line=1,.end_line=2,.properties="{}"},
+        {.id=2,.project="payload_fast",.label="Function",.name="Target",
+         .qualified_name="payload_fast.Target",.file_path="src/payload.c",
+         .start_line=3,.end_line=4,.properties="{}"},
+    };
+    const CBMDumpEdge edge = {
+        .id=1,.project="payload_fast",.source_id=1,.target_id=2,.type="CALLS",
+        .properties="{}",.url_path="",.local_name="",
+    };
+    const cbm_zova_workspace_generation_input_t input = {
+        .root_path="/tmp/payload-fast",.project="payload_fast",
+        .indexed_at="2026-07-21T00:00:00Z",
+        .model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,.vector_dimensions=4,
+        .nodes=nodes,.node_count=2,.edges=&edge,.edge_count=1,
+    };
+    cbm_zova_prepared_view_t *view = NULL;
+    ASSERT_EQ(cbm_zova_prepared_view_build(
+                  "w1_00000000000000000000000000000000", &input, &view), 0);
+    ASSERT_NOT_NULL(view);
+    ASSERT_EQ(cbm_zova_publish_model_topology_count(view), 1);
+    const cbm_zova_publish_edge_t *topology =
+        cbm_zova_publish_model_topology_at(view, 0);
+    ASSERT_NOT_NULL(topology);
+    ASSERT_EQ(topology->logical_edge_count, 1);
+    ASSERT_NULL(topology->payload);
+    ASSERT_EQ(topology->payload_len, 0);
+    cbm_zova_publish_model_metrics_t metrics = {0};
+    cbm_zova_publish_model_metrics(view, &metrics);
+    ASSERT_EQ(metrics.prepared_single_default_payload_count, 1);
+    ASSERT_EQ(metrics.prepared_payload_scratch_edge_count, 0);
+    ASSERT_TRUE(metrics.prepared_endpoint_ms >= 0.0);
+    ASSERT_TRUE(metrics.prepared_topology_sort_ms >= 0.0);
+    ASSERT_TRUE(metrics.prepared_topology_group_ms >= 0.0);
+    ASSERT_TRUE(metrics.prepared_payload_ms >= 0.0);
+    ASSERT_TRUE(metrics.prepared_topology_digest_ms >= 0.0);
+    double edge_phase_sum = metrics.prepared_endpoint_ms +
+                            metrics.prepared_topology_sort_ms +
+                            metrics.prepared_topology_group_ms +
+                            metrics.prepared_payload_ms +
+                            metrics.prepared_topology_digest_ms;
+    ASSERT_TRUE(metrics.edges_ms + 0.001 >= edge_phase_sum);
+    cbm_zova_prepared_view_free(view);
+    PASS();
+}
+
+TEST(zova_prepared_view_encodes_single_metadata_edge_without_group_scratch) {
+    const CBMDumpNode nodes[] = {
+        {.id=1,.project="payload_one",.label="Function",.name="Source",
+         .qualified_name="payload_one.Source",.file_path="src/payload.c",
+         .start_line=1,.end_line=2,.properties="{}"},
+        {.id=2,.project="payload_one",.label="Function",.name="Target",
+         .qualified_name="payload_one.Target",.file_path="src/payload.c",
+         .start_line=3,.end_line=4,.properties="{}"},
+    };
+    const CBMDumpEdge edge = {
+        .id=1,.project="payload_one",.source_id=1,.target_id=2,.type="IMPORTS",
+        .properties="{\"kind\":\"named\"}",.url_path="/module",.local_name="Thing",
+    };
+    const cbm_zova_workspace_generation_input_t input = {
+        .root_path="/tmp/payload-one",.project="payload_one",
+        .indexed_at="2026-07-21T00:00:00Z",
+        .model_fingerprint=CBM_ZOVA_MODEL_FINGERPRINT,.vector_dimensions=4,
+        .nodes=nodes,.node_count=2,.edges=&edge,.edge_count=1,
+    };
+    cbm_zova_prepared_view_t *view = NULL;
+    ASSERT_EQ(cbm_zova_prepared_view_build(
+                  "w1_00000000000000000000000000000000", &input, &view), 0);
+    ASSERT_NOT_NULL(view);
+    const cbm_zova_publish_edge_t *topology =
+        cbm_zova_publish_model_topology_at(view, 0);
+    ASSERT_NOT_NULL(topology);
+    ASSERT_NOT_NULL(topology->payload);
+    ASSERT_GT(topology->payload_len, 0);
+    size_t decoded_count = 0;
+    ASSERT_EQ(cbm_zova_edge_payload_visit(topology->payload, topology->payload_len,
+                                          NULL, NULL, &decoded_count), 0);
+    ASSERT_EQ(decoded_count, 1);
+    cbm_zova_publish_model_metrics_t metrics = {0};
+    cbm_zova_publish_model_metrics(view, &metrics);
+    ASSERT_EQ(metrics.prepared_single_default_payload_count, 0);
+    ASSERT_EQ(metrics.prepared_payload_scratch_edge_count, 0);
+    cbm_zova_prepared_view_free(view);
+    PASS();
+}
+
 #endif
+
+static int zova_benchmark_double_compare(const void *left, const void *right) {
+    double left_value = *(const double *)left;
+    double right_value = *(const double *)right;
+    return left_value < right_value ? -1 : left_value > right_value ? 1 : 0;
+}
+
+TEST(zova_prepared_view_normalization_benchmark) {
+    enum {
+        NODE_COUNT = 124818,
+        EDGE_COUNT = 481770,
+        SAMPLE_COUNT = 5,
+    };
+    static const char *edge_types[] = {"CALLS", "CONTAINS", "REFERENCES", "USES"};
+    CBMDumpNode *nodes = calloc(NODE_COUNT, sizeof(*nodes));
+    CBMDumpEdge *edges = calloc(EDGE_COUNT, sizeof(*edges));
+    char (*names)[32] = calloc(NODE_COUNT, sizeof(*names));
+    char (*qualified_names)[48] = calloc(NODE_COUNT, sizeof(*qualified_names));
+    char (*file_paths)[48] = calloc(NODE_COUNT, sizeof(*file_paths));
+    ASSERT_NOT_NULL(nodes);
+    ASSERT_NOT_NULL(edges);
+    ASSERT_NOT_NULL(names);
+    ASSERT_NOT_NULL(qualified_names);
+    ASSERT_NOT_NULL(file_paths);
+
+    for (int i = 0; i < NODE_COUNT; i++) {
+        snprintf(names[i], sizeof(names[i]), "Node%d", i);
+        snprintf(qualified_names[i], sizeof(qualified_names[i]),
+                 "normalization.Node%d", i);
+        snprintf(file_paths[i], sizeof(file_paths[i]), "src/module_%d.c", i / 32);
+        nodes[i] = (CBMDumpNode){
+            .id = i + 1,
+            .project = "normalization",
+            .label = "Function",
+            .name = names[i],
+            .qualified_name = qualified_names[i],
+            .file_path = file_paths[i],
+            .start_line = i % 200 + 1,
+            .end_line = i % 200 + 2,
+            .properties = "{}",
+        };
+    }
+    for (int i = 0; i < EDGE_COUNT; i++) {
+        int source = i % NODE_COUNT;
+        int lane = i / NODE_COUNT;
+        edges[i] = (CBMDumpEdge){
+            .id = i + 1,
+            .project = "normalization",
+            .source_id = source + 1,
+            .target_id = (source + lane + 1) % NODE_COUNT + 1,
+            .type = edge_types[lane],
+            .properties = "{}",
+            .url_path = "",
+            .local_name = "",
+        };
+    }
+
+    const cbm_zova_workspace_generation_input_t input = {
+        .root_path = "/tmp/normalization-benchmark",
+        .project = "normalization",
+        .indexed_at = "2026-07-21T00:00:00Z",
+        .model_fingerprint = CBM_ZOVA_MODEL_FINGERPRINT,
+        .vector_dimensions = 384,
+        .nodes = nodes,
+        .node_count = NODE_COUNT,
+        .edges = edges,
+        .edge_count = EDGE_COUNT,
+    };
+    const char *workspace_id = "w1_00000000000000000000000000000000";
+    double normalization[SAMPLE_COUNT];
+    double node_build[SAMPLE_COUNT];
+    double edge_build[SAMPLE_COUNT];
+    double endpoint_build[SAMPLE_COUNT];
+    double topology_sort[SAMPLE_COUNT];
+    double topology_group[SAMPLE_COUNT];
+    double payload_build[SAMPLE_COUNT];
+    double topology_digest[SAMPLE_COUNT];
+    for (int iteration = -1; iteration < SAMPLE_COUNT; iteration++) {
+        cbm_zova_prepared_view_t *view = NULL;
+        ASSERT_EQ(cbm_zova_prepared_view_build(workspace_id, &input, &view), 0);
+        ASSERT_NOT_NULL(view);
+        cbm_zova_publish_model_metrics_t metrics = {0};
+        cbm_zova_publish_model_metrics(view, &metrics);
+        if (iteration >= 0) {
+            normalization[iteration] = metrics.normalization_ms;
+            node_build[iteration] = metrics.nodes_ms;
+            edge_build[iteration] = metrics.edges_ms;
+            endpoint_build[iteration] = metrics.prepared_endpoint_ms;
+            topology_sort[iteration] = metrics.prepared_topology_sort_ms;
+            topology_group[iteration] = metrics.prepared_topology_group_ms;
+            payload_build[iteration] = metrics.prepared_payload_ms;
+            topology_digest[iteration] = metrics.prepared_topology_digest_ms;
+            printf("NORMALIZATION_SAMPLE {\"iteration\":%d,\"normalization_ms\":%.3f,"
+                   "\"nodes_ms\":%.3f,\"edges_ms\":%.3f,"
+                   "\"endpoint_ms\":%.3f,\"sort_ms\":%.3f,\"group_ms\":%.3f,"
+                   "\"payload_ms\":%.3f,\"digest_ms\":%.3f,"
+                   "\"default_payloads\":%llu,\"payload_scratch_edges\":%llu}\n",
+                   iteration + 1, metrics.normalization_ms, metrics.nodes_ms,
+                   metrics.edges_ms, metrics.prepared_endpoint_ms,
+                   metrics.prepared_topology_sort_ms,
+                   metrics.prepared_topology_group_ms, metrics.prepared_payload_ms,
+                   metrics.prepared_topology_digest_ms,
+                   (unsigned long long)metrics.prepared_single_default_payload_count,
+                   (unsigned long long)metrics.prepared_payload_scratch_edge_count);
+            fflush(stdout);
+        }
+        cbm_zova_prepared_view_free(view);
+    }
+    qsort(normalization, SAMPLE_COUNT, sizeof(*normalization),
+          zova_benchmark_double_compare);
+    qsort(node_build, SAMPLE_COUNT, sizeof(*node_build),
+          zova_benchmark_double_compare);
+    qsort(edge_build, SAMPLE_COUNT, sizeof(*edge_build),
+          zova_benchmark_double_compare);
+    qsort(endpoint_build, SAMPLE_COUNT, sizeof(*endpoint_build),
+          zova_benchmark_double_compare);
+    qsort(topology_sort, SAMPLE_COUNT, sizeof(*topology_sort),
+          zova_benchmark_double_compare);
+    qsort(topology_group, SAMPLE_COUNT, sizeof(*topology_group),
+          zova_benchmark_double_compare);
+    qsort(payload_build, SAMPLE_COUNT, sizeof(*payload_build),
+          zova_benchmark_double_compare);
+    qsort(topology_digest, SAMPLE_COUNT, sizeof(*topology_digest),
+          zova_benchmark_double_compare);
+    printf("NORMALIZATION_MEDIAN {\"normalization_ms\":%.3f,\"nodes_ms\":%.3f,"
+           "\"edges_ms\":%.3f,\"endpoint_ms\":%.3f,\"sort_ms\":%.3f,"
+           "\"group_ms\":%.3f,\"payload_ms\":%.3f,\"digest_ms\":%.3f}\n",
+           normalization[SAMPLE_COUNT / 2], node_build[SAMPLE_COUNT / 2],
+           edge_build[SAMPLE_COUNT / 2], endpoint_build[SAMPLE_COUNT / 2],
+           topology_sort[SAMPLE_COUNT / 2], topology_group[SAMPLE_COUNT / 2],
+           payload_build[SAMPLE_COUNT / 2], topology_digest[SAMPLE_COUNT / 2]);
+    fflush(stdout);
+
+    free(file_paths);
+    free(qualified_names);
+    free(names);
+    free(edges);
+    free(nodes);
+    PASS();
+}
+
+SUITE(zova_normalization_benchmark) {
+    RUN_TEST(zova_prepared_view_normalization_benchmark);
+}
 
 SUITE(zova) {
     RUN_TEST(zova_edge_payload_codec_is_compact_deterministic_and_strict);
@@ -5297,5 +5534,7 @@ SUITE(zova) {
     RUN_TEST(zova_atomic_delta_publisher_preserves_old_generation_on_every_fault);
     RUN_TEST(zova_publish_model_dense_camel_name_is_owned_without_overflow);
     RUN_TEST(zova_publish_model_uses_bounded_row_storage_allocations);
+    RUN_TEST(zova_prepared_view_uses_implicit_default_edge_payload);
+    RUN_TEST(zova_prepared_view_encodes_single_metadata_edge_without_group_scratch);
 #endif
 }

@@ -35,6 +35,7 @@ source "$ROOT/scripts/env.sh"
 
 # Parse remaining arguments
 WITH_UI=false
+WITH_ZOVA=false
 VERSION=""
 EXTRA_MAKE_ARGS=()
 
@@ -48,6 +49,10 @@ for arg in "$@"; do
     case "$arg" in
         --with-ui)
             WITH_UI=true
+            ;;
+        CBM_WITH_ZOVA=1)
+            WITH_ZOVA=true
+            EXTRA_MAKE_ARGS+=("$arg")
             ;;
         --version)
             prev_arg="$arg"
@@ -79,7 +84,7 @@ if [[ -n "$VERSION" ]]; then
 fi
 
 print_env "build.sh"
-echo "  ui=$WITH_UI version=${VERSION:-dev}"
+echo "  ui=$WITH_UI zova=$WITH_ZOVA version=${VERSION:-dev}"
 
 # Verify compiler supports target arch
 verify_compiler "$CC"
@@ -90,6 +95,9 @@ rm -rf "$ROOT/build/c"
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
     make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
+        CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
+elif $WITH_ZOVA; then
+    make -j"$NPROC" -f Makefile.cbm build/c/codebase-memory-mcp \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
     make -j"$NPROC" -f Makefile.cbm cbm \

@@ -74,7 +74,7 @@ typedef struct {
  * Probe knobs for the skip-and-continue recovery re-run (Stage 3c) are passed to
  * the child as inherited env vars around the spawn (set before, unset after —
  * safe because spawns are sequential):
- *   - single_thread   → CBM_INDEX_SINGLE_THREAD=1: the pipeline uses exactly one
+ *   - single_thread   → CBM_WORKERS=0: the pipeline uses exactly one
  *                       worker, so a per-file marker pins the EXACT crasher.
  *   - marker_file      → CBM_INDEX_MARKER_FILE: the worker writes the rel_path of
  *                       the file it is about to process here before touching it.

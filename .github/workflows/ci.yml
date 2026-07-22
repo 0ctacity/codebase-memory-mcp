@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Reject disabled tests
+        run: bash scripts/check-no-test-skips.sh
+      - name: Check whitespace
+        run: git diff --check
+      - name: Validate GitHub Actions contract
+        run: bash tests/test_github_workflows.sh
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - uses: ./.github/actions/setup-zova
+      - name: Build Zova-CBM once
+        run: scripts/zova-build-once.sh
+      - name: Verify Zova is linked
+        run: |
+          nm build/c/codebase-memory-mcp > zova-symbols.txt
+          grep -q 'zova_fresh_build_begin' zova-symbols.txt
+      - name: Run complete C test suite
+        env:
+          CBM_ZOVA_BUILD_SKIP: '1'
+        run: scripts/zova-run-tests.sh
+      - name: Test pinned-SDK workflow
+        run: bash tests/test_zova_build_workflow.sh
+      - name: Test installer safety
+        run: bash tests/test_install_script_safety.sh

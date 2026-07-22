@@ -38,6 +38,9 @@ probe=$(sed -n 's/.*return \([0-9][0-9]*\).*/\1/p' \
   "$CBM_ZOVA_OPTIMIZATION_MUTATION_FILE")
 printf '%s|%s|%s|%s|%s\n' "$workload" "$mode" "$probe" "$mutation" \
   "$CBM_ZOVA_TEST_CACHE_DIR" >>"$CBM_FAKE_RECORD.states"
+if [[ ${CBM_ZOVA_OPTIMIZATION_INDEX_ONLY:-0} == 1 ]]; then
+  printf '%s\n' "$workload" >>"$CBM_FAKE_RECORD.index-only"
+fi
 if [[ ${CBM_FAKE_FAIL_STATE:-} == "$workload" ]]; then exit 1; fi
 write_report() {
   local route=$1 report=$2
@@ -67,7 +70,12 @@ cat >"$TMP/baseline.json" <<'JSON'
 JSON
 
 invoke() {
-  local run_root=$1
+  local run_root=$1 scope=${2:-all}
+  local gate="$TMP/bin/gate" baseline="$TMP/baseline.json"
+  if [[ $scope == full ]]; then
+    gate="$TMP/not-used-gate"
+    baseline="$TMP/not-used-baseline.json"
+  fi
   CBM_ZOVA_VALIDATION_REPO="$TMP/source" \
   CBM_ZOVA_OPTIMIZATION_REPOSITORY=tops \
   CBM_ZOVA_OPTIMIZATION_ATTEMPT=1 \
@@ -77,9 +85,9 @@ invoke() {
   CBM_ZOVA_OPTIMIZATION_TEST_RUNNER="$TMP/bin/test-runner" \
   CBM_ZOVA_OPTIMIZATION_RUN_TESTS="$TMP/bin/run-tests" \
   CBM_ZOVA_OPTIMIZATION_DISK_GUARD="$TMP/bin/disk-guard" \
-  CBM_ZOVA_OPTIMIZATION_GATE="$TMP/bin/gate" \
-  CBM_ZOVA_OPTIMIZATION_BASELINE="$TMP/baseline.json" \
-  CBM_FAKE_RECORD="$TMP/record" "$SCRIPT"
+  CBM_ZOVA_OPTIMIZATION_GATE="$gate" \
+  CBM_ZOVA_OPTIMIZATION_BASELINE="$baseline" \
+  CBM_FAKE_RECORD="$TMP/record" "$SCRIPT" "$scope"
 }
 
 # RED contract: the script must reject missing/invalid inputs before mutation.
@@ -108,6 +116,36 @@ for report in pure-full single-full pure-incremental single-incremental; do
 done
 grep -q -- '--baseline' "$TMP/record.gate" || fail "baseline not passed to gate"
 grep -q -- '--report' "$TMP/record.gate" || fail "report not passed to gate"
+
+rm -f "$TMP/record.states" "$TMP/record.gate"
+invoke "$TMP/full-only" full
+[[ $(wc -l <"$TMP/record.states" | tr -d ' ') == 1 ]] ||
+  fail "full-only run executed more than one workload"
+[[ -s "$TMP/full-only/pure-full.json" ]] || fail "full-only pure report missing"
+[[ -s "$TMP/full-only/single-full.json" ]] || fail "full-only single report missing"
+[[ ! -e "$TMP/full-only/pure-incremental.json" ]] || fail "full-only incremental report exists"
+[[ ! -e "$TMP/record.gate" ]] || fail "full-only run invoked the four-state gate"
+python3 - "$TMP/full-only/optimization-report.json" <<'PY'
+import json, pathlib, sys
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["benchmark_scope"] == "full"
+assert [(state["route"], state["workload"]) for state in report["states"]] == [
+    ("pure", "full"), ("single", "full")
+]
+PY
+
+rm -f "$TMP/record.states" "$TMP/record.index-only"
+invoke "$TMP/index-only" index-only
+[[ $(wc -l <"$TMP/record.states" | tr -d ' ') == 1 ]] ||
+  fail "index-only run executed more than one workload"
+[[ $(cat "$TMP/record.index-only") == full ]] ||
+  fail "index-only contract was not passed to the real-repository test"
+python3 - "$TMP/index-only/optimization-report.json" <<'PY'
+import json, pathlib, sys
+report = json.loads(pathlib.Path(sys.argv[1]).read_text())
+assert report["benchmark_scope"] == "index-only"
+assert len(report["states"]) == 2
+PY
 
 rm -f "$TMP/record.states"
 expect_fail env CBM_FAKE_FAIL_STATE=full \

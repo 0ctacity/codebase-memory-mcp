@@ -247,6 +247,7 @@ extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
 extern void suite_zova(void);
+extern void suite_zova_normalization_benchmark(void);
 extern void suite_zova_operations(void);
 extern void suite_zova_migration(void);
 extern void suite_zova_c_sql_functions(void);
@@ -422,6 +423,7 @@ int main(int argc, char **argv) {
 
     /* Optional Zova migration adapter */
     RUN_SELECTED_SUITE(zova);
+    RUN_EXPLICIT_SUITE(zova_normalization_benchmark);
     RUN_SELECTED_SUITE(zova_c_sql_functions);
     RUN_SELECTED_SUITE(zova_bridge);
     RUN_EXPLICIT_SUITE(zova_real_repo);

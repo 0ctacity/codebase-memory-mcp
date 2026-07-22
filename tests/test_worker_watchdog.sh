@@ -9,7 +9,7 @@
 # Strategy: launch the worker under a wrapper "parent" on a fixture where the
 # test-only injector (CBM_TEST_HANG_ON) busy-spins on one file, so the worker
 # is guaranteed to still be mid-index when the wrapper is killed — the guard
-# cannot pass vacuously via the worker simply finishing. CBM_INDEX_SINGLE_THREAD
+# cannot pass vacuously via the worker simply finishing. CBM_WORKERS=0
 # + CBM_INDEX_MARKER_FILE (the supervisor's own recovery knobs) give a
 # deterministic "worker is AT the hang file" sync point: the worker writes the
 # rel_path it is about to process before touching it. After kill -9 of the
@@ -66,7 +66,7 @@ chmod +x "${tmpdir}/wrapper.sh"
 
 CBM_BINARY="${BINARY}" TMPDIR_PATH="${tmpdir}" \
   ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
-  CBM_TEST_HANG_ON=hang_me CBM_INDEX_SINGLE_THREAD=1 \
+  CBM_TEST_HANG_ON=hang_me CBM_WORKERS=0 \
   CBM_INDEX_MARKER_FILE="${tmpdir}/marker" \
   "${tmpdir}/wrapper.sh" &
 wrapper_pid=$!

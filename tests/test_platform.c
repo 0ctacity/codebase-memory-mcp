@@ -101,14 +101,19 @@ TEST(platform_default_workers_env_override) {
     PASS();
 }
 
+TEST(platform_default_workers_env_zero_is_sequential) {
+    cbm_setenv("CBM_WORKERS", "0", 1);
+    ASSERT_EQ(cbm_default_worker_count(true), 1);
+    ASSERT_EQ(cbm_default_worker_count(false), 1);
+    cbm_unsetenv("CBM_WORKERS");
+    PASS();
+}
+
 TEST(platform_default_workers_env_invalid) {
-    /* Out-of-range values (< 1 or > 256) and non-numeric strings
+    /* Negative values, values above 256, and non-numeric strings
      * fall back to the sysconf-derived default. */
     int baseline = cbm_default_worker_count(true);
     ASSERT_GT(baseline, 0);
-
-    cbm_setenv("CBM_WORKERS", "0", 1);
-    ASSERT_EQ(cbm_default_worker_count(true), baseline);
 
     cbm_setenv("CBM_WORKERS", "-1", 1);
     ASSERT_EQ(cbm_default_worker_count(true), baseline);
@@ -314,6 +319,7 @@ SUITE(platform) {
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_default_workers_env_override);
+    RUN_TEST(platform_default_workers_env_zero_is_sequential);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
 #ifdef __linux__

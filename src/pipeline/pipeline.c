@@ -356,19 +356,6 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
     }
 }
 
-/* Effective worker count. The crash supervisor re-runs its worker single-
- * threaded (CBM_INDEX_SINGLE_THREAD=1) so a per-file marker can pin the EXACT
- * crasher; a parallel re-run would race the marker. Honour that override
- * everywhere the worker count drives the parallel/sequential decision, so the
- * whole extraction phase collapses to the deterministic sequential path. */
-static int effective_worker_count(bool initial) {
-    const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
-    if (st && st[0] == '1') {
-        return 1;
-    }
-    return cbm_default_worker_count(initial);
-}
-
 /* Resolve the DB path for this pipeline. Caller must free(). */
 static char *resolve_db_path(const cbm_pipeline_t *p) {
     char *path = malloc(CBM_SZ_1K);
@@ -1169,6 +1156,14 @@ static int pipeline_publish_zova_user_database(
         .normalization_ms = result.normalization_ms,
         .model_nodes_ms = result.model_nodes_ms,
         .model_edges_ms = result.model_edges_ms,
+        .model_edge_endpoint_ms = result.model_edge_endpoint_ms,
+        .model_edge_sort_ms = result.model_edge_sort_ms,
+        .model_edge_group_ms = result.model_edge_group_ms,
+        .model_edge_payload_ms = result.model_edge_payload_ms,
+        .model_edge_digest_ms = result.model_edge_digest_ms,
+        .model_edge_default_payloads = result.model_edge_default_payloads,
+        .model_edge_payload_scratch_edges =
+            result.model_edge_payload_scratch_edges,
         .model_hashes_ms = result.model_hashes_ms,
         .model_vectors_ms = result.model_vectors_ms,
         .model_digests_ms = result.model_digests_ms,
@@ -1439,7 +1434,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        if (cbm_default_worker_count(true) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -1528,7 +1523,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = effective_worker_count(true);
+    int worker_count = cbm_default_worker_count(true);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)

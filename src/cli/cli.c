@@ -3507,7 +3507,7 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
         snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
     } else {
         snprintf(checksum_url, sizeof(checksum_url), "%s",
-                 "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
+                 "https://github.com/0ctacity/codebase-memory-mcp/releases/latest/download/"
                  "checksums.txt");
     }
     int rc = cbm_download_to_file_quiet(checksum_url, checksum_file);
@@ -3633,6 +3633,85 @@ typedef struct {
 } cbm_install_plan_t;
 
 static cbm_install_plan_t *g_install_plan = NULL;
+static bool g_install_replace_config = false;
+static int g_install_config_conflicts = 0;
+
+typedef enum {
+    CBM_INSTALL_CONFIG_WRITE,
+    CBM_INSTALL_CONFIG_UNCHANGED,
+    CBM_INSTALL_CONFIG_CONFLICT,
+} cbm_install_config_decision_t;
+
+static bool cbm_config_has_mcp_entry(const char *config_path) {
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return false;
+    }
+    bool found = strstr(content, "\"codebase-memory-mcp\"") != NULL ||
+                 strstr(content, "[mcp_servers.codebase-memory-mcp]") != NULL;
+    free(content);
+    (void)len;
+    return found;
+}
+
+static bool cbm_config_contains_command(const char *content, const char *binary_path) {
+    if (strstr(content, binary_path) != NULL) {
+        return true;
+    }
+    size_t len = strlen(binary_path);
+    if (len > (SIZE_MAX - CLI_SKIP_ONE) / CLI_PAIR_LEN) {
+        return false;
+    }
+    char *escaped = malloc(len * CLI_PAIR_LEN + CLI_SKIP_ONE);
+    if (!escaped) {
+        return false;
+    }
+    char *out = escaped;
+    for (const char *p = binary_path; *p; p++) {
+        if (*p == '\\' || *p == '"') {
+            *out++ = '\\';
+        }
+        *out++ = *p;
+    }
+    *out = '\0';
+    bool found = strstr(content, escaped) != NULL;
+    free(escaped);
+    return found;
+}
+
+static cbm_install_config_decision_t cbm_install_config_decision(const char *label,
+                                                                 const char *config_path,
+                                                                 const char *binary_path) {
+    size_t len = 0;
+    char *content = read_file_str(config_path, &len);
+    if (!content) {
+        return CBM_INSTALL_CONFIG_WRITE;
+    }
+    bool has_entry = strstr(content, "\"codebase-memory-mcp\"") != NULL ||
+                     strstr(content, "[mcp_servers.codebase-memory-mcp]") != NULL;
+    bool same_command = has_entry && cbm_config_contains_command(content, binary_path);
+    free(content);
+    (void)len;
+
+    if (!has_entry) {
+        return CBM_INSTALL_CONFIG_WRITE;
+    }
+    if (same_command) {
+        return CBM_INSTALL_CONFIG_UNCHANGED;
+    }
+    if (g_install_replace_config) {
+        return CBM_INSTALL_CONFIG_WRITE;
+    }
+
+    (void)fprintf(stderr,
+                  "error: %s already has a codebase-memory-mcp entry pointing elsewhere:\n"
+                  "  %s\n"
+                  "Re-run with --replace-config to replace it explicitly.\n",
+                  label, config_path);
+    g_install_config_conflicts++;
+    return CBM_INSTALL_CONFIG_CONFLICT;
+}
 
 static void plan_record(const char *agent, const char *kind, const char *path) {
     if (!g_install_plan || !path || !path[0]) {
@@ -3664,14 +3743,20 @@ static void install_claude_code_config(const char *home, const char *binary_path
     char skills_dir[CLI_BUF_1K];
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
 
+    char mcp_path[CLI_BUF_1K];
+    char legacy_mcp_path[CLI_BUF_1K];
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    snprintf(legacy_mcp_path, sizeof(legacy_mcp_path), "%s/.claude.json", user_root);
+    bool primary_has_entry = cbm_config_has_mcp_entry(mcp_path);
+    bool legacy_has_entry = cbm_config_has_mcp_entry(legacy_mcp_path);
+    const char *selected_mcp_path =
+        (primary_has_entry || !legacy_has_entry) ? mcp_path : legacy_mcp_path;
+
     /* Plan mode: record the planned writes and return without mutating (#388). */
     if (g_install_plan) {
         char p[CLI_BUF_1K];
         plan_record("Claude Code", "skills", skills_dir);
-        snprintf(p, sizeof(p), "%s/.mcp.json", config_dir);
-        plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/.claude.json", user_root);
-        plan_record("Claude Code", "mcp_config", p);
+        plan_record("Claude Code", "mcp_config", selected_mcp_path);
         snprintf(p, sizeof(p), "%s/settings.json", config_dir);
         plan_record("Claude Code", "mcp_config", p);
         snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
@@ -3692,19 +3777,21 @@ static void install_claude_code_config(const char *home, const char *binary_path
         printf("  removed old monolithic skill\n");
     }
 
-    char mcp_path[CLI_BUF_1K];
-    snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
-    if (!dry_run) {
-        cbm_install_editor_mcp(binary_path, mcp_path);
+    cbm_install_config_decision_t decision =
+        cbm_install_config_decision("Claude Code", selected_mcp_path, binary_path);
+    if (!dry_run && decision == CBM_INSTALL_CONFIG_WRITE) {
+        cbm_install_editor_mcp(binary_path, selected_mcp_path);
     }
-    printf("  mcp: %s\n", mcp_path);
-
-    char mcp_path2[CLI_BUF_1K];
-    snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
-    if (!dry_run) {
-        cbm_install_editor_mcp(binary_path, mcp_path2);
+    if (decision == CBM_INSTALL_CONFIG_UNCHANGED) {
+        printf("  mcp: already configured (%s)\n", selected_mcp_path);
+    } else if (decision == CBM_INSTALL_CONFIG_WRITE) {
+        printf("  mcp: %s\n", selected_mcp_path);
     }
-    printf("  mcp: %s\n", mcp_path2);
+    if (primary_has_entry && legacy_has_entry) {
+        (void)fprintf(stderr,
+                      "  note: Claude MCP entries exist in both %s and %s; only %s was selected.\n",
+                      mcp_path, legacy_mcp_path, selected_mcp_path);
+    }
 
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
@@ -3749,10 +3836,16 @@ static void install_generic_agent_config(const char *label, const char *binary_p
         return;
     }
     printf("%s:\n", label);
-    if (!dry_run) {
+    cbm_install_config_decision_t decision =
+        cbm_install_config_decision(label, config_path, binary_path);
+    if (!dry_run && decision == CBM_INSTALL_CONFIG_WRITE) {
         install_mcp(binary_path, config_path);
     }
-    printf("  mcp: %s\n", config_path);
+    if (decision == CBM_INSTALL_CONFIG_UNCHANGED) {
+        printf("  mcp: already configured (%s)\n", config_path);
+    } else if (decision == CBM_INSTALL_CONFIG_WRITE) {
+        printf("  mcp: %s\n", config_path);
+    }
     if (instr_path) {
         if (!dry_run) {
             cbm_upsert_instructions(instr_path, agent_instructions_content);
@@ -4367,13 +4460,15 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
 static void cbm_print_install_help(void) {
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
     printf("Usage:\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
-    printf("  codebase-memory-mcp install --ui [-y|-n] [--force] [--dry-run]\n\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--replace] [--replace-config] [--dry-run] [--plan]\n");
+    printf("  codebase-memory-mcp install --ui [-y|-n] [--replace] [--replace-config] [--dry-run]\n\n");
     printf("Options:\n");
     printf("  --help           Print this help and make no changes\n");
     printf("  --plan           Print the files install would touch as JSON and make no changes\n");
     printf("  --dry-run        Show install actions without writing files\n");
-    printf("  --force          Replace an existing installed binary without prompting\n");
+    printf("  --replace        Replace an existing installed binary without prompting\n");
+    printf("  --force          Legacy alias for --replace; also refresh installed skills\n");
+    printf("  --replace-config Replace existing MCP entries that point to another binary\n");
     printf("  --reset-indexes  Prompt to delete existing project indexes before install\n");
     printf("  --ui             Install/configure UI mode; requires a binary with embedded UI assets\n");
     printf("  -y, --yes        Answer yes to prompts\n");
@@ -4390,6 +4485,8 @@ int cbm_cmd_install(int argc, char **argv) {
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
+    bool replace_binary = false;
+    bool replace_config = false;
     bool plan = false;
     bool reset_indexes = false;
     bool install_ui = false;
@@ -4399,6 +4496,13 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--force") == 0) {
             force = true;
+            replace_binary = true;
+        }
+        if (strcmp(argv[i], "--replace") == 0) {
+            replace_binary = true;
+        }
+        if (strcmp(argv[i], "--replace-config") == 0) {
+            replace_config = true;
         }
         if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
@@ -4480,12 +4584,12 @@ int cbm_cmd_install(int argc, char **argv) {
     if (!cbm_same_file(self_path, bin_target)) {
         struct stat tgt_st;
         bool target_exists = (stat(bin_target, &tgt_st) == 0);
-        bool do_copy = !target_exists || force;
-        if (target_exists && !force) {
+        bool do_copy = !target_exists || replace_binary;
+        if (target_exists && !replace_binary) {
             printf("A different binary already exists at:\n  %s\n", bin_target);
             if (prompt_yn("Replace it with the binary you ran install from?")) {
                 do_copy = true;
-                force = true; /* user approved replacement for this run */
+                replace_binary = true; /* user approved replacement for this run */
             } else {
                 printf("Keeping existing binary; configs will point at it.\n\n");
             }
@@ -4523,7 +4627,16 @@ int cbm_cmd_install(int argc, char **argv) {
 #endif
 
     /* Step 3: Install/refresh all agent configs, pointing at the install target. */
+    g_install_replace_config = replace_config;
+    g_install_config_conflicts = 0;
     cbm_install_agent_configs(home, bin_target, force, dry_run);
+    g_install_replace_config = false;
+    if (g_install_config_conflicts != 0) {
+        (void)fprintf(stderr, "error: %d conflicting MCP configuration(s) were not changed.\n",
+                      g_install_config_conflicts);
+        g_install_config_conflicts = 0;
+        return CLI_TRUE;
+    }
 
     /* Step 4: Ensure PATH */
     char bin_dir[CLI_BUF_1K];
@@ -4884,6 +4997,16 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         }
         printf("Removed %s\n", bin_path);
     }
+#ifndef _WIN32
+    char hash_record[CLI_BUF_1K];
+    snprintf(hash_record, sizeof(hash_record), "%s.sha256", bin_path);
+    if (stat(hash_record, &st) == 0) {
+        if (!dry_run) {
+            cbm_unlink(hash_record);
+        }
+        printf("Removed %s\n", hash_record);
+    }
+#endif
 
     printf("\nUninstall complete.\n");
     if (dry_run) {
@@ -4956,7 +5079,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
     if (!base_url || !base_url[0]) {
-        base_url = "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download";
+        base_url = "https://github.com/0ctacity/codebase-memory-mcp/releases/latest/download";
     }
     /* Linux ships a fully-static "-portable" build; the standard linux binary
      * dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
@@ -5072,7 +5195,7 @@ static bool prefix_icase(const char *s, const char *prefix) {
  * Returns heap-allocated tag (e.g. "v0.5.7") or NULL on failure. */
 static char *fetch_latest_tag(void) {
     FILE *fp = cbm_popen(
-        "curl -sfI https://github.com/DeusData/codebase-memory-mcp/releases/latest 2>/dev/null",
+        "curl -sfI https://github.com/0ctacity/codebase-memory-mcp/releases/latest 2>/dev/null",
         "r");
     if (!fp) {
         return NULL;
@@ -5135,6 +5258,7 @@ int cbm_cmd_update(int argc, char **argv) {
 
     bool dry_run = false;
     bool force = false;
+    bool replace_config = false;
     int variant_flag = 0; /* 0 = ask, 1 = standard, 2 = ui */
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
@@ -5145,6 +5269,8 @@ int cbm_cmd_update(int argc, char **argv) {
             variant_flag = VARIANT_B;
         } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
+        } else if (strcmp(argv[i], "--replace-config") == 0) {
+            replace_config = true;
         }
     }
 
@@ -5225,7 +5351,16 @@ int cbm_cmd_update(int argc, char **argv) {
 
     /* Step 6: Refresh all agent configs (skills, MCP entries, hooks) */
     printf("Refreshing agent configurations...\n");
+    g_install_replace_config = replace_config;
+    g_install_config_conflicts = 0;
     cbm_install_agent_configs(home, bin_dest, true, false);
+    g_install_replace_config = false;
+    if (g_install_config_conflicts != 0) {
+        (void)fprintf(stderr, "error: %d conflicting MCP configuration(s) were not changed.\n",
+                      g_install_config_conflicts);
+        g_install_config_conflicts = 0;
+        return CLI_TRUE;
+    }
 
     /* Step 7: Verify new version (exec directly, no shell interpretation) */
     printf("\nUpdate complete. Verifying:\n");

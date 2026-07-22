@@ -1445,7 +1445,7 @@ TEST(zova_single_file_real_repo_compact_parity) {
         FAIL("CBM_CACHE_DIR is required for the isolated real-repository suite");
     }
     cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
-    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    cbm_setenv("CBM_WORKERS", "0", 1);
     cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     char db_path[1024];
     char source_zova_path[1024];
@@ -1975,7 +1975,7 @@ TEST(zova_single_file_real_repo_compact_parity) {
     free(project_copy);
     cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     cbm_unsetenv("CBM_ZOVA_MODE");
-    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_unsetenv("CBM_WORKERS");
     PASS();
 #endif
 }
@@ -2135,6 +2135,11 @@ static int zsp_optimization_requested(void) {
         (strcmp(workload, "full") == 0 || strcmp(workload, "incremental") == 0);
 }
 
+static int zsp_index_only_requested(void) {
+    const char *value = getenv("CBM_ZOVA_OPTIMIZATION_INDEX_ONLY");
+    return value && strcmp(value, "1") == 0;
+}
+
 static const char *zsp_optimization_pipeline_mode(const char *workload) {
     if (workload && strcmp(workload, "full") == 0) return "CBM_MODE_FULL";
     if (workload && strcmp(workload, "incremental") == 0)
@@ -2187,22 +2192,17 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
     const char *old_cache_value = getenv("CBM_CACHE_DIR");
     const char *old_mode_value = getenv("CBM_ZOVA_MODE");
     const char *old_single_value = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
-    const char *old_thread_value = getenv("CBM_INDEX_SINGLE_THREAD");
     char *old_cache = old_cache_value ? strdup(old_cache_value) : NULL;
     char *old_mode = old_mode_value ? strdup(old_mode_value) : NULL;
     char *old_single = old_single_value ? strdup(old_single_value) : NULL;
-    char *old_thread = old_thread_value ? strdup(old_thread_value) : NULL;
     if ((old_cache_value && !old_cache) || (old_mode_value && !old_mode) ||
-        (old_single_value && !old_single) || (old_thread_value && !old_thread)) {
-        free(old_cache); free(old_mode); free(old_single); free(old_thread);
+        (old_single_value && !old_single)) {
+        free(old_cache); free(old_mode); free(old_single);
         return -1;
     }
     int pure_sqlite = !flagged && zsp_pure_sqlite_route_enabled();
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
     cbm_setenv("CBM_ZOVA_MODE", pure_sqlite ? "off" : "graph_read", 1);
-    /* Keep promotion evidence deterministic by default, but let an explicit
-     * caller setting exercise the production parallel indexing route. */
-    if (!old_thread_value) cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
     if (flagged) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
 
@@ -2259,7 +2259,6 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
     zsp_restore_env("CBM_CACHE_DIR", old_cache);
     zsp_restore_env("CBM_ZOVA_MODE", old_mode);
     zsp_restore_env("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", old_single);
-    zsp_restore_env("CBM_INDEX_SINGLE_THREAD", old_thread);
     return rc;
 }
 
@@ -2905,12 +2904,17 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             "    \"node_vectors_total\": %lld, \"node_vectors_upserted\": %lld, "
             "\"node_vectors_deleted\": %lld,\n"
             "    \"token_vectors_total\": %lld, \"token_vectors_upserted\": %lld, "
-            "\"token_vectors_deleted\": %lld\n"
+            "\"token_vectors_deleted\": %lld,\n"
+            "    \"model_edge_default_payloads\": %llu, "
+            "\"model_edge_payload_scratch_edges\": %llu\n"
             "  },\n"
             "  \"timing_ms\": {\n"
             "    \"route\": %.3f, \"normalize\": %.3f, "
             "\"model_nodes\": %.3f, \"model_edges\": %.3f, "
             "\"model_hashes\": %.3f, \"model_vectors\": %.3f,\n"
+            "    \"model_edge_endpoint\": %.3f, \"model_edge_sort\": %.3f, "
+            "\"model_edge_group\": %.3f, \"model_edge_payload\": %.3f, "
+            "\"model_edge_digest\": %.3f,\n"
             "    \"writer_guard\": %.3f, \"database_init\": %.3f, "
             "\"database_open\": %.3f, \"transaction_begin\": %.3f,\n"
             "    \"transaction_body\": %.3f, \"transaction_commit\": %.3f, "
@@ -2996,12 +3000,19 @@ static int zsp_write_optimization_report(const char *path, const char *route,
             (long long)report->token_vectors_total,
             (long long)report->token_vectors_upserted,
             (long long)report->token_vectors_deleted,
+            (unsigned long long)selected->publish_stats.model_edge_default_payloads,
+            (unsigned long long)selected->publish_stats.model_edge_payload_scratch_edges,
             selected->publish_stats.route_ms,
             selected->publish_stats.normalization_ms,
             selected->publish_stats.model_nodes_ms,
             selected->publish_stats.model_edges_ms,
             selected->publish_stats.model_hashes_ms,
             selected->publish_stats.model_vectors_ms,
+            selected->publish_stats.model_edge_endpoint_ms,
+            selected->publish_stats.model_edge_sort_ms,
+            selected->publish_stats.model_edge_group_ms,
+            selected->publish_stats.model_edge_payload_ms,
+            selected->publish_stats.model_edge_digest_ms,
             selected->publish_stats.writer_guard_ms,
             selected->publish_stats.database_init_ms,
             selected->publish_stats.database_open_ms,
@@ -3136,17 +3147,24 @@ TEST(zova_single_file_optimization_contract_is_explicit) {
     const char *old_pure_report_value = getenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
     const char *old_single_report_value = getenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
     const char *old_workload_value = getenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
+    const char *old_index_only_value = getenv("CBM_ZOVA_OPTIMIZATION_INDEX_ONLY");
     char *old_pure_report = old_pure_report_value ? strdup(old_pure_report_value) : NULL;
     char *old_single_report = old_single_report_value ? strdup(old_single_report_value) : NULL;
     char *old_workload = old_workload_value ? strdup(old_workload_value) : NULL;
+    char *old_index_only = old_index_only_value ? strdup(old_index_only_value) : NULL;
     ASSERT_TRUE((!old_pure_report_value || old_pure_report) &&
                 (!old_single_report_value || old_single_report) &&
-                (!old_workload_value || old_workload));
+                (!old_workload_value || old_workload) &&
+                (!old_index_only_value || old_index_only));
 
     cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT");
     cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
     cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
+    cbm_unsetenv("CBM_ZOVA_OPTIMIZATION_INDEX_ONLY");
     ASSERT_FALSE(zsp_optimization_requested());
+    ASSERT_FALSE(zsp_index_only_requested());
+    cbm_setenv("CBM_ZOVA_OPTIMIZATION_INDEX_ONLY", "1", 1);
+    ASSERT_TRUE(zsp_index_only_requested());
     cbm_setenv("CBM_ZOVA_OPTIMIZATION_PURE_REPORT", "/tmp/pure-report.json", 1);
     ASSERT_FALSE(zsp_optimization_requested());
     cbm_setenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT", "/tmp/single-report.json", 1);
@@ -3163,6 +3181,7 @@ TEST(zova_single_file_optimization_contract_is_explicit) {
     zsp_restore_env("CBM_ZOVA_OPTIMIZATION_PURE_REPORT", old_pure_report);
     zsp_restore_env("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT", old_single_report);
     zsp_restore_env("CBM_ZOVA_OPTIMIZATION_WORKLOAD", old_workload);
+    zsp_restore_env("CBM_ZOVA_OPTIMIZATION_INDEX_ONLY", old_index_only);
     PASS();
 }
 
@@ -3249,11 +3268,14 @@ TEST(zova_single_file_promotion_real_repository_state) {
     ASSERT_STR_EQ(flagged_artifact.project, repository);
     ASSERT_STR_EQ(compat_artifact.project, flagged_artifact.project);
     zsp_state_report_t state_report = {0};
+    int index_only = zsp_index_only_requested();
     state_report.compatibility_artifact_count = zsp_flagged_artifacts(&flagged_artifact);
     ASSERT_TRUE(state_report.compatibility_artifact_count >= 0);
-    ASSERT_EQ(zsp_compare_pair(&compat_artifact, &flagged_artifact, &state_report, 1), 0);
-    ASSERT_EQ(zsp_measure_reads(&compat_artifact, &flagged_artifact, &state_report), 0);
-    if (strcmp(state, "incremental") == 0) {
+    if (!index_only) {
+        ASSERT_EQ(zsp_compare_pair(&compat_artifact, &flagged_artifact, &state_report, 1), 0);
+        ASSERT_EQ(zsp_measure_reads(&compat_artifact, &flagged_artifact, &state_report), 0);
+    }
+    if (!index_only && strcmp(state, "incremental") == 0) {
         zsp_artifact_t fresh_artifact = {0};
         ASSERT_EQ(zsp_run_route(repo, fresh_cache, 0, "full", &fresh_artifact), 0);
         ASSERT_STR_EQ(fresh_artifact.project, repository);
@@ -3280,7 +3302,6 @@ TEST(zova_single_file_promotion_real_repository_state) {
         const char *single_report = getenv("CBM_ZOVA_OPTIMIZATION_SINGLE_REPORT");
         const char *optimization_workload = getenv("CBM_ZOVA_OPTIMIZATION_WORKLOAD");
         ASSERT_STR_EQ(state, optimization_workload);
-        ASSERT_EQ(zsp_optimization_inspect_single(&flagged_artifact, &state_report), 0);
         zsp_state_report_t pure_state_report = state_report;
         const cbm_pipeline_zova_publish_stats_t *stats = &flagged_artifact.publish_stats;
         ASSERT_TRUE(stats->completed);
@@ -3296,6 +3317,14 @@ TEST(zova_single_file_promotion_real_repository_state) {
         state_report.node_vectors_deleted = (int64_t)stats->node_vectors_deleted;
         state_report.token_vectors_upserted = (int64_t)stats->token_vectors_upserted;
         state_report.token_vectors_deleted = (int64_t)stats->token_vectors_deleted;
+        if (index_only) {
+            state_report.nodes_total = state_report.nodes_inserted;
+            state_report.edges_total = state_report.edges_inserted;
+            state_report.graph_topology_total = state_report.edges_inserted;
+            state_report.node_vectors_total = state_report.node_vectors_upserted;
+            state_report.token_vectors_total = state_report.token_vectors_upserted;
+        }
+        ASSERT_EQ(zsp_optimization_inspect_single(&flagged_artifact, &state_report), 0);
         ASSERT_EQ(zsp_write_optimization_report(pure_report, "pure",
                                                 optimization_workload,
                                                 &compat_artifact, &flagged_artifact,

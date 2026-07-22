@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 # Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-$Repo = "DeusData/codebase-memory-mcp"
+$Repo = "0ctacity/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
 $BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }
@@ -24,10 +24,14 @@ if (-not $BaseUrl.StartsWith("https://") -and -not $BaseUrl.StartsWith("http://l
 # Detect variant from args (--ui or --standard)
 $Variant = "standard"
 $SkipConfig = $false
+$Replace = $false
+$ReplaceConfig = $false
 foreach ($arg in $args) {
     if ($arg -eq "--ui") { $Variant = "ui" }
     if ($arg -eq "--standard") { $Variant = "standard" }
     if ($arg -eq "--skip-config") { $SkipConfig = $true }
+    if ($arg -eq "--replace") { $Replace = $true }
+    if ($arg -eq "--replace-config") { $ReplaceConfig = $true }
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
 
@@ -124,28 +128,50 @@ if (-not (Test-Path $DlBin)) {
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $Dest = Join-Path $InstallDir $BinName
 
-# Handle replace-if-running (rename-aside)
+# Identical binaries are a true no-op. Refuse a different target unless the
+# caller explicitly authorizes replacement.
 if (Test-Path $Dest) {
-    $OldDest = "$Dest.old"
-    Remove-Item $OldDest -Force -ErrorAction SilentlyContinue
-    try {
-        Rename-Item $Dest $OldDest -ErrorAction Stop
-    } catch {
-        Write-Host "warning: could not rename existing binary (may be in use)"
+    $CurrentHash = (Get-FileHash -Path $Dest -Algorithm SHA256).Hash
+    $IncomingHash = (Get-FileHash -Path $DlBin -Algorithm SHA256).Hash
+    if ($CurrentHash -eq $IncomingHash) {
+        Write-Host "already installed: $Dest"
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 0
+    }
+    if (-not $Replace) {
+        Write-Host "error: a different binary already exists at $Dest" -ForegroundColor Red
+        Write-Host "Re-run with --replace to replace it explicitly."
+        Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+        exit 1
     }
 }
 
-Copy-Item $DlBin $Dest -Force
+$InstallTmp = Join-Path $InstallDir ".codebase-memory-mcp.install.$([Guid]::NewGuid().ToString('N')).exe"
+Copy-Item $DlBin $InstallTmp
 
-# Verify
+# Verify before atomically moving the binary into place.
 try {
-    $ver = & $Dest --version 2>&1
-    Write-Host "Installed: $ver"
+    $ver = & $InstallTmp --version 2>&1
 } catch {
     Write-Host "error: installed binary failed to run" -ForegroundColor Red
+    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
     Remove-Item -Recurse -Force $TmpDir
     exit 1
 }
+if ((Test-Path $Dest) -and -not $Replace) {
+    Write-Host "error: install target appeared while installing: $Dest" -ForegroundColor Red
+    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $TmpDir
+    exit 1
+}
+try {
+    Move-Item $InstallTmp $Dest -Force
+} catch {
+    Remove-Item $InstallTmp -Force -ErrorAction SilentlyContinue
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    throw
+}
+Write-Host "Installed: $ver"
 
 # Configure agents
 if ($SkipConfig) {
@@ -154,7 +180,9 @@ if ($SkipConfig) {
 } else {
     Write-Host ""
     Write-Host "Configuring coding agents..."
-    & $Dest install -y 2>&1 | Write-Host
+    $ConfigArgs = @("install", "-y")
+    if ($ReplaceConfig) { $ConfigArgs += "--replace-config" }
+    & $Dest @ConfigArgs 2>&1 | Write-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "error: agent configuration failed (exit code $LASTEXITCODE)" -ForegroundColor Red

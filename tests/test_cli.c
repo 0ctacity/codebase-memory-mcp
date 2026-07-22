@@ -1811,6 +1811,44 @@ TEST(cli_install_help_no_mutation) {
     PASS();
 }
 
+TEST(cli_install_refuses_conflicting_mcp_config_without_replace_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-conflict-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *old_home = getenv("HOME");
+    char *old_home_copy = old_home ? strdup(old_home) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char cursor_dir[512];
+    char config_path[512];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/mcp.json", cursor_dir);
+    ASSERT_EQ(test_mkdirp(cursor_dir), 0);
+    ASSERT_EQ(write_test_file(config_path,
+                              "{\"mcpServers\":{\"codebase-memory-mcp\":{"
+                              "\"command\":\"/opt/upstream/codebase-memory-mcp\"}}}"),
+              0);
+
+    char *refuse_args[] = {"--dry-run", "-y"};
+    ASSERT_EQ(cbm_cmd_install(2, refuse_args), 1);
+    ASSERT(strstr(read_test_file(config_path), "/opt/upstream/codebase-memory-mcp") != NULL);
+
+    char *replace_args[] = {"--dry-run", "--replace-config", "-y"};
+    ASSERT_EQ(cbm_cmd_install(3, replace_args), 0);
+    ASSERT(strstr(read_test_file(config_path), "/opt/upstream/codebase-memory-mcp") != NULL);
+
+    if (old_home_copy) {
+        cbm_setenv("HOME", old_home_copy, 1);
+        free(old_home_copy);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_install_ui_rejects_non_ui_binary) {
     char *args[] = {"--ui", "--dry-run"};
     ASSERT_EQ(cbm_cmd_install(2, args), 1);

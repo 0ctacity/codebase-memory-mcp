@@ -307,6 +307,13 @@ typedef struct {
     double diff_ms;
     double model_nodes_ms;
     double model_edges_ms;
+    double model_edge_endpoint_ms;
+    double model_edge_sort_ms;
+    double model_edge_group_ms;
+    double model_edge_payload_ms;
+    double model_edge_digest_ms;
+    uint64_t model_edge_default_payloads;
+    uint64_t model_edge_payload_scratch_edges;
     double model_hashes_ms;
     double model_vectors_ms;
     double model_digests_ms;

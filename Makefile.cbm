@@ -169,9 +169,21 @@ SQLITE_WRITER_SRC = $(CBM_DIR)/sqlite_writer.c
 # Store module (new)
 STORE_SRCS = src/store/store.c
 
-# Optional Zova migration adapter. Compiles to no-op stubs unless
+# Optional Zova storage adapter. Compiles to no-op stubs unless
 # CBM_WITH_ZOVA=1 is set for the build.
-ZOVA_SRCS = src/zova/cbm_zova.c src/zova/cbm_zova_bridge_stub.c
+ZOVA_SRCS = \
+	src/zova/cbm_zova.c \
+	src/zova/cbm_zova_publish_model.c \
+	src/zova/cbm_zova_edge_payload.c \
+	src/zova/cbm_zova_delta.c \
+	src/zova/cbm_zova_operations.c \
+	src/zova/cbm_zova_migration.c \
+	src/zova/cbm_zova_legacy_snapshot.c \
+	src/zova/cbm_zova_v5_snapshot.c \
+	src/zova/cbm_zova_writer_gate.c \
+	src/zova/cbm_zova_route.c \
+	src/zova/cbm_zova_repository.c \
+	src/zova/cbm_zova_bridge_stub.c
 
 # Cypher module (new)
 CYPHER_SRCS = src/cypher/cypher.c
@@ -557,8 +569,8 @@ check-zova:
 		echo "       Build Zova first with: cd $(ZOVA_ROOT) && zig build" >&2; \
 		exit 1; \
 	}
-	@grep -q "Zova C ABI, v0.22.0 pre-1.0" "$(ZOVA_ROOT)/include/zova.h" || { \
-		echo "error: Zova C ABI 0.22.0 is required: $(ZOVA_ROOT)/include/zova.h" >&2; \
+	@grep -q "Zova C ABI, v0.24.0 pre-1.0" "$(ZOVA_ROOT)/include/zova.h" || { \
+		echo "error: Zova C ABI 0.24.0 is required: $(ZOVA_ROOT)/include/zova.h" >&2; \
 		exit 1; \
 	}
 	@grep -q "zova_database_register_function" "$(ZOVA_ROOT)/include/zova.h" || { \
@@ -821,13 +833,14 @@ frontend: check-bun
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(CBM_CLI_ZIG_LIB) $(ZOVA_CHECK_TARGET)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(CBM_CLI_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
 		$(CBM_CLI_ZIG_LIB) \
+		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(ZOVA_LINK_LIBS) \
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"

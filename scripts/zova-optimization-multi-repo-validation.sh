@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MODE=${1:-all}
+[[ $# -le 1 ]] || { echo "usage: $0 [all|index-only]" >&2; exit 2; }
+case "$MODE" in all|index-only) ;;
+  *) echo "usage: $0 [all|index-only]" >&2; exit 2;;
+esac
+
 ROOT=$(git rev-parse --show-toplevel)
 ROOT=$(cd "$ROOT" && pwd -P)
 OUTPUT=${CBM_ZOVA_OPTIMIZATION_FINAL_ROOT:-"$ROOT/build/zova-optimization/final"}
 TOPS=${CBM_ZOVA_OPTIMIZATION_TOPS_REPO:-"$ROOT/../tops"}
+DENO=${CBM_ZOVA_OPTIMIZATION_DENO_REPO:-"$ROOT/../deno"}
 MOTIVE=${CBM_ZOVA_OPTIMIZATION_MOTIVE_REPO:-"$ROOT/../motive"}
 RVAULT=${CBM_ZOVA_OPTIMIZATION_RVAULT_REPO:-"$ROOT/../rvault"}
 CBM=${CBM_ZOVA_OPTIMIZATION_CBM_REPO:-"$ROOT"}
@@ -20,6 +27,106 @@ AGGREGATOR=${CBM_ZOVA_OPTIMIZATION_AGGREGATOR:-"$ROOT/scripts/zova-optimization-
 MANIFEST=${CBM_ZOVA_OPTIMIZATION_MANIFEST:-"$ROOT/.zova-sdk/manifest.txt"}
 
 fail() { echo "error: $*" >&2; exit 1; }
+
+if [[ "$MODE" == index-only ]]; then
+  for repo in "$TOPS" "$DENO"; do
+    git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
+      fail "repository is missing .git: $repo"
+  done
+  for path in "$BUILD_ONCE" "$REPOSITORY_RUNNER"; do
+    [[ -x "$path" ]] || fail "required executable is missing: $path"
+  done
+  [[ ! -e "$OUTPUT" ]] || fail "index-only output root must be fresh: $OUTPUT"
+  mkdir -p "$OUTPUT"
+  OUTPUT=$(cd "$OUTPUT" && pwd -P)
+  if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" != 1 ]]; then
+    echo "ZOVA INDEX ONLY phase=build" >&2
+    "$BUILD_ONCE" >/dev/null
+  fi
+  [[ -x "$BUILD" && -x "$TEST_RUNNER" ]] || fail "build products are missing"
+
+  run_index_only_repository() {
+    local name=$1 repo=$2 attempt=$3
+    local run_root="$OUTPUT/$name/attempt-$attempt"
+    echo "ZOVA INDEX ONLY repository=$name attempt=$attempt workers=${CBM_WORKERS:-auto}" >&2
+    CBM_ZOVA_BUILD_SKIP=1 \
+    CBM_ZOVA_VALIDATION_REPO="$repo" \
+    CBM_ZOVA_OPTIMIZATION_REPOSITORY="$name" \
+    CBM_ZOVA_OPTIMIZATION_ATTEMPT="$attempt" \
+    CBM_ZOVA_OPTIMIZATION_MUTATION=source-change \
+    CBM_ZOVA_OPTIMIZATION_BENCHMARK_KIND=storage-ingestion \
+    CBM_ZOVA_OPTIMIZATION_RUN_ROOT="$run_root" \
+    CBM_ZOVA_OPTIMIZATION_BUILD_BINARY="$BUILD" \
+    CBM_ZOVA_OPTIMIZATION_TEST_RUNNER="$TEST_RUNNER" \
+    CBM_ZOVA_OPTIMIZATION_BASELINE_CAPTURE=1 \
+    "$REPOSITORY_RUNNER" index-only
+  }
+
+  for name in tops deno; do
+    repo=$TOPS
+    [[ "$name" == deno ]] && repo=$DENO
+    run_index_only_repository "$name" "$repo" 1
+    run_index_only_repository "$name" "$repo" 2
+  done
+
+  python3 - "$OUTPUT" "${CBM_WORKERS:-auto}" <<'PY'
+import json, os, pathlib, statistics, sys
+root = pathlib.Path(sys.argv[1])
+workers = sys.argv[2]
+repositories = []
+for name in ("tops", "deno"):
+    samples = []
+    states_by_route = {"pure": [], "single": []}
+    for attempt in (1, 2):
+        path = root / name / f"attempt-{attempt}" / "optimization-report.json"
+        report = json.loads(path.read_text())
+        if report.get("benchmark_scope") != "index-only":
+            raise SystemExit(f"{path} is not an index-only report")
+        states = {state["route"]: state for state in report["states"]}
+        if set(states) != {"pure", "single"}:
+            raise SystemExit(f"{path} does not contain pure and single states")
+        for route in states_by_route:
+            states_by_route[route].append(states[route])
+        samples.append({
+            "attempt": attempt,
+            "pure_sqlite_full_ms": states["pure"]["timing_ms"]["pipeline"],
+            "zova_native_full_ms": states["single"]["timing_ms"]["pipeline"],
+            "zova_publish_ms": states["single"]["timing_ms"]["publish"],
+            "pure_sqlite_bytes": states["pure"]["storage"]["database_bytes"],
+            "zova_native_bytes": states["single"]["storage"]["database_bytes"],
+        })
+    average = {
+        key: statistics.fmean(sample[key] for sample in samples)
+        for key in samples[0] if key != "attempt"
+    }
+    timing_fields = states_by_route["single"][0]["timing_ms"]
+    zova_phase_average_ms = {
+        field: statistics.fmean(state["timing_ms"][field]
+                                for state in states_by_route["single"])
+        for field in timing_fields
+    }
+    repositories.append({
+        "repository": name,
+        "sample_count": 2,
+        "samples": samples,
+        "average": average,
+        "zova_phase_average_ms": zova_phase_average_ms,
+    })
+output = root / "index-only-average.json"
+temporary = output.with_suffix(".json.tmp")
+temporary.write_text(json.dumps({
+    "schema_version": 1,
+    "benchmark_scope": "index-only",
+    "workers": workers,
+    "repositories": repositories,
+}, indent=2, sort_keys=True) + "\n")
+os.replace(temporary, output)
+print(output)
+PY
+  echo "ZOVA INDEX ONLY phase=complete" >&2
+  exit 0
+fi
+
 for repo in "$TOPS" "$MOTIVE" "$RVAULT" "$CBM"; do
   git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 ||
     fail "repository is missing .git: $repo"

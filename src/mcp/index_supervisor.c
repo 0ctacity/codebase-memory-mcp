@@ -189,10 +189,14 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
 
     /* Recovery-run probe knobs → inherited env for the child. Spawns are
      * sequential, so mutating the parent's environment around a single spawn is
-     * safe. Set only the requested knobs; unset them all again after reaping so
-     * a later attempt (or the caller) starts from a clean environment. */
+     * safe. Preserve a caller's worker override around a sequential recovery. */
+    const char *old_workers_value = single_thread ? getenv("CBM_WORKERS") : NULL;
+    char *old_workers = old_workers_value ? strdup(old_workers_value) : NULL;
+    if (old_workers_value && !old_workers) {
+        return -1;
+    }
     if (single_thread) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+        cbm_setenv("CBM_WORKERS", "0", 1);
     }
     if (marker_file && marker_file[0]) {
         cbm_setenv("CBM_INDEX_MARKER_FILE", marker_file, 1);
@@ -215,8 +219,10 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     int run_rc = cbm_subprocess_run(&opts, &r);
 
     if (single_thread) {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        if (old_workers) cbm_setenv("CBM_WORKERS", old_workers, 1);
+        else cbm_unsetenv("CBM_WORKERS");
     }
+    free(old_workers);
     if (marker_file && marker_file[0]) {
         cbm_unsetenv("CBM_INDEX_MARKER_FILE");
     }

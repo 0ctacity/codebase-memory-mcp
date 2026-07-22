@@ -80,6 +80,12 @@ pub fn build(b: *std.Build) void {
     const install_ui = b.addSystemCommand(&.{ "bash", "scripts/test-install-ui-success.sh" });
     install_ui.step.dependOn(cbm_with_ui);
     test_install_ui.dependOn(&install_ui.step);
+
+    const test_install_safety =
+        b.step("test-install-safety", "Verify installer replacement and idempotency safeguards");
+    const install_safety =
+        b.addSystemCommand(&.{ "bash", "tests/test_install_script_safety.sh" });
+    test_install_safety.dependOn(&install_safety.step);
 }
 
 fn checkZovaInputs(b: *std.Build, cfg: Config) void {
@@ -99,7 +105,7 @@ fn checkZovaInputs(b: *std.Build, cfg: Config) void {
     const header = b.build_root.handle.readFileAlloc(b.graph.io, header_path, b.allocator, .limited(1024 * 1024)) catch {
         std.debug.panic("error: unable to read Zova C ABI header: {s}", .{header_path});
     };
-    if (!std.mem.containsAtLeast(u8, header, 1, "Zova C ABI, v0.24.0 pre-1.0") or
+    if (!std.mem.containsAtLeast(u8, header, 1, "Zova C ABI, v0.") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_database_register_function") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_in") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_vector_search_by_id_in") or
@@ -112,7 +118,7 @@ fn checkZovaInputs(b: *std.Build, cfg: Config) void {
         !std.mem.containsAtLeast(u8, header, 1, "zova_graph_edge_payload_replace_many") or
         !std.mem.containsAtLeast(u8, header, 1, "zova_fresh_build_begin"))
     {
-        std.debug.panic("error: Zova C ABI 0.24.0 format-9 header with SQL callbacks, candidate vector search, batch deletion, prepared payload graph builds, edge payload access, and fresh-build sessions is required: {s}", .{header_path});
+        std.debug.panic("error: a pinned format-9 Zova C ABI header with SQL callbacks, candidate vector search, batch deletion, prepared payload graph builds, edge payload access, and fresh-build sessions is required: {s}", .{header_path});
     }
 }
 

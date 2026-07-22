@@ -2049,9 +2049,9 @@ TEST(pipeline_rust_grouped_import_properties_valid_json_sequential) {
         "pub struct TemporaryChatSession {}\n"
         "pub struct TemporaryInvitePayload {}\n"};
 
-    const char *saved_single_thread = getenv("CBM_INDEX_SINGLE_THREAD");
-    char *saved_single_thread_copy = saved_single_thread ? strdup(saved_single_thread) : NULL;
-    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    const char *saved_workers = getenv("CBM_WORKERS");
+    char *saved_workers_copy = saved_workers ? strdup(saved_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "0", 1);
 
     int setup_rc = setup_lang_repo(files, contents, 2);
     int run_rc = -1;
@@ -2103,12 +2103,12 @@ TEST(pipeline_rust_grouped_import_properties_valid_json_sequential) {
     if (s) cbm_store_close(s);
     if (p) cbm_pipeline_free(p);
     if (setup_rc == 0) teardown_lang_repo();
-    if (saved_single_thread_copy) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single_thread_copy, 1);
+    if (saved_workers_copy) {
+        cbm_setenv("CBM_WORKERS", saved_workers_copy, 1);
     } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        cbm_unsetenv("CBM_WORKERS");
     }
-    free(saved_single_thread_copy);
+    free(saved_workers_copy);
 
     ASSERT_EQ(setup_rc, 0);
     ASSERT_EQ(run_rc, 0);
@@ -6175,6 +6175,18 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     ASSERT_TRUE(isfinite(full_stats.normalization_ms) && full_stats.normalization_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_nodes_ms) && full_stats.model_nodes_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_edges_ms) && full_stats.model_edges_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edge_endpoint_ms) &&
+                full_stats.model_edge_endpoint_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edge_sort_ms) &&
+                full_stats.model_edge_sort_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edge_group_ms) &&
+                full_stats.model_edge_group_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edge_payload_ms) &&
+                full_stats.model_edge_payload_ms >= 0.0);
+    ASSERT_TRUE(isfinite(full_stats.model_edge_digest_ms) &&
+                full_stats.model_edge_digest_ms >= 0.0);
+    ASSERT_EQ(full_stats.model_edge_default_payloads, 1);
+    ASSERT_EQ(full_stats.model_edge_payload_scratch_edges, 0);
     ASSERT_TRUE(isfinite(full_stats.model_hashes_ms) && full_stats.model_hashes_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_vectors_ms) && full_stats.model_vectors_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_digests_ms) && full_stats.model_digests_ms >= 0.0);

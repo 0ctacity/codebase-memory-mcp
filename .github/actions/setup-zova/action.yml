@@ -1,0 +1,50 @@
+name: Setup pinned Zova SDK
+description: Fetch and build the exact Zova SDK used by Zova-CBM
+
+inputs:
+  target:
+    description: Optional Zig target triple for the Zova static library
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+      with:
+        version: 0.16.0
+
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      with:
+        repository: ata-sesli/zova
+        ref: e492609d480a60781c106012f11b17b2a1c9e330
+        path: .ci/zova
+        persist-credentials: false
+
+    - name: Verify and build pinned Zova
+      shell: bash
+      working-directory: ${{ github.workspace }}/.ci/zova
+      env:
+        EXPECTED_COMMIT: e492609d480a60781c106012f11b17b2a1c9e330
+        TARGET: ${{ inputs.target }}
+      run: |
+        set -euo pipefail
+        ZOVA_ROOT="$GITHUB_WORKSPACE/.ci/zova"
+        test "$(git -C "$ZOVA_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
+        if [[ -n "$TARGET" ]]; then
+          zig build \
+            --cache-dir "$RUNNER_TEMP/zova-cache" \
+            --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
+            -Dtarget="$TARGET" -Doptimize=ReleaseSafe
+        else
+          zig build \
+            --cache-dir "$RUNNER_TEMP/zova-cache" \
+            --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
+            -Doptimize=ReleaseSafe
+        fi
+        test -f "$ZOVA_ROOT/zig-out/lib/libzova_c.a"
+        grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ZOVA_ROOT/include/zova.h"
+        {
+          echo "ZOVA_ROOT=$ZOVA_ROOT"
+          echo "CBM_ZOVA_PIN_ROOT=$ZOVA_ROOT"
+        } >> "$GITHUB_ENV"

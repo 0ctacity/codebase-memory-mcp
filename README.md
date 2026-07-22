@@ -43,18 +43,22 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 
 **One-line install** (macOS / Linux):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/install.sh | bash
 ```
+
+The installer is non-destructive by default. If a different binary or MCP
+configuration already exists, replacement must be authorized explicitly with
+`--replace` or `--replace-config`.
 
 With graph visualization UI:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --ui
+curl -fsSL https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/install.sh | bash -s -- --ui
 ```
 
 **Windows** (PowerShell):
 ```powershell
 # 1. Download the installer
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/install.ps1 -OutFile install.ps1
 
 # 2. (Optional but recommended) Inspect the script
 notepad install.ps1
@@ -76,7 +80,7 @@ Restart your coding agent. Say **"Index this project"** — done.
 <details>
 <summary>Manual install</summary>
 
-1. **Download** the archive for your platform from the [latest release](https://github.com/DeusData/codebase-memory-mcp/releases/latest):
+1. **Download** the archive for your platform from the [latest release](https://github.com/0ctacity/codebase-memory-mcp/releases/latest):
    - `codebase-memory-mcp-<os>-<arch>.tar.gz` (macOS/Linux) or `.zip` (Windows) — standard
    - `codebase-memory-mcp-ui-<os>-<arch>.tar.gz` / `.zip` — with graph visualization
 
@@ -288,13 +292,13 @@ Every release includes `checksums.txt` with SHA-256 hashes. All binaries are sta
 **macOS / Linux:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup.sh | bash
+curl -fsSL https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/scripts/setup.sh | bash
 ```
 
 **Windows (PowerShell):**
 
 ```powershell
-irm https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
+irm https://raw.githubusercontent.com/0ctacity/codebase-memory-mcp/main/scripts/setup-windows.ps1 | iex
 ```
 
 </details>
@@ -314,7 +318,7 @@ The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org
 ### Install via Claude Code
 
 ```
-You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
+You: "Install this MCP server: https://github.com/0ctacity/codebase-memory-mcp"
 ```
 
 ### Build from Source
@@ -332,7 +336,7 @@ You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 </details>
 
 ```bash
-git clone https://github.com/DeusData/codebase-memory-mcp.git
+git clone https://github.com/0ctacity/codebase-memory-mcp.git
 cd codebase-memory-mcp
 scripts/build.sh                    # standard binary
 scripts/build.sh --with-ui          # with graph visualization
@@ -619,7 +623,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
-| `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
+| `CBM_WORKERS` | *(detected)* | Set the indexing worker count. `0` selects the sequential path; `1`–`256` selects an explicit worker count. Unset or invalid values use automatic detection. |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0–1; set `0` to disable. Invalid values are ignored with a warning. |
 
 ```bash

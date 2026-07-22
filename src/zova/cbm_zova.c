@@ -1117,9 +1117,9 @@ static int register_zova_sql_function(zova_database *db, const char *name, int a
         .destroy = NULL,
     };
     zova_status status = zova_database_register_function(&req);
-    /* Zova 0.24 reports duplicate registration as INVALID_ARGUMENT. Treat
-     * that one case as success so callers can safely establish the callback
-     * set on handles opened by another CBM helper. */
+    /* Pinned Zova builds report duplicate registration as INVALID_ARGUMENT.
+     * Treat that one case as success so callers can safely establish the
+     * callback set on handles opened by another CBM helper. */
     if (status == ZOVA_INVALID_ARGUMENT) {
         return 0;
     }
@@ -1128,11 +1128,6 @@ static int register_zova_sql_function(zova_database *db, const char *name, int a
 
 int cbm_zova_register_sql_functions(zova_database *db) {
     if (!db) {
-        return -1;
-    }
-    if (zova_abi_version_major() != 0 || zova_abi_version_minor() != 24) {
-        cbm_log_error("zova.abi", "expected", "0.24.x", "actual",
-                      zova_abi_version_string());
         return -1;
     }
     if (register_zova_sql_function(db, "cbm_cosine_i8", 2, zova_sql_cosine_i8) != 0) {
@@ -5940,6 +5935,15 @@ static int cbm_zova_user_database_publish_delta_tx(
     out_result->normalization_ms=model_metrics.normalization_ms;
     out_result->model_nodes_ms=model_metrics.nodes_ms;
     out_result->model_edges_ms=model_metrics.edges_ms;
+    out_result->model_edge_endpoint_ms=model_metrics.prepared_endpoint_ms;
+    out_result->model_edge_sort_ms=model_metrics.prepared_topology_sort_ms;
+    out_result->model_edge_group_ms=model_metrics.prepared_topology_group_ms;
+    out_result->model_edge_payload_ms=model_metrics.prepared_payload_ms;
+    out_result->model_edge_digest_ms=model_metrics.prepared_topology_digest_ms;
+    out_result->model_edge_default_payloads=
+        model_metrics.prepared_single_default_payload_count;
+    out_result->model_edge_payload_scratch_edges=
+        model_metrics.prepared_payload_scratch_edge_count;
     out_result->model_hashes_ms=model_metrics.hashes_ms;
     out_result->model_vectors_ms=model_metrics.vectors_ms;
     out_result->model_digests_ms=model_metrics.digests_ms;
@@ -6527,6 +6531,15 @@ int cbm_zova_user_database_publish_model_tx(
     out_result->normalization_ms = model_metrics.normalization_ms;
     out_result->model_nodes_ms = model_metrics.nodes_ms;
     out_result->model_edges_ms = model_metrics.edges_ms;
+    out_result->model_edge_endpoint_ms = model_metrics.prepared_endpoint_ms;
+    out_result->model_edge_sort_ms = model_metrics.prepared_topology_sort_ms;
+    out_result->model_edge_group_ms = model_metrics.prepared_topology_group_ms;
+    out_result->model_edge_payload_ms = model_metrics.prepared_payload_ms;
+    out_result->model_edge_digest_ms = model_metrics.prepared_topology_digest_ms;
+    out_result->model_edge_default_payloads =
+        model_metrics.prepared_single_default_payload_count;
+    out_result->model_edge_payload_scratch_edges =
+        model_metrics.prepared_payload_scratch_edge_count;
     out_result->model_hashes_ms = model_metrics.hashes_ms;
     out_result->model_vectors_ms = model_metrics.vectors_ms;
     out_result->model_digests_ms = model_metrics.digests_ms;
