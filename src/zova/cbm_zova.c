@@ -153,11 +153,9 @@ bool cbm_zova_vector_read_is_enabled(void) {
            strcmp(mode, "graph_read") == 0 || strcmp(mode, "authority") == 0;
 }
 
-bool cbm_zova_single_file_experimental_enabled(void) {
-    const char *value = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+bool cbm_zova_single_file_enabled(void) {
     const char *mode = getenv("CBM_ZOVA_MODE");
-    return value && strcmp(value, "1") == 0 &&
-           !(mode && strcmp(mode, "off") == 0);
+    return !mode || mode[0] == '\0' || strcmp(mode, "authority") == 0;
 }
 
 bool cbm_zova_should_use_full_vector_search(int candidate_count, int collection_count) {

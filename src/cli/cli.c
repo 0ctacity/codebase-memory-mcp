@@ -3095,11 +3095,11 @@ int cbm_cmd_zova_ops(int argc, char **argv) {
     bool read_only = strcmp(action, "status") == 0 || is_health;
     if (cbm_zova_workspace_registry_path(database_path, sizeof(database_path)) != 0) {
         snprintf(report.reason, sizeof(report.reason), "%s", "database_path_failed");
-    } else if (!read_only && !cbm_zova_single_file_experimental_enabled()) {
+    } else if (!read_only && !cbm_zova_single_file_enabled()) {
         code = CBM_ZOVA_OPERATION_INCOMPATIBLE;
         report.code = code;
         snprintf(report.operation, sizeof(report.operation), "%s", action);
-        snprintf(report.reason, sizeof(report.reason), "%s", "experimental_route_required");
+        snprintf(report.reason, sizeof(report.reason), "%s", "zova_disabled");
     } else if (strcmp(action, "status") == 0) {
         code = cbm_zova_database_status(database_path, &report);
     } else if (strcmp(action, "backup") == 0) {

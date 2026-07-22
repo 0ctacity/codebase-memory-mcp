@@ -90,7 +90,7 @@ assert_main_unchanged() {
   capture_main_state "$RUN_DIR/main-after.json"
   cmp "$RUN_DIR/main-before.json" "$RUN_DIR/main-after.json" >/dev/null ||
     fail "retained workspace changed after $1"
-  HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 \
+  HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" \
     "$BINARY" cli search_graph --project "$PROJECT" --limit 1 \
     >"$RUN_DIR/main-query.json" 2>"$RUN_DIR/main-query.stderr.log" ||
     fail "retained workspace was not publicly queryable after $1"
@@ -117,7 +117,7 @@ if [[ "${CBM_ZOVA_SECTION8_CONFIRMATION_ONLY:-0}" == "1" ]]; then
   [[ "$NAME" == "CBM" ]] || fail "confirmation-only mode is reserved for the final CBM run"
   echo "SECTION 8 MODE: bounded CBM confirmation" >&2
   started_seconds=$SECONDS
-  HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 \
+  HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" \
   CBM_INDEX_SUPERVISOR=0 "$BINARY" cli index_repository --repo-path "$REPO" --mode full \
     >"$RUN_DIR/confirmation-index.json" 2>"$RUN_DIR/real-repository.log" || {
       tail -100 "$RUN_DIR/real-repository.log" >&2 || true
@@ -175,7 +175,7 @@ with open(output, "w", encoding="utf-8") as target:
 PY
 else
   CBM_ZOVA_VALIDATION_REPO="$REPO" CBM_ZOVA_SINGLE_FILE_REPORT="$REPORT" \
-  CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 CBM_ZOVA_TEST_CACHE_DIR="$TEST_ROOT" \
+  CBM_ZOVA_TEST_CACHE_DIR="$TEST_ROOT" \
   CBM_ZOVA_BUILD_SKIP=1 "$ROOT/scripts/zova-run-tests.sh" zova_single_file_real_repo \
     >"$RUN_DIR/real-repository.log" 2>&1 || {
       tail -100 "$RUN_DIR/real-repository.log" >&2 || true
@@ -217,7 +217,7 @@ DISPOSABLE="$TEST_ROOT/disposable workspace"
 mkdir -p "$DISPOSABLE"
 printf '%s\n' 'int helper(void) { return 1; } int main(void) { return helper(); }' \
   >"$DISPOSABLE/main.c"
-HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 \
+HOME="$HOME_ROOT" CBM_CACHE_DIR="$CACHE" \
 CBM_INDEX_SUPERVISOR=0 "$BINARY" cli index_repository --repo-path "$DISPOSABLE" \
   --name section8-disposable --mode full >"$RUN_DIR/disposable-index.json" \
   2>"$RUN_DIR/disposable-index.stderr.log" || fail "disposable workspace indexing failed"

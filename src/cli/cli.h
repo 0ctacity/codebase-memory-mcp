@@ -36,10 +36,10 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
  * non-zero (and prints nothing) if it is not. */
 int cbm_cli_print_tool_help(const char *tool_name);
 
-/* Section 7 opt-in legacy-to-cbm.zova migration command. */
+/* Legacy-to-cbm.zova migration command. */
 int cbm_cmd_zova_migrate(int argc, char **argv);
 
-/* Section 8 opt-in shared cbm.zova operations command. */
+/* Shared cbm.zova operations command. */
 int cbm_cmd_zova_ops(int argc, char **argv);
 
 /* Resolve exactly one legacy project DB in the configured CBM cache whose

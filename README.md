@@ -25,7 +25,7 @@ The current development version uses **CBM schema 7** with a pinned **Zova forma
 - **Incremental-first performance** — unchanged records are not republished; native delta APIs update only the affected graph, metadata, FTS, and vector records.
 - **Exact compatibility checks** — benchmarked Zova results are required to match the pure-SQLite CBM result set exactly, with no unexpected fallback.
 
-The Zova full-authority route is still opt-in while operational tooling and performance work continue. The original per-project SQLite route remains available for comparison and rollback.
+The shared Zova full-authority route is the default for indexing and queries. The original per-project SQLite route is retained only as an explicit compatibility and benchmark mode selected with `CBM_ZOVA_MODE=off`.
 
 ### Latest Zova-native results
 
@@ -433,7 +433,7 @@ codebase-memory-mcp cli list_projects
 codebase-memory-mcp cli --raw search_graph '{"label": "Function"}' | jq '.results[].name'
 ```
 
-### Zova migration and rollback (Section 7 opt-in)
+### Zova migration and rollback
 
 Section 7 migration is an explicit operator action. It discovers the existing
 project `.db` and sibling `.zova` in the resolved CBM cache and publishes their
@@ -472,16 +472,14 @@ JSON response as `runs/<run>/migration.json`; the default run root is
 The one-file `cbm.zova` schema is documented in
 [`docs/zova-single-file-schema.md`](docs/zova-single-file-schema.md).
 
-### Zova backup, recovery, and workspace operations (Section 8 opt-in)
+### Zova backup, recovery, and workspace operations
 
-The shared-database operator commands remain behind
-`CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1`. They act only on
+The shared-database operator commands act only on
 `${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}/cbm.zova` and emit exactly
 one compact JSON object. Exit `0` means success or no-op, exit `1` means an
 operational refusal/failure, and exit `2` means invalid command syntax.
 
 ```bash
-export CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1
 codebase-memory-mcp zova-ops status --json
 codebase-memory-mcp zova-ops backup --output /safe/path/cbm-backup.zova --json
 codebase-memory-mcp zova-ops restore --input /safe/path/cbm-backup.zova --confirm-replace --json
@@ -522,27 +520,24 @@ scripts/zova-operations.sh status
 scripts/zova-operations.sh backup --output /safe/path/cbm-backup.zova
 ```
 
-The one-file path is currently opt-in. Its compact real-repository validation
-runner is:
+The compact real-repository validation runner is:
 
 ```bash
-CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 scripts/zova-single-file-validation.sh
+scripts/zova-single-file-validation.sh
 ```
 
-It retains only a JSON report on success; normal indexing and the default
-`.db`/sidecar authority are unchanged.
+It retains only a JSON report on success.
 
-The current flagged schema is CBM v7 on Zova format v9. It removes projection
+The current schema is CBM v7 on Zova format v9. It removes projection
 tables, duplicate workspace FTS/rowmaps, compatibility-vector tables, and the
 separate native norm table. Native topology edges carry compact CBM payloads,
 and fresh full publication uses Zova's prepared builder;
 `CBM_MODE_INCREMENTAL` computes and commits an atomic delta without clearing
 the workspace or rewriting unchanged rows. Migration from v5/v7 uses a
-verified temporary database and resumable atomic replacement. The flag remains
-opt-in. The final same-binary TOPS → motive → rvault → CBM optimization gate
+verified temporary database and resumable atomic replacement. The final
+same-binary TOPS → motive → rvault → CBM optimization gate
 passes; storage is 45.0%–60.1% lower than the documented pre-v6 Zova baseline,
-and true incremental publication performs no full clear or unchanged-row
-rewrite. This evidence does not make the route the Section 10 default.
+and true incremental publication performs no full clear or unchanged-row rewrite.
 
 ### Reproducible Zova development builds
 

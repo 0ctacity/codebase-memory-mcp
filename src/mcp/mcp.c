@@ -2056,12 +2056,12 @@ static char *handle_search_graph_flagged(const char *args, char *project) {
     char path[CBM_SZ_1K];
     if (!project || !project[0] || cbm_zova_user_database_path(path, sizeof(path)) != 0) {
         free(project);
-        return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+        return cbm_mcp_text_result("project not indexed in shared cbm.zova", true);
     }
     cbm_zova_repository_t *repo = cbm_zova_repository_open(path, project);
     if (!repo) {
         free(project);
-        return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+        return cbm_mcp_text_result("project not indexed in shared cbm.zova", true);
     }
     const char *workspace_id = cbm_zova_repository_workspace_id(repo);
     char *query = cbm_mcp_get_string_arg(args, "query");
@@ -2134,7 +2134,7 @@ static char *handle_search_graph_flagged(const char *args, char *project) {
     cbm_zova_repository_close(repo);
     free(query); free(name_pattern); free(qn_pattern); free(label); free(file_pattern);
     free(relationship); free(project);
-    if (!json) return cbm_mcp_text_result("flagged cbm.zova search failed", true);
+    if (!json) return cbm_mcp_text_result("shared cbm.zova search failed", true);
     char *result = cbm_mcp_text_result(json, false);
     free(json);
     return result;
@@ -2594,7 +2594,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_zova_workspace_id_validate(cbm_zova_repository_workspace_id(repo)) != 0) {
             if (repo) cbm_zova_repository_close(repo);
             free(query); free(project);
-            return cbm_mcp_text_result("workspace-scoped flagged Cypher request is invalid", true);
+            return cbm_mcp_text_result("workspace-scoped Zova Cypher request is invalid", true);
         }
         const char *workspace_id = cbm_zova_repository_workspace_id(repo);
         char workspace_copy[CBM_ZOVA_WORKSPACE_ID_MAX];
@@ -2761,7 +2761,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         if (!project || cbm_zova_user_database_path(path, sizeof(path)) != 0 ||
             !(repo = cbm_zova_repository_open(path, project))) {
             free(project);
-            return cbm_mcp_text_result("project not indexed in flagged cbm.zova", true);
+            return cbm_mcp_text_result("project not indexed in shared cbm.zova", true);
         }
         int nodes = 0, edges = 0;
         cbm_project_t info = {0};
@@ -2772,7 +2772,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         cbm_zova_repository_close(repo);
         if (rc != CBM_STORE_OK) {
             free(project);
-            return cbm_mcp_text_result("flagged cbm.zova status read failed", true);
+            return cbm_mcp_text_result("shared cbm.zova status read failed", true);
         }
         yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
         yyjson_mut_val *root = yyjson_mut_obj(doc);

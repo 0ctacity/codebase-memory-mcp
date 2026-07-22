@@ -1093,7 +1093,7 @@ static int pipeline_publish_zova_user_database(
     }
     p->zova_publish_ms = 0.0;
     memset(&p->zova_publish_stats, 0, sizeof(p->zova_publish_stats));
-    if (!cbm_zova_single_file_experimental_enabled()) return 0;
+    if (!cbm_zova_single_file_enabled()) return 0;
     struct timespec route_started = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &route_started);
     int capacity = file_count + mode_skipped_count;

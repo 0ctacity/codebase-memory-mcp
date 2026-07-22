@@ -160,14 +160,16 @@ bool cbm_zova_graph_read_is_enabled(void);
 /* Vector reads/writes default to Zova when the mode is unset. Explicit
  * `off` remains the complete SQLite rollback switch. */
 bool cbm_zova_vector_read_is_enabled(void);
-/* Opt-in single-file publisher. Explicit CBM_ZOVA_MODE=off always disables it. */
-bool cbm_zova_single_file_experimental_enabled(void);
+/* The shared single-file authority is the default. Explicit `authority`
+ * selects the same route; diagnostic modes retain their compatibility
+ * behavior and `off` selects pure SQLite. */
+bool cbm_zova_single_file_enabled(void);
 /* Raw, read-only compatibility check used before calling the pinned Zova SDK.
  * A v5/v7 file is valid source material but must be atomically repacked. */
 cbm_zova_database_format_status_t cbm_zova_database_format_status(const char *path);
 const char *cbm_zova_repack_phase_name(cbm_zova_repack_phase_t phase);
 
-/* Validate a durable workspace identifier before any flagged SQL or native
+/* Validate a durable workspace identifier before any shared SQL or native
  * object is opened. */
 int cbm_zova_workspace_id_validate(const char *workspace_id);
 int cbm_zova_workspace_id_for_root(const char *root_path, char *out_workspace_id,

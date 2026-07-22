@@ -29,7 +29,6 @@ if [[ -z "${CBM_ZOVA_TEST_CACHE_DIR:-}" ]]; then
 fi
 CBM_ZOVA_VALIDATION_REPO="$REPO" \
 CBM_ZOVA_SINGLE_FILE_REPORT="$REPORT" \
-CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 \
 CBM_ZOVA_BUILD_SKIP=1 \
   "$ROOT/scripts/zova-run-tests.sh" zova_single_file_real_repo >"$RUN_DIR/run.log" 2>&1 || {
     tail -80 "$RUN_DIR/run.log" >&2 || true

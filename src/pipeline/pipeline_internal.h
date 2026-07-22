@@ -137,7 +137,7 @@ CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
 /* Publish finalized graph/vector arrays plus the exact discovered hash set to
- * the opt-in user-local Zova generation. Returns 0 when disabled or when the
+ * the shared user-local Zova generation. Returns 0 when disabled or when the
  * publication succeeds. */
 int cbm_pipeline_publish_zova_user_database(
     cbm_pipeline_t *p, cbm_gbuf_t *gbuf, const cbm_file_info_t *files, int file_count,

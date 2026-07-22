@@ -2202,7 +2202,7 @@ static int zsp_run_route(const char *repo, const char *cache, int flagged,
     }
     int pure_sqlite = !flagged && zsp_pure_sqlite_route_enabled();
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
-    cbm_setenv("CBM_ZOVA_MODE", pure_sqlite ? "off" : "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", flagged ? "authority" : (pure_sqlite ? "off" : "graph_read"), 1);
     if (flagged) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
 
@@ -2322,7 +2322,7 @@ static int zsp_capture_public(const zsp_artifact_t *artifact, int flagged,
     }
     int pure_sqlite = !flagged && zsp_pure_sqlite_route_enabled();
     cbm_setenv("CBM_CACHE_DIR", artifact->cache, 1);
-    cbm_setenv("CBM_ZOVA_MODE", pure_sqlite ? "off" : "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", flagged ? "authority" : (pure_sqlite ? "off" : "graph_read"), 1);
     if (flagged) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     int rc = single_file_capture_public_responses(

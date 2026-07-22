@@ -200,16 +200,24 @@ TEST(zova_writer_gate_serializes_processes_and_releases_after_crash) {
 }
 #endif
 
-TEST(zova_route_requires_flag_and_respects_off) {
+TEST(zova_route_defaults_to_authority_and_respects_off) {
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     cbm_unsetenv("CBM_ZOVA_MODE");
+    ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
+    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "0", 1);
+    ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
+    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
     ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_COMPATIBILITY);
-    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
     cbm_setenv("CBM_ZOVA_MODE", "off", 1);
     ASSERT_EQ(cbm_zova_route_from_env(), CBM_ZOVA_ROUTE_COMPATIBILITY);
     cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
-    cbm_unsetenv("CBM_ZOVA_MODE");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_mode_copy);
     PASS();
 }
 
@@ -5626,7 +5634,7 @@ SUITE(zova) {
 #ifndef _WIN32
     RUN_TEST(zova_writer_gate_serializes_processes_and_releases_after_crash);
 #endif
-    RUN_TEST(zova_route_requires_flag_and_respects_off);
+    RUN_TEST(zova_route_defaults_to_authority_and_respects_off);
     RUN_TEST(zova_route_uses_user_cache_database);
     RUN_TEST(zova_mode_parser);
     RUN_TEST(zova_workspace_scoped_names_and_node_ids_are_deterministic);

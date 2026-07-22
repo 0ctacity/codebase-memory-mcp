@@ -130,7 +130,7 @@ struct cbm_gbuf {
     int zova_dump_edge_count;
     cbm_zova_prepared_view_t *zova_prepared_view;
 
-    /* The SQLite writer and experimental user-local publisher must describe
+    /* The SQLite writer and shared user-local publisher must describe
      * the same indexed generation. Keep the timestamp produced for the dump
      * so publication does not create a second, later timestamp. */
     char indexed_at[CBM_SZ_64];

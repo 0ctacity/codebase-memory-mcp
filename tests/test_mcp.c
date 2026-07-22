@@ -114,9 +114,12 @@ TEST(mcp_migration_route_is_explicit_and_never_fallback) {
     ASSERT_NOT_NULL(cbm_mkdtemp(cache));
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     char target[512], legacy_path[512];
     snprintf(target, sizeof(target), "%s/cbm.zova", cache);
@@ -151,7 +154,7 @@ TEST(mcp_migration_route_is_explicit_and_never_fallback) {
     char *legacy_response = cbm_mcp_handle_tool(srv, "index_status",
                                                 "{\"project\":\"route-proj\"}");
     ASSERT_NOT_NULL(legacy_response);
-    ASSERT_NULL(strstr(legacy_response, "project not indexed in flagged cbm.zova"));
+    ASSERT_NULL(strstr(legacy_response, "project not indexed in shared cbm.zova"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "migration_legacy"));
     ASSERT_NULL(strstr(mcp_log_buf, "unexpected_fallback"));
     free(legacy_response);
@@ -164,21 +167,24 @@ TEST(mcp_migration_route_is_explicit_and_never_fallback) {
     char *cleanup_response = cbm_mcp_handle_tool(srv, "index_status",
                                                  "{\"project\":\"route-proj\"}");
     ASSERT_NOT_NULL(cleanup_response);
-    ASSERT_NOT_NULL(strstr(cleanup_response, "project not indexed in flagged cbm.zova"));
+    ASSERT_NOT_NULL(strstr(cleanup_response, "project not indexed in shared cbm.zova"));
     free(cleanup_response);
     char *absent_response = cbm_mcp_handle_tool(srv, "index_status",
                                                 "{\"project\":\"absent\"}");
     ASSERT_NOT_NULL(absent_response);
-    ASSERT_NOT_NULL(strstr(absent_response, "project not indexed in flagged cbm.zova"));
+    ASSERT_NOT_NULL(strstr(absent_response, "project not indexed in shared cbm.zova"));
     free(absent_response);
     cbm_mcp_server_free(srv);
     cbm_log_set_sink(NULL);
     cbm_log_set_level(previous_level);
     if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
     else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
     if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     free(saved_cache_copy);
+    free(saved_mode_copy);
     free(saved_flag_copy);
     cbm_unlink(legacy_path);
     cbm_unlink(target);
@@ -941,9 +947,9 @@ TEST(tool_search_graph_rejects_empty_projects) {
 }
 
 TEST(tool_search_graph_rejects_multi_project_compatibility_route) {
-    const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
-    char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
-    cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
+    cbm_setenv("CBM_ZOVA_MODE", "off", 1);
     cbm_mcp_server_t *srv = setup_mcp_with_data();
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\","
@@ -953,9 +959,9 @@ TEST(tool_search_graph_rejects_multi_project_compatibility_route) {
     ASSERT_NOT_NULL(strstr(resp, "multi-project search requires Zova full authority"));
     free(resp);
     cbm_mcp_server_free(srv);
-    if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
-    else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
-    free(saved_flag_copy);
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_mode_copy);
     PASS();
 }
 
@@ -974,7 +980,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
     char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
-    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     char user_db[512], project_db[512], repo_root[512], source_dir[512], source_path[512];
     ASSERT_EQ(cbm_zova_user_database_path(user_db, sizeof(user_db)), 0);
     snprintf(project_db, sizeof(project_db), "%s/fixture.db", cache);
@@ -1247,7 +1253,7 @@ TEST(tool_search_graph_flagged_reads_user_database_without_project_db) {
     ASSERT_EQ(mcp_test_file_digest(project_db, project_db_before_rollback), 0);
     cbm_mcp_server_free(baseline_srv);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
-    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     char *trace_response = cbm_mcp_server_handle(
         srv,
         trace_request);
@@ -1514,10 +1520,13 @@ TEST(tool_search_graph_searches_two_zova_projects_globally) {
     ASSERT_NOT_NULL(cbm_mkdtemp(cache));
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
     char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
 
     char path[512];
     ASSERT_EQ(cbm_zova_user_database_path(path, sizeof(path)), 0);
@@ -1604,8 +1613,11 @@ TEST(tool_search_graph_searches_two_zova_projects_globally) {
     else cbm_unsetenv("CBM_CACHE_DIR");
     if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
     free(saved_cache_copy);
     free(saved_flag_copy);
+    free(saved_mode_copy);
     cbm_unlink(path);
     cbm_rmdir(cache);
     PASS();

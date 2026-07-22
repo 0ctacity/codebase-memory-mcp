@@ -591,7 +591,7 @@ typedef struct {
     const char *updated_at;
 } cbm_adr_t;
 
-/* Exact project_summaries row used by the experimental user-local Zova
+/* Exact project_summaries row used by the shared user-local Zova
  * publisher. All returned strings are heap-owned by the export object. */
 typedef struct {
     char *summary;

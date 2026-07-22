@@ -8,7 +8,7 @@ usage() {
   cat >&2 <<'EOF'
 usage: scripts/zova-operations.sh ACTION [ACTION FLAGS]
 
-Runs one flagged cbm.zova operation and appends --json automatically.
+Runs one shared cbm.zova operation and appends --json automatically.
 
 Environment:
   CBM_ZOVA_OPERATIONS_BINARY       executable (default: build/c/codebase-memory-mcp)
@@ -64,7 +64,7 @@ COMMAND_STDERR="$RUN_DIR/command.stderr.log"
 echo "ACTION: $ACTION" >&2
 echo "DATABASE: $CACHE_DIR/cbm.zova" >&2
 set +e
-HOME="${HOME:?}" CBM_CACHE_DIR="$CACHE_DIR" CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL=1 \
+HOME="${HOME:?}" CBM_CACHE_DIR="$CACHE_DIR" \
   "$BINARY" zova-ops "$ACTION" "$@" --json >"$REPORT_TMP" 2>"$COMMAND_STDERR"
 COMMAND_RC=$?
 set -e

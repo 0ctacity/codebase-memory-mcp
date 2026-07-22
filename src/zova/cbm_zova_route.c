@@ -10,13 +10,13 @@
 #include <string.h>
 
 cbm_zova_route_t cbm_zova_route_from_env(void) {
-    return cbm_zova_single_file_experimental_enabled()
+    return cbm_zova_single_file_enabled()
                ? CBM_ZOVA_ROUTE_FULL_AUTHORITY
                : CBM_ZOVA_ROUTE_COMPATIBILITY;
 }
 
 cbm_zova_route_t cbm_zova_route_for_project(const char *project) {
-    if (!cbm_zova_single_file_experimental_enabled()) return CBM_ZOVA_ROUTE_COMPATIBILITY;
+    if (!cbm_zova_single_file_enabled()) return CBM_ZOVA_ROUTE_COMPATIBILITY;
     if (!project || !project[0]) return CBM_ZOVA_ROUTE_FULL_AUTHORITY;
     char path[1024];
     if (cbm_zova_user_database_path(path, sizeof(path)) != 0 || !cbm_file_exists(path))

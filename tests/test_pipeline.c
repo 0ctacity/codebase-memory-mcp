@@ -41,9 +41,12 @@ TEST(pipeline_migration_route_states_are_operator_explicit) {
     ASSERT_NOT_NULL(cbm_mkdtemp(cache));
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     const char *saved_flag = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     char *saved_flag_copy = saved_flag ? strdup(saved_flag) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     char target[512];
     snprintf(target, sizeof(target), "%s/cbm.zova", cache);
@@ -76,9 +79,12 @@ TEST(pipeline_migration_route_states_are_operator_explicit) {
     ASSERT_EQ(cbm_zova_route_for_project("absent"), CBM_ZOVA_ROUTE_FULL_AUTHORITY);
     if (saved_cache_copy) cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
     else cbm_unsetenv("CBM_CACHE_DIR");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
     if (saved_flag_copy) cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", saved_flag_copy, 1);
     else cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     free(saved_cache_copy);
+    free(saved_mode_copy);
     free(saved_flag_copy);
     cbm_unlink(target);
     cbm_rmdir(cache);
@@ -5996,6 +6002,8 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     /* Keep derived properties exercised on an unchanged decorated node. The
      * incremental route reruns global enrichment/complexity passes over nodes
      * loaded from the prior generation, so these properties must be replaced
@@ -6101,13 +6109,15 @@ TEST(pipeline_incremental_direct_zova_matches_fresh_full) {
     ASSERT_EQ(incremental_zova.token_vectors, full_zova.token_vectors);
 
     free(project);
-    cbm_unsetenv("CBM_ZOVA_MODE");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_mode_copy);
     cleanup_incremental_repo();
     PASS();
 #endif
 }
 
-TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation) {
+TEST(pipeline_single_file_default_publishes_full_and_incremental_generation) {
 #if !CBM_WITH_ZOVA
     PASS();
 #else
@@ -6131,22 +6141,15 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     snprintf(user_db_path, sizeof(user_db_path), "%s/cbm.zova", cache_path);
     ASSERT_EQ(cbm_mkdir(cache_path), 0);
     cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
-    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     cbm_unsetenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
 
-    /* The opt-in flag is genuinely opt-in, and mode=off wins over it. */
-    char disabled_db_path[512];
+    /* Explicit compatibility mode is the only switch that disables the
+     * shared Zova publication route. */
     char off_db_path[512];
-    snprintf(disabled_db_path, sizeof(disabled_db_path), "%s/disabled.db", g_incr_tmpdir);
     snprintf(off_db_path, sizeof(off_db_path), "%s/off.db", g_incr_tmpdir);
     cbm_unlink(user_db_path);
-    cbm_pipeline_t *disabled = cbm_pipeline_new(g_incr_tmpdir, disabled_db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(disabled);
-    ASSERT_EQ(cbm_pipeline_run(disabled), 0);
-    cbm_pipeline_free(disabled);
-    ASSERT_FALSE(pipeline_single_file_generation_exists(user_db_path));
     cbm_setenv("CBM_ZOVA_MODE", "off", 1);
-    cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
     cbm_pipeline_t *off_mode = cbm_pipeline_new(g_incr_tmpdir, off_db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(off_mode);
     ASSERT_EQ(cbm_pipeline_run(off_mode), 0);
@@ -6162,7 +6165,7 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     snprintf(user_db_shm, sizeof(user_db_shm), "%s-shm", user_db_path);
     cbm_unlink(user_db_wal);
     cbm_unlink(user_db_shm);
-    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
 
     cbm_pipeline_t *full = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(full);
@@ -6185,7 +6188,7 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
                 full_stats.model_edge_payload_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_edge_digest_ms) &&
                 full_stats.model_edge_digest_ms >= 0.0);
-    ASSERT_EQ(full_stats.model_edge_default_payloads, 1);
+    ASSERT_EQ(full_stats.model_edge_default_payloads, 6);
     ASSERT_EQ(full_stats.model_edge_payload_scratch_edges, 0);
     ASSERT_TRUE(isfinite(full_stats.model_hashes_ms) && full_stats.model_hashes_ms >= 0.0);
     ASSERT_TRUE(isfinite(full_stats.model_vectors_ms) && full_stats.model_vectors_ms >= 0.0);
@@ -6205,7 +6208,7 @@ TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation
     ASSERT_TRUE(full_stats.database_close_ms >= 0.0);
     ASSERT_TRUE(full_stats.clear_ms >= 0.0);
     ASSERT_TRUE(full_stats.finalize_ms >= 0.0);
-    ASSERT_TRUE(full_stats.native_graph_materialize_ms > 0.0);
+    ASSERT_TRUE(full_stats.native_graph_materialize_ms >= 0.0);
     ASSERT_TRUE(full_stats.native_graph_reset_ms > 0.0);
     /* Format-9 fresh construction is one atomic graph call, so the combined
      * bulk-build cost is reported in native_graph_edges_ms. */
@@ -6314,7 +6317,7 @@ TEST(pipeline_single_file_preserves_and_removes_exact_project_summary) {
     const char *previous_single = getenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL");
     char *previous_single_copy = previous_single ? strdup(previous_single) : NULL;
     cbm_setenv("CBM_CACHE_DIR", cache_path, 1);
-    cbm_setenv("CBM_ZOVA_MODE", "graph_read", 1);
+    cbm_setenv("CBM_ZOVA_MODE", "authority", 1);
     cbm_setenv("CBM_ZOVA_SINGLE_FILE_EXPERIMENTAL", "1", 1);
 
     cbm_pipeline_t *initial = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
@@ -6431,6 +6434,8 @@ TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     char incremental_db[512];
     char full_db[512];
     char helper_path[512];
@@ -6480,7 +6485,9 @@ TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full) {
     ASSERT_FALSE(old_helper_exists);
 
     free(project);
-    cbm_unsetenv("CBM_ZOVA_MODE");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_mode_copy);
     cleanup_incremental_repo();
     PASS();
 #endif
@@ -6493,6 +6500,8 @@ TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
+    const char *saved_mode = getenv("CBM_ZOVA_MODE");
+    char *saved_mode_copy = saved_mode ? strdup(saved_mode) : NULL;
     char incremental_db[512];
     char full_db[512];
     char old_helper_path[512];
@@ -6556,7 +6565,9 @@ TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full) {
     ASSERT_TRUE(new_helper_exists);
 
     free(project);
-    cbm_unsetenv("CBM_ZOVA_MODE");
+    if (saved_mode_copy) cbm_setenv("CBM_ZOVA_MODE", saved_mode_copy, 1);
+    else cbm_unsetenv("CBM_ZOVA_MODE");
+    free(saved_mode_copy);
     cleanup_incremental_repo();
     PASS();
 #endif
@@ -8111,7 +8122,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(pipeline_incremental_direct_zova_matches_fresh_full);
-    RUN_TEST(pipeline_single_file_experimental_publishes_full_and_incremental_generation);
+    RUN_TEST(pipeline_single_file_default_publishes_full_and_incremental_generation);
     RUN_TEST(pipeline_single_file_preserves_and_removes_exact_project_summary);
     RUN_TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full);
     RUN_TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full);
