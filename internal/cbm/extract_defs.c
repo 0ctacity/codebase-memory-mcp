@@ -1171,7 +1171,11 @@ static bool is_comment_node(const char *kind) {
 static char *extract_comment_text(CBMArena *a, TSNode node, const char *source) {
     char *text = cbm_node_text(a, node, source);
     if (text && strlen(text) > MAX_COMMENT_LEN) {
-        text[MAX_COMMENT_LEN] = '\0';
+        size_t cut = MAX_COMMENT_LEN;
+        while (cut > 0 && ((unsigned char)text[cut] & 0xc0) == 0x80) {
+            cut--;
+        }
+        text[cut] = '\0';
     }
     return text;
 }

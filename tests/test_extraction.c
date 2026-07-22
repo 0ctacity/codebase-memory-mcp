@@ -1972,6 +1972,43 @@ TEST(python_docstring) {
     PASS();
 }
 
+TEST(c_docstring_truncation_preserves_utf8_boundary) {
+    char source[1024];
+    size_t pos = 0;
+    const char prefix[] = "/* ";
+    const char box_drawing[] = "\xe2\x94\x80";
+    const char suffix[] = " */\nint utf8_boundary_target(void) { return 0; }\n";
+
+    memcpy(source + pos, prefix, sizeof(prefix) - 1);
+    pos += sizeof(prefix) - 1;
+    for (int i = 0; i < 200; i++) {
+        memcpy(source + pos, box_drawing, sizeof(box_drawing) - 1);
+        pos += sizeof(box_drawing) - 1;
+    }
+    memcpy(source + pos, suffix, sizeof(suffix));
+
+    CBMFileResult *r = extract(source, CBM_LANG_C, "test", "test.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "utf8_boundary_target"));
+
+    const char *docstring = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "utf8_boundary_target") == 0) {
+            docstring = r->defs.items[i].docstring;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(docstring);
+    ASSERT_EQ((int)strlen(docstring), 498);
+    ASSERT_EQ((unsigned char)docstring[495], 0xe2);
+    ASSERT_EQ((unsigned char)docstring[496], 0x94);
+    ASSERT_EQ((unsigned char)docstring[497], 0x80);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_function_extraction) {
     CBMFileResult *r =
         extract("package main\n\n// Greet returns a greeting.\nfunc Greet(name string) string "
@@ -3702,6 +3739,7 @@ SUITE(extraction) {
 
     /* cbm_test.go ports */
     RUN_TEST(python_docstring);
+    RUN_TEST(c_docstring_truncation_preserves_utf8_boundary);
     RUN_TEST(go_function_extraction);
     RUN_TEST(js_arrow_function);
 
