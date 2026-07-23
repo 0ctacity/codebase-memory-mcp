@@ -55,7 +55,7 @@ else
   TEST_ENV_OWNED=1
 fi
 TEST_HOME="$TEST_ENV_ROOT/home"
-TEST_CACHE="$TEST_ENV_ROOT/cache"
+TEST_CACHE="$TEST_HOME/.cache/codebase-memory-mcp"
 mkdir -p "$TEST_HOME" "$TEST_CACHE"
 cleanup_test_environment() {
   if [[ "$TEST_ENV_OWNED" -eq 1 && "${CBM_ZOVA_TEST_PRESERVE:-0}" != "1" ]]; then
@@ -74,5 +74,9 @@ for suite in "$@"; do
   group=$(runner_group_for_suite "$suite")
   ensure_runner "$group"
   echo "TEST SUITE: $suite" >&2
-  HOME="$TEST_HOME" CBM_CACHE_DIR="$TEST_CACHE" "$RUNNER" "$suite"
+  if [[ -n "${CBM_ZOVA_MODE+x}" || "$group" == "zova" ]]; then
+    HOME="$TEST_HOME" CBM_CACHE_DIR="$TEST_CACHE" "$RUNNER" "$suite"
+  else
+    HOME="$TEST_HOME" CBM_CACHE_DIR="$TEST_CACHE" CBM_ZOVA_MODE=off "$RUNNER" "$suite"
+  fi
 done

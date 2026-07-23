@@ -437,7 +437,9 @@ static const char **collect_sorted_call_neighbors(const cbm_gbuf_t *gbuf, int64_
             names[n++] = neighbor->name;
         }
     }
-    qsort(names, (size_t)n, sizeof(char *), cmp_name_ptr);
+    if (n > 1) {
+        qsort(names, (size_t)n, sizeof(char *), cmp_name_ptr);
+    }
     *out_n = n;
     return names;
 }
@@ -990,7 +992,9 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
      * emitted. Sort the cheap pointer array by qualified name (unique) and
      * re-derive the three fields set so far; the heavy per-func payloads are
      * filled in later phases, so no 12.7 KB structs are moved. */
-    qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
+    if (func_count > 1) {
+        qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
+    }
     for (int k = 0; k < func_count; k++) {
         funcs[k].node_id = node_ptrs[k]->id;
         funcs[k].file_path = node_ptrs[k]->file_path;
@@ -1073,7 +1077,9 @@ static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_buf
         n += worker_bufs[w].count;
         deferred_buf_free(&worker_bufs[w]);
     }
-    qsort(pairs, (size_t)n, sizeof(deferred_edge_t), cmp_deferred_edge_canonical);
+    if (n > 1) {
+        qsort(pairs, (size_t)n, sizeof(deferred_edge_t), cmp_deferred_edge_canonical);
+    }
 
     int total_edges = 0;
     for (int e = 0; e < n; e++) {

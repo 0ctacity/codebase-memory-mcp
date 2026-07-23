@@ -550,7 +550,9 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         id_map[i].id = search_out.results[i].node.id;
         id_map[i].idx = i;
     }
-    qsort(id_map, (size_t)n, sizeof(node_id_entry_t), cmp_node_id_entry);
+    if (n > 1) {
+        qsort(id_map, (size_t)n, sizeof(node_id_entry_t), cmp_node_id_entry);
+    }
 
     /* 3. Query edges — filter during fetch via binary search (O(e log n)) */
     int *deg = calloc((size_t)n, sizeof(int));

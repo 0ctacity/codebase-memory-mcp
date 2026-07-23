@@ -350,7 +350,9 @@ static int apply_decorator_tags(cbm_gbuf_t *gbuf, tagged_node_t *nodes, int node
         if (tag_count == 0) {
             continue;
         }
-        qsort(tag_words, tag_count, sizeof(char *), cmp_str);
+        if (tag_count > 1) {
+            qsort(tag_words, tag_count, sizeof(char *), cmp_str);
+        }
 
         const cbm_gbuf_node_t *gn = cbm_gbuf_find_by_qn(gbuf, nodes[n].qualified_name);
         if (!gn) {

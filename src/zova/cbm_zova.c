@@ -3656,7 +3656,9 @@ static int workspace_generation_map_build(const char *workspace_id, const CBMDum
             return -1;
         }
     }
-    qsort(map, (size_t)node_count, sizeof(*map), workspace_graph_node_map_compare);
+    if (node_count > 1) {
+        qsort(map, (size_t)node_count, sizeof(*map), workspace_graph_node_map_compare);
+    }
     for (int i = 1; i < node_count; i++) {
         if (map[i - 1].sqlite_id == map[i].sqlite_id ||
             strcmp(map[i - 1].stable_id, map[i].stable_id) == 0) {
@@ -4908,7 +4910,9 @@ static int user_delta_file_keys_tx(
         if (!row) { free(paths); return -1; }
         paths[path_count++] = row->file_path;
     }
-    qsort(paths, (size_t)path_count, sizeof(*paths), user_string_pointer_compare);
+    if (path_count > 1) {
+        qsort(paths, (size_t)path_count, sizeof(*paths), user_string_pointer_compare);
+    }
     int unique_count = 0;
     for (int i = 0; i < path_count; i++)
         if (i == 0 || strcmp(paths[i - 1], paths[i]) != 0)
@@ -4941,7 +4945,9 @@ static int user_publish_file_keys_tx(zova_database *db,
     for (int i = 0; i < input->node_count; i++) paths[path_count++] = input->nodes[i].file_path;
     for (int i = 0; i < hash_count; i++)
         paths[path_count++] = cbm_zova_publish_model_file_hash_at(model, i)->file_path;
-    qsort(paths, (size_t)path_count, sizeof(*paths), user_string_pointer_compare);
+    if (path_count > 1) {
+        qsort(paths, (size_t)path_count, sizeof(*paths), user_string_pointer_compare);
+    }
     int unique_count = 0;
     for (int i = 0; i < path_count; i++)
         if (i == 0 || strcmp(paths[i - 1], paths[i]) != 0) paths[unique_count++] = paths[i];

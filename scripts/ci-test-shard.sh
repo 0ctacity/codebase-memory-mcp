@@ -4,8 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 
 authority=(
-  zova_migration zova_operations zova zova_c_sql_functions zova_bridge
-  zova_incremental_native
+  zova_operations zova zova_c_sql_functions zova_bridge zova_incremental_native
 )
 mcp_query=(
   mcp cypher cli integration security ui httpd

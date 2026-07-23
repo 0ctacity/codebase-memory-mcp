@@ -78,7 +78,9 @@ static const cbm_gbuf_node_t **sorted_node_refs(
     const cbm_gbuf_node_t **sorted = malloc((size_t)count * sizeof(*sorted));
     if (!sorted) return NULL;
     memcpy(sorted, nodes, (size_t)count * sizeof(*sorted));
-    qsort(sorted, (size_t)count, sizeof(*sorted), node_ref_qualified_name_compare);
+    if (count > 1) {
+        qsort(sorted, (size_t)count, sizeof(*sorted), node_ref_qualified_name_compare);
+    }
     return sorted;
 }
 

@@ -1372,7 +1372,9 @@ static int *make_sorted_perm(int n, int (*cmp)(const void *, const void *)) {
     for (int i = 0; i < n; i++) {
         perm[i] = i;
     }
-    qsort(perm, n, sizeof(int), cmp);
+    if (n > 1) {
+        qsort(perm, n, sizeof(int), cmp);
+    }
     return perm;
 }
 

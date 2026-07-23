@@ -5033,7 +5033,9 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
              count, input);
     yyjson_mut_obj_add_str(doc, root, "message", msg);
 
-    qsort(nodes, (size_t)count, sizeof(*nodes), compare_snippet_suggestions);
+    if (count > 1) {
+        qsort(nodes, (size_t)count, sizeof(*nodes), compare_snippet_suggestions);
+    }
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
     for (int i = 0; i < count; i++) {
         yyjson_mut_val *s = yyjson_mut_obj(doc);
@@ -5925,7 +5927,10 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
                                    const char *project, search_result_t **sr, int *sr_count,
                                    int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    if (gm_count > 1) {
+        qsort(gm, gm_count, sizeof(grep_match_t),
+              (int (*)(const void *, const void *))strcmp);
+    }
     int i = 0;
     while (i < gm_count) {
         const char *cur_file = gm[i].file;
@@ -6297,7 +6302,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     grep_match_t *raw = malloc(raw_cap * sizeof(grep_match_t));
 
     /* Sort matches by file path for contiguous per-file processing */
-    qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
+    if (gm_count > 1) {
+        qsort(gm, gm_count, sizeof(grep_match_t),
+              (int (*)(const void *, const void *))strcmp);
+    }
 
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap);

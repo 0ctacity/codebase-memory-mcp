@@ -592,12 +592,16 @@ static int model_build_nodes(cbm_zova_publish_model_t *model,
                 .dump_id = model->nodes[i].value.source->id,
                 .stable_id = model->nodes[i].value.stable_id};
         }
-        qsort(model->id_map, (size_t)count, sizeof(*model->id_map), model_id_compare);
+        if (count > 1) {
+            qsort(model->id_map, (size_t)count, sizeof(*model->id_map), model_id_compare);
+        }
         model->metrics.global_sorts++;
         for (int i = 1; i < count; i++)
             if (model->id_map[i - 1].dump_id == model->id_map[i].dump_id) return -1;
     }
-    qsort(model->nodes, (size_t)count, sizeof(*model->nodes), model_node_compare);
+    if (count > 1) {
+        qsort(model->nodes, (size_t)count, sizeof(*model->nodes), model_node_compare);
+    }
     model->metrics.global_sorts++;
     for (int i = 0; i < count; i++) {
         if (i > 0 && strcmp(model->nodes[i - 1].value.stable_id,
@@ -664,7 +668,9 @@ static int model_build_edges(cbm_zova_publish_model_t *model,
             .target_ordinal = target_ordinal};
         model->metrics.edge_id_computations++;
     }
-    qsort(model->edges, (size_t)count, sizeof(*model->edges), model_edge_compare);
+    if (count > 1) {
+        qsort(model->edges, (size_t)count, sizeof(*model->edges), model_edge_compare);
+    }
     model->metrics.global_sorts++;
     int unique_edges = 0;
     for (int i = 0; i < count; i++) {
@@ -692,8 +698,10 @@ static int model_build_edges(cbm_zova_publish_model_t *model,
     model->topology = model_calloc((size_t)unique_edges, sizeof(*model->topology));
     if (!model->topology) return -1;
     for (int i = 0; i < unique_edges; i++) model->topology[i] = model->edges[i];
-    qsort(model->topology, (size_t)unique_edges, sizeof(*model->topology),
-          model_topology_compare);
+    if (unique_edges > 1) {
+        qsort(model->topology, (size_t)unique_edges, sizeof(*model->topology),
+              model_topology_compare);
+    }
     model->metrics.global_sorts++;
     int unique_topology = 0;
     for (int i = 0; i < unique_edges; i++) {
@@ -851,7 +859,9 @@ static int model_build_prepared_topology(cbm_zova_publish_model_t *model,
     model->metrics.prepared_endpoint_ms =
         model_elapsed_ms(&phase_started, &phase_finished);
     phase_started = phase_finished;
-    qsort(seeds, (size_t)count, sizeof(*seeds), prepared_topology_seed_compare);
+    if (count > 1) {
+        qsort(seeds, (size_t)count, sizeof(*seeds), prepared_topology_seed_compare);
+    }
     model->metrics.global_sorts++;
     cbm_clock_gettime(CLOCK_MONOTONIC, &phase_finished);
     model->metrics.prepared_topology_sort_ms =
@@ -943,8 +953,10 @@ static int model_build_prepared_topology(cbm_zova_publish_model_t *model,
                     goto fail;
                 model->metrics.edge_id_computations++;
             }
-            qsort(ordered, group_edge_count, sizeof(*ordered),
-                  prepared_group_edge_compare);
+            if (group_edge_count > 1) {
+                qsort(ordered, group_edge_count, sizeof(*ordered),
+                      prepared_group_edge_compare);
+            }
             for (size_t j = 0; j < group_edge_count; j++) {
                 if (j > 0 && strcmp(ordered[j - 1].edge_id,
                                     ordered[j].edge_id) == 0)
@@ -1041,7 +1053,9 @@ static int model_build_hashes(cbm_zova_publish_model_t *model,
         if (!hash->file_path || !hash->content_hash) return -1;
         model->hashes[i].source = hash;
     }
-    qsort(model->hashes, (size_t)count, sizeof(*model->hashes), model_hash_compare);
+    if (count > 1) {
+        qsort(model->hashes, (size_t)count, sizeof(*model->hashes), model_hash_compare);
+    }
     model->metrics.global_sorts++;
     for (int i = 0; i < count; i++) {
         if (i > 0 && strcmp(model->hashes[i - 1].source->file_path,
@@ -1079,8 +1093,10 @@ static int model_build_vectors(cbm_zova_publish_model_t *model,
                 .source = vector, .stable_id = stable_id, .node_ordinal = node_ordinal};
     }
     if (model->node_vector_count > 0) {
+        if (model->node_vector_count > 1) {
         qsort(model->node_vectors, (size_t)model->node_vector_count,
               sizeof(*model->node_vectors), model_node_vector_compare);
+        }
         model->metrics.global_sorts++;
         for (int i = 0; i < model->node_vector_count; i++) {
             if (i > 0 && strcmp(model->node_vectors[i - 1].value.stable_id,
@@ -1115,8 +1131,10 @@ static int model_build_vectors(cbm_zova_publish_model_t *model,
             (cbm_zova_publish_token_vector_t){.source = vector, .token_id = token_id};
     }
     if (model->token_vector_count > 0) {
+        if (model->token_vector_count > 1) {
         qsort(model->token_vectors, (size_t)model->token_vector_count,
               sizeof(*model->token_vectors), model_token_vector_compare);
+        }
         model->metrics.global_sorts++;
         for (int i = 0; i < model->token_vector_count; i++) {
             if (i > 0 && strcmp(model->token_vectors[i - 1].value.token_id,

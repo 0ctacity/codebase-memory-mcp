@@ -1073,7 +1073,9 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         sorted[i].idx = i;
         sorted[i].size = files[i].size;
     }
-    qsort(sorted, file_count, sizeof(file_sort_entry_t), compare_by_size_desc);
+    if (file_count > 1) {
+        qsort(sorted, file_count, sizeof(file_sort_entry_t), compare_by_size_desc);
+    }
     CBM_PROF_END_N("parallel_extract", "2_sort_files", t_sort, file_count);
 
     /* Allocate per-worker state (cache-line aligned via posix_memalign) */

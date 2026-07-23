@@ -487,7 +487,9 @@ static int snapshot_build_fts_manifest(cbm_zova_legacy_snapshot_t *snapshot,
         snapshot_term_most_compare, snapshot_term_least_compare, snapshot_term_lex_compare,
         snapshot_term_hash_compare};
     for (int group = 0; rc == 0 && group < 4; group++) {
-        qsort(terms, (size_t)term_count, sizeof(*terms), comparators[group]);
+        if (term_count > 1) {
+            qsort(terms, (size_t)term_count, sizeof(*terms), comparators[group]);
+        }
         int take = term_count < limits[group] ? term_count : limits[group];
         for (int i = 0; rc == 0 && i < take; i++) rc = snapshot_add_query(snapshot, terms[i].term);
     }
@@ -534,8 +536,10 @@ static int snapshot_build_fts_manifest(cbm_zova_legacy_snapshot_t *snapshot,
             };
         }
         sqlite3_finalize(stmt);
-        qsort(query_results, (size_t)query_result_count, sizeof(*query_results),
-              snapshot_fts_result_compare);
+        if (query_result_count > 1) {
+            qsort(query_results, (size_t)query_result_count, sizeof(*query_results),
+                  snapshot_fts_result_compare);
+        }
         for (int rank = 0; rank < query_result_count; rank++) {
             char rank_text[32], score_text[64];
             double normalized = nearbyint(query_results[rank].score * 1e12) / 1e12;
@@ -828,8 +832,9 @@ static int snapshot_validate_sidecar(cbm_zova_legacy_snapshot_t *snapshot,
         for (int i = 0; rc == 0 && i < snapshot->input.node_count; i++) {
             sorted[i] = snapshot->source_ids[i];
         }
-        if (rc == 0) qsort(sorted, (size_t)snapshot->input.node_count, sizeof(*sorted),
-                           snapshot_string_ptr_compare);
+        if (rc == 0 && snapshot->input.node_count > 1)
+            qsort(sorted, (size_t)snapshot->input.node_count, sizeof(*sorted),
+                  snapshot_string_ptr_compare);
         for (int i = 0; rc == 0 && i < snapshot->input.node_count; i++) {
             if (sqlite3_step(stmt) != SQLITE_ROW ||
                 strcmp((const char *)sqlite3_column_text(stmt, 0), sorted[i]) != 0) {

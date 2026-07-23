@@ -528,8 +528,10 @@ cbm_zova_catalog_t *cbm_zova_catalog_open(const char *path) {
         cbm_zova_catalog_close(catalog);
         return NULL;
     }
-    qsort(catalog->projects, (size_t)catalog->count, sizeof(*catalog->projects),
-          catalog_project_selector_compare);
+    if (catalog->count > 1) {
+        qsort(catalog->projects, (size_t)catalog->count, sizeof(*catalog->projects),
+              catalog_project_selector_compare);
+    }
     return catalog;
 error:
     (void)zova_statement_finalize(statement);
@@ -963,7 +965,10 @@ int cbm_zova_catalog_search(cbm_zova_catalog_t *catalog,
         cbm_store_search_free(&local);
     }
 
-    qsort(combined, (size_t)combined_count, sizeof(*combined), catalog_search_result_compare);
+    if (combined_count > 1) {
+        qsort(combined, (size_t)combined_count, sizeof(*combined),
+              catalog_search_result_compare);
+    }
     int limit = params->limit > 0 ? params->limit : 10;
     int available = params->offset < combined_count ? combined_count - params->offset : 0;
     int page_count = available < limit ? available : limit;

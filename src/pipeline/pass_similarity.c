@@ -149,7 +149,9 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
         }
     }
     /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. */
-    qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
+    if (count > 1) {
+        qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
+    }
     *out_entries = entries;
     return count;
 }

@@ -278,8 +278,10 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
                              /* itoa via thread-local buffer would be tidier; keep simple */
                              "256_of_more");
             }
-            qsort(map->entries, (size_t)map->count, sizeof(cbm_path_alias_t),
-                  cmp_alias_entry_by_specificity);
+            if (map->count > 1) {
+                qsort(map->entries, (size_t)map->count, sizeof(cbm_path_alias_t),
+                      cmp_alias_entry_by_specificity);
+            }
         }
     }
 
@@ -484,8 +486,10 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         return NULL;
     }
 
-    qsort(coll->scopes, (size_t)coll->count, sizeof(cbm_path_alias_scope_t),
-          cmp_scope_by_specificity);
+    if (coll->count > 1) {
+        qsort(coll->scopes, (size_t)coll->count, sizeof(cbm_path_alias_scope_t),
+              cmp_scope_by_specificity);
+    }
     return coll;
 }
 

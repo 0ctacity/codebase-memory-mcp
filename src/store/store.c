@@ -1585,7 +1585,9 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
             nodes[i] = search.results[i].node;
             memset(&search.results[i].node, 0, sizeof(search.results[i].node));
         }
-        qsort(nodes, (size_t)search.count, sizeof(*nodes), node_public_order_compare);
+        if (search.count > 1) {
+            qsort(nodes, (size_t)search.count, sizeof(*nodes), node_public_order_compare);
+        }
         *out = nodes;
         *count = search.count;
         cbm_store_search_free(&search);
@@ -5849,7 +5851,9 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
         for (int c = 0; c < C; c++) {
             rank[c] = (cluster_rank_t){c, members[c]};
         }
-        qsort(rank, (size_t)C, sizeof(cluster_rank_t), cluster_rank_cmp);
+        if (C > 1) {
+            qsort(rank, (size_t)C, sizeof(cluster_rank_t), cluster_rank_cmp);
+        }
 
         cbm_cluster_info_t *clusters =
             malloc((size_t)CBM_CLUSTER_TOP_N * sizeof(cbm_cluster_info_t));
@@ -7714,7 +7718,9 @@ int cbm_store_zova_multi_vector_search(
         cbm_store_free_vector_results(combined, combined_count);
         return rc;
     }
-    qsort(combined, (size_t)combined_count, sizeof(*combined), multi_vector_result_compare);
+    if (combined_count > 1) {
+        qsort(combined, (size_t)combined_count, sizeof(*combined), multi_vector_result_compare);
+    }
     int start = offset < combined_count ? offset : combined_count;
     int end = start + limit < combined_count ? start + limit : combined_count;
     int page_count = end - start;

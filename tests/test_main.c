@@ -283,13 +283,12 @@ int main(int argc, char **argv) {
      * binary as `<self> cli --index-worker …` and recursively re-run suites.
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
-
     g_suite_argc = argc;
     g_suite_argv = argv;
     printf("\n  codebase-memory-mcp  C test suite\n");
 
 #if defined(CBM_TEST_RUNNER_ZOVA)
-    RUN_SELECTED_SUITE(zova_migration);
+    RUN_EXPLICIT_SUITE(zova_migration);
     RUN_SELECTED_SUITE(zova_operations);
     RUN_SELECTED_SUITE(zova);
     RUN_EXPLICIT_SUITE(zova_normalization_benchmark);
@@ -348,7 +347,7 @@ int main(int argc, char **argv) {
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);
 
-    RUN_SELECTED_SUITE(zova_migration);
+    RUN_EXPLICIT_SUITE(zova_migration);
     RUN_SELECTED_SUITE(zova_operations);
 
     /* MCP Server (M9) */
