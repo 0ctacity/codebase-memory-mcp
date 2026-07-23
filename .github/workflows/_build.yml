@@ -131,10 +131,29 @@ jobs:
       - uses: ./.github/actions/setup-zova
         with:
           target: ${{ matrix.zig_target }}
+      - name: Build CBM Zig support for Windows
+        env:
+          TARGET: ${{ matrix.zig_target }}
+        run: |
+          set -euo pipefail
+          mkdir -p .ci/windows-zig "$RUNNER_TEMP/cbm-zig-local" "$RUNNER_TEMP/cbm-zig-global"
+          zig build-lib -static -O ReleaseFast -lc -fcompiler-rt -target "$TARGET" \
+            --cache-dir "$RUNNER_TEMP/cbm-zig-local" \
+            --global-cache-dir "$RUNNER_TEMP/cbm-zig-global" \
+            -femit-bin=.ci/windows-zig/libcbm_cli_zig.a \
+            src/cli_zig/cbm_cli_zig.zig
+          zig build-obj -O ReleaseFast -lc -target "$TARGET" \
+            --cache-dir "$RUNNER_TEMP/cbm-zig-local" \
+            --global-cache-dir "$RUNNER_TEMP/cbm-zig-global" \
+            -Isrc -Ivendored/sqlite3 \
+            -femit-bin=.ci/windows-zig/cbm_zova_bridge.o \
+            --dep zova -Mroot=src/zova/cbm_zova_bridge.zig \
+            -Isrc -Ivendored/sqlite3 -Mzova="$ZOVA_ROOT/src/root.zig"
+          cp "$ZOVA_ROOT/zig-out/lib/libzova_c.a" .ci/windows-zig/
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: zova-windows-${{ matrix.arch }}
-          path: .ci/zova/zig-out/lib/libzova_c.a
+          path: .ci/windows-zig/*
           if-no-files-found: error
 
   windows:
@@ -147,12 +166,10 @@ jobs:
             arch: amd64
             msystem: CLANG64
             package_arch: x86_64
-            zig_target: x86_64-windows-gnu
           - runner: windows-11-arm
             arch: arm64
             msystem: CLANGARM64
             package_arch: aarch64
-            zig_target: aarch64-windows-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     steps:
@@ -172,9 +189,6 @@ jobs:
       - name: Install Bun
         shell: msys2 {0}
         run: npm install --global bun@1.3.14
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: ata-sesli/zova
@@ -184,12 +198,16 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: zova-windows-${{ matrix.arch }}
-          path: .ci/zova/zig-out/lib
+          path: .ci/windows-zig
       - name: Verify cross-built Zova
         shell: msys2 {0}
         run: |
-          test -f .ci/zova/zig-out/lib/libzova_c.a
+          test -f .ci/windows-zig/libzova_c.a
+          test -f .ci/windows-zig/libcbm_cli_zig.a
+          test -f .ci/windows-zig/cbm_zova_bridge.o
           grep -q 'Zova C ABI, v0.24.0 pre-1.0' .ci/zova/include/zova.h
+          mkdir -p .ci/zova/zig-out/lib
+          cp .ci/windows-zig/libzova_c.a .ci/zova/zig-out/lib/
           ZOVA_ROOT_PATH=$(cygpath -m "$GITHUB_WORKSPACE/.ci/zova")
           {
             echo "ZOVA_ROOT=$ZOVA_ROOT_PATH"
@@ -200,10 +218,8 @@ jobs:
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
-          ZIG_TARGET: ${{ matrix.zig_target }}
-          ZIG_GLOBAL_CACHE_DIR: build/c/zig-global-cache
-          ZIG_LOCAL_CACHE_DIR: build/c/zig-local-cache
-        run: scripts/build.sh --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
+          CBM_PREBUILT_ZIG_DIR: .ci/windows-zig
+        run: scripts/build.sh --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
       - name: Verify and archive standard binary
         shell: msys2 {0}
         env:
@@ -222,10 +238,8 @@ jobs:
         shell: msys2 {0}
         env:
           VERSION: ${{ inputs.version }}
-          ZIG_TARGET: ${{ matrix.zig_target }}
-          ZIG_GLOBAL_CACHE_DIR: build/c/zig-global-cache
-          ZIG_LOCAL_CACHE_DIR: build/c/zig-local-cache
-        run: scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
+          CBM_PREBUILT_ZIG_DIR: .ci/windows-zig
+        run: scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT"
       - name: Verify and archive UI binary
         shell: msys2 {0}
         env:
