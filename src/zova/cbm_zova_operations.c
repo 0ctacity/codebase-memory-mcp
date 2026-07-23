@@ -178,13 +178,13 @@ static int operations_path_is_regular_nosymlink(const char *path) {
 #ifdef _WIN32
     return stat(path, &value) == 0 && S_ISREG(value.st_mode);
 #else
-    return lstat(path, &value) == 0 && S_ISREG(value.st_mode) && !S_ISLNK(value.st_mode);
+    return cbm_lstat(path, &value) == 0 && S_ISREG(value.st_mode) && !S_ISLNK(value.st_mode);
 #endif
 }
 
 static int operations_restore_path_state(const char *path) {
     struct stat value;
-    if (lstat(path, &value) != 0) return 0;
+    if (cbm_lstat(path, &value) != 0) return 0;
 #ifdef _WIN32
     return S_ISREG(value.st_mode) ? 1 : -1;
 #else
@@ -608,7 +608,7 @@ static int operations_generation_matches(
 static int operations_verify_archive(const char *archive, const char *live_path,
                                      operations_archive_manifest_t *out) {
     struct stat value;
-    if (lstat(archive, &value) != 0 || !S_ISDIR(value.st_mode)
+    if (cbm_lstat(archive, &value) != 0 || !S_ISDIR(value.st_mode)
 #ifndef _WIN32
         || S_ISLNK(value.st_mode)
 #endif
@@ -705,7 +705,7 @@ static int operations_verify_archive(const char *archive, const char *live_path,
 static int operations_verify_workspace_archive(const char *archive, const char *live_path,
                                                operations_archive_manifest_t *out) {
     struct stat value;
-    if (lstat(archive, &value) != 0 || !S_ISDIR(value.st_mode)
+    if (cbm_lstat(archive, &value) != 0 || !S_ISDIR(value.st_mode)
 #ifndef _WIN32
         || S_ISLNK(value.st_mode)
 #endif
@@ -817,7 +817,7 @@ cbm_zova_operation_code_t cbm_zova_database_status(
         operations_report(out, CBM_ZOVA_OPERATION_INVALID, "status", "path_too_long");
         return CBM_ZOVA_OPERATION_INVALID;
     }
-    if (lstat(wal_path, &wal_stat) == 0) {
+    if (cbm_lstat(wal_path, &wal_stat) == 0) {
         if (!operations_path_is_regular_nosymlink(wal_path) || wal_stat.st_size < 0) {
             operations_report(out, CBM_ZOVA_OPERATION_INVALID, "status", "wal_not_regular");
             return CBM_ZOVA_OPERATION_INVALID;
@@ -1745,7 +1745,7 @@ cbm_zova_operation_code_t cbm_zova_database_backup(
     struct stat source_stat;
     struct stat destination_stat;
     if (!operations_path_is_regular_nosymlink(source_path) ||
-        lstat(destination_path, &destination_stat) == 0) {
+        cbm_lstat(destination_path, &destination_stat) == 0) {
         return CBM_ZOVA_OPERATION_INVALID;
     }
 
@@ -1913,12 +1913,12 @@ cbm_zova_operation_code_t cbm_zova_database_export(
         operations_parent_directory(archive_directory, parent, sizeof(parent)) != 0)
         return CBM_ZOVA_OPERATION_INVALID;
     struct stat value;
-    if (lstat(archive_directory, &value) == 0) return CBM_ZOVA_OPERATION_INVALID;
-    if (lstat(partial, &value) == 0) {
+    if (cbm_lstat(archive_directory, &value) == 0) return CBM_ZOVA_OPERATION_INVALID;
+    if (cbm_lstat(partial, &value) == 0) {
         operations_report(out, CBM_ZOVA_OPERATION_BUSY, "export_database", "partial_exists");
         return CBM_ZOVA_OPERATION_BUSY;
     }
-    if (mkdir(partial, 0700) != 0) return CBM_ZOVA_OPERATION_INVALID;
+    if (cbm_mkdir_mode(partial, 0700) != 0) return CBM_ZOVA_OPERATION_INVALID;
     struct timespec started = {0}, finished = {0};
     cbm_clock_gettime(CLOCK_MONOTONIC, &started);
     cbm_zova_operation_report_t backup = {0};
@@ -1971,7 +1971,7 @@ cbm_zova_operation_code_t cbm_zova_database_import(
     return CBM_ZOVA_OPERATION_INCOMPATIBLE;
 #else
     struct stat value;
-    if (lstat(archive_directory, &value) != 0 || !S_ISDIR(value.st_mode)
+    if (cbm_lstat(archive_directory, &value) != 0 || !S_ISDIR(value.st_mode)
 #ifndef _WIN32
         || S_ISLNK(value.st_mode)
 #endif
@@ -2028,16 +2028,16 @@ cbm_zova_operation_code_t cbm_zova_workspace_export(
         snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.json", partial) >=
             (int)sizeof(manifest_path) ||
         operations_parent_directory(archive_directory, parent, sizeof(parent)) != 0 ||
-        lstat(archive_directory, &value) == 0) {
+        cbm_lstat(archive_directory, &value) == 0) {
         code = CBM_ZOVA_OPERATION_INVALID;
         goto done;
     }
-    if (lstat(partial, &value) == 0) {
+    if (cbm_lstat(partial, &value) == 0) {
         operations_report(out, CBM_ZOVA_OPERATION_BUSY, "export_workspace", "partial_exists");
         code = CBM_ZOVA_OPERATION_BUSY;
         goto done;
     }
-    if (mkdir(partial, 0700) != 0) {
+    if (cbm_mkdir_mode(partial, 0700) != 0) {
         code = CBM_ZOVA_OPERATION_INVALID;
         goto done;
     }

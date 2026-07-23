@@ -71,9 +71,20 @@ char *cbm_strcasestr(const char *haystack, const char *needle);
 #ifdef _WIN32
 #include <direct.h>
 #define cbm_mkdir(path) _mkdir(path)
+#define cbm_mkdir_mode(path, mode) ((void)(mode), _mkdir((path)))
 #else
 #include <sys/stat.h>
 #define cbm_mkdir(path) mkdir(path, 0755)
+#define cbm_mkdir_mode(path, mode) mkdir((path), (mode))
+#endif
+
+/* ── lstat portability ───────────────────────────────────────── */
+#ifdef _WIN32
+/* Windows stat follows reparse points; this matches the existing Windows
+ * behavior of callers that cannot use POSIX lstat. */
+#define cbm_lstat(path, out) stat((path), (out))
+#else
+#define cbm_lstat(path, out) lstat((path), (out))
 #endif
 
 /* ── clock_gettime / nanosleep (Windows lacks them) ──────────── */

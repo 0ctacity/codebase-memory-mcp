@@ -2753,7 +2753,7 @@ int cbm_cli_zova_migration_discover(const char *canonical_root, char *source_db,
         int n = snprintf(candidate, sizeof(candidate), "%s/%s", cache, entry->name);
         struct stat candidate_stat;
         if (n <= 0 || (size_t)n >= sizeof(candidate) ||
-            lstat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode) ||
+            cbm_lstat(candidate, &candidate_stat) != 0 || !S_ISREG(candidate_stat.st_mode) ||
             !cli_zova_db_matches_root(candidate, canonical_root))
             continue;
         matches++;

@@ -81,6 +81,23 @@ grep -q 'softprops/action-gh-release@' "$WORKFLOWS/release.yml"
 grep -q 'pattern: release-\*' "$WORKFLOWS/release.yml"
 grep -q 'checksums.txt' "$WORKFLOWS/release.yml"
 
+grep -q '#define cbm_lstat' "$ROOT/src/foundation/compat.h"
+grep -q '#define cbm_mkdir_mode' "$ROOT/src/foundation/compat.h"
+for path in \
+  "$ROOT/src/store/store.c" \
+  "$ROOT/src/zova/cbm_zova_operations.c" \
+  "$ROOT/src/zova/cbm_zova_migration.c" \
+  "$ROOT/src/cli/cli.c"; do
+  if rg -n '\blstat\(' "$path"; then
+    echo "error: $path bypasses the Windows-compatible cbm_lstat wrapper" >&2
+    exit 1
+  fi
+done
+if rg -n '\bmkdir\([^,]+,' "$ROOT/src/zova/cbm_zova_operations.c"; then
+  echo "error: Zova operations bypasses the Windows-compatible mkdir wrapper" >&2
+  exit 1
+fi
+
 if rg -n -i \
     'npm publish|twine upload|mcp-publisher|pypi|registry\.npmjs|virus.?total|deusdata|brew tap|deploy-pages|stale@|issue-labeler|label-actions|scorecard' \
     "$WORKFLOWS" "$ROOT/.github/actions"; then

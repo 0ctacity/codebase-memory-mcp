@@ -1,6 +1,7 @@
 #include "zova/cbm_zova_migration.h"
 #include "zova/cbm_zova_legacy_snapshot.h"
 #include "zova/cbm_zova_writer_gate.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
 #include <stddef.h>
@@ -51,7 +52,7 @@ static int migration_cleanup_member_safe(const char *path, int required) {
 #ifdef _WIN32
     int rc = stat(path, &st);
 #else
-    int rc = lstat(path, &st);
+    int rc = cbm_lstat(path, &st);
 #endif
     if (rc != 0) return required ? -1 : 0;
     return S_ISREG(st.st_mode) && st.st_nlink == 1 ? 0 : -1;
@@ -70,7 +71,7 @@ static int migration_cleanup_parent_components_safe(const char *path) {
         if (*cursor != '/') continue;
         *cursor = '\0';
         struct stat st;
-        int rc = lstat(component, &st);
+        int rc = cbm_lstat(component, &st);
         *cursor = '/';
         if (rc != 0 || !S_ISDIR(st.st_mode) || S_ISLNK(st.st_mode)) return -1;
     }
@@ -147,7 +148,9 @@ static int migration_cleanup_quarantine_allowlisted(const char *directory,
         char path[2048];
         struct stat st;
         snprintf(path, sizeof(path), "%s/%s", directory, entry->d_name);
-        if (!allowed || lstat(path, &st) != 0 || !S_ISREG(st.st_mode) || st.st_nlink != 1) ok = 0;
+        if (!allowed || cbm_lstat(path, &st) != 0 || !S_ISREG(st.st_mode) ||
+            st.st_nlink != 1)
+            ok = 0;
     }
     closedir(dir);
     return ok ? 0 : -1;
@@ -346,7 +349,7 @@ static int migration_cleanup_marker_write(const char *marker, const char *worksp
 
 static int migration_cleanup_marker_remove(const char *marker, const char *source_directory) {
     struct stat marker_stat;
-    if (lstat(marker, &marker_stat) != 0) return errno == ENOENT ? 0 : -1;
+    if (cbm_lstat(marker, &marker_stat) != 0) return errno == ENOENT ? 0 : -1;
     return remove(marker) == 0 && migration_cleanup_sync_directory(source_directory) == 0 ? 0
                                                                                           : -1;
 }
@@ -1006,9 +1009,9 @@ cbm_zova_migration_code_t cbm_zova_migration_cleanup(
     }
     char retired_root[2048];
     snprintf(retired_root, sizeof(retired_root), "%s/.zova-retired", source_dir);
-    struct stat retired_root_stat;
 #ifndef _WIN32
-    if (lstat(retired_root, &retired_root_stat) == 0 &&
+    struct stat retired_root_stat;
+    if (cbm_lstat(retired_root, &retired_root_stat) == 0 &&
         (!S_ISDIR(retired_root_stat.st_mode) || retired_root_stat.st_dev != source_db_stat.st_dev)) {
         code = CBM_ZOVA_MIGRATION_CLEANUP_REFUSED;
         goto cleanup_done;

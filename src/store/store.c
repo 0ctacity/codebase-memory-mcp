@@ -694,7 +694,7 @@ static bool store_cleanup_pending(const char *db_path) {
     int n = snprintf(marker, sizeof(marker), "%s.cbm-cleanup-pending", db_path ? db_path : "");
     if (n <= 0 || (size_t)n >= sizeof(marker)) return false;
     struct stat marker_stat;
-    return lstat(marker, &marker_stat) == 0;
+    return cbm_lstat(marker, &marker_stat) == 0;
 }
 
 cbm_store_t *cbm_store_open_path(const char *db_path) {
