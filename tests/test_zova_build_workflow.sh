@@ -12,7 +12,8 @@ cat > "$RUNNER" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> "${CBM_ZOVA_TEST_RUNNER_LOG:?}"
-printf 'HOME=%s\nCBM_CACHE_DIR=%s\n' "$HOME" "${CBM_CACHE_DIR-}" >> "${CBM_ZOVA_TEST_ENV_LOG:?}"
+printf 'HOME=%s\nCBM_CACHE_DIR=%s\nCBM_ZOVA_MODE=%s\n' \
+  "$HOME" "${CBM_CACHE_DIR-}" "${CBM_ZOVA_MODE-}" >> "${CBM_ZOVA_TEST_ENV_LOG:?}"
 EOF
 chmod +x "$RUNNER"
 
@@ -29,12 +30,21 @@ test_home_first=$(sed -n 's/^HOME=//p' "$ENV_LOG" | head -n 1)
 test_home_last=$(sed -n 's/^HOME=//p' "$ENV_LOG" | tail -n 1)
 test_cache_first=$(sed -n 's/^CBM_CACHE_DIR=//p' "$ENV_LOG" | head -n 1)
 test_cache_last=$(sed -n 's/^CBM_CACHE_DIR=//p' "$ENV_LOG" | tail -n 1)
-[[ "$(grep -c '^HOME=' "$ENV_LOG")" -eq 2 ]]
-[[ "$(grep -c '^CBM_CACHE_DIR=' "$ENV_LOG")" -eq 2 ]]
-[[ "$test_home_first" == "$test_home_last" ]]
-[[ "$test_cache_first" == "$test_cache_last" ]]
-[[ "$test_home_first" == "${test_cache_first%/cache}/home" ]]
-[[ "$test_cache_first" == */cache ]]
+test_mode_first=$(sed -n 's/^CBM_ZOVA_MODE=//p' "$ENV_LOG" | head -n 1)
+test_mode_last=$(sed -n 's/^CBM_ZOVA_MODE=//p' "$ENV_LOG" | tail -n 1)
+if [[ "$(grep -c '^HOME=' "$ENV_LOG")" -ne 2 ||
+      "$(grep -c '^CBM_CACHE_DIR=' "$ENV_LOG")" -ne 2 ||
+      "$(grep -c '^CBM_ZOVA_MODE=' "$ENV_LOG")" -ne 2 ||
+      "$test_home_first" != "$test_home_last" ||
+      "$test_cache_first" != "$test_cache_last" ||
+      "$test_cache_first" != "$test_home_first/.cache/codebase-memory-mcp" ]]; then
+  echo "error: test suites did not share one canonical isolated cache" >&2
+  exit 1
+fi
+if [[ -n "$test_mode_first" || "$test_mode_last" != "off" ]]; then
+  echo "error: test suite mode routing did not preserve Zova authority and SQLite compatibility" >&2
+  exit 1
+fi
 if [[ -e "$test_home_first" || -e "$test_cache_first" ]]; then
   echo "error: isolated test environment was not cleaned" >&2
   exit 1
