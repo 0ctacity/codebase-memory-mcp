@@ -183,6 +183,7 @@ fn addTestRunner(
         .flags = flags(b, cfg, .tests, .normal),
     });
     module.linkLibrary(test_support);
+    addZovaRuntimeArchive(b, module, cfg);
     const exe = b.addExecutable(.{
         .name = "test-runner",
         .root_module = module,
@@ -208,6 +209,7 @@ fn addFocusedTestRunner(
         .flags = flags(b, cfg, .tests, .normal),
     });
     module.linkLibrary(test_support);
+    addZovaRuntimeArchive(b, module, cfg);
     const name = b.fmt("test-runner-{s}", .{group});
     const exe = b.addExecutable(.{
         .name = name,
@@ -339,7 +341,7 @@ fn addNativeSources(
     module: *std.Build.Module,
     cfg: Config,
     kind: BuildKind,
-    include_tests: bool,
+    defer_zova_runtime: bool,
     with_ui_assets: bool,
 ) void {
     module.addCSourceFile(.{ .file = b.path("vendored/mimalloc/src/static.c"), .flags = flags(b, cfg, kind, .mimalloc) });
@@ -361,17 +363,22 @@ fn addNativeSources(
     module.addCSourceFiles(.{ .files = uiSources(with_ui_assets), .flags = flags(b, cfg, kind, .normal) });
 
     if (cfg.with_zova) {
-        module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ cfg.zova_root, "zig-out/lib/libzova_c.a" }) });
+        if (!defer_zova_runtime) {
+            addZovaRuntimeArchive(b, module, cfg);
+        }
         const bridge = addZovaBridgeObject(b, cfg);
         module.addObject(bridge);
     }
 
     const cli_zig = addCliZigLibrary(b, cfg);
     module.linkLibrary(cli_zig);
+}
 
-    if (include_tests) {
-        module.addCSourceFiles(.{ .files = &.{}, .flags = &.{} });
-    }
+fn addZovaRuntimeArchive(b: *std.Build, module: *std.Build.Module, cfg: Config) void {
+    if (!cfg.with_zova) return;
+    module.addObjectFile(.{
+        .cwd_relative = b.pathJoin(&.{ cfg.zova_root, "zig-out/lib/libzova_c.a" }),
+    });
 }
 
 fn addCliZigLibrary(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
