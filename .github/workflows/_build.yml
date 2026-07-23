@@ -201,6 +201,8 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           ZIG_TARGET: ${{ matrix.zig_target }}
+          ZIG_GLOBAL_CACHE_DIR: build/c/zig-global-cache
+          ZIG_LOCAL_CACHE_DIR: build/c/zig-local-cache
         run: scripts/build.sh --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
       - name: Verify and archive standard binary
         shell: msys2 {0}
@@ -221,6 +223,8 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
           ZIG_TARGET: ${{ matrix.zig_target }}
+          ZIG_GLOBAL_CACHE_DIR: build/c/zig-global-cache
+          ZIG_LOCAL_CACHE_DIR: build/c/zig-local-cache
         run: scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++ CBM_WITH_ZOVA=1 "ZOVA_ROOT=$ZOVA_ROOT" "ZIG_TARGET_FLAGS=-target $ZIG_TARGET"
       - name: Verify and archive UI binary
         shell: msys2 {0}

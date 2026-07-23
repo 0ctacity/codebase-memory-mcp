@@ -60,7 +60,11 @@ grep -q 'needs: zova-windows' "$WORKFLOWS/_build.yml"
 grep -q 'zova-windows-${{ matrix.arch }}' "$WORKFLOWS/_build.yml"
 grep -q 'ZOVA_ROOT_PATH=$(cygpath -m' "$WORKFLOWS/_build.yml"
 grep -q 'codebase-memory-mcp-windows-' "$WORKFLOWS/_build.yml"
+[[ $(grep -c 'ZIG_GLOBAL_CACHE_DIR: build/c/zig-global-cache' "$WORKFLOWS/_build.yml") -eq 2 ]]
+[[ $(grep -c 'ZIG_LOCAL_CACHE_DIR: build/c/zig-local-cache' "$WORKFLOWS/_build.yml") -eq 2 ]]
 grep -q -- '-fcompiler-rt' "$ROOT/Makefile.cbm"
+grep -Fq 'ZIG_GLOBAL_CACHE_DIR="$(ZIG_GLOBAL_CACHE_DIR)"' "$ROOT/Makefile.cbm"
+grep -Fq 'ZIG_LOCAL_CACHE_DIR="$(ZIG_LOCAL_CACHE_DIR)"' "$ROOT/Makefile.cbm"
 
 BRIDGE="$ROOT/src/zova/cbm_zova_bridge.zig"
 grep -q '@cInclude("foundation/compat_regex.h")' "$BRIDGE"
