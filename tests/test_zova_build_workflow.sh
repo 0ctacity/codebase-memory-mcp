@@ -33,7 +33,7 @@ test_cache_last=$(sed -n 's/^CBM_CACHE_DIR=//p' "$ENV_LOG" | tail -n 1)
 [[ "$(grep -c '^CBM_CACHE_DIR=' "$ENV_LOG")" -eq 2 ]]
 [[ "$test_home_first" == "$test_home_last" ]]
 [[ "$test_cache_first" == "$test_cache_last" ]]
-[[ "$test_home_first" == "$test_cache_first"/home ]]
+[[ "$test_home_first" == "${test_cache_first%/cache}/home" ]]
 [[ "$test_cache_first" == */cache ]]
 if [[ -e "$test_home_first" || -e "$test_cache_first" ]]; then
   echo "error: isolated test environment was not cleaned" >&2
