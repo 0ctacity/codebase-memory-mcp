@@ -32,6 +32,8 @@ grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' \
   "$ROOT/.github/actions/setup-zova/action.yml"
 grep -q "steps.zova-cache.outputs.cache-hit != 'true'" \
   "$ROOT/.github/actions/setup-zova/action.yml"
+grep -q 'cygpath -m' "$ROOT/.github/actions/setup-zova/action.yml"
+grep -q 'zova_c.lib' "$ROOT/.github/actions/setup-zova/action.yml"
 
 grep -q 'pull_request:' "$WORKFLOWS/ci.yml"
 grep -q 'push:' "$WORKFLOWS/ci.yml"
@@ -51,7 +53,14 @@ grep -q 'cbm-with-ui:.*CBM_ZOVA_BRIDGE_LIB' "$ROOT/Makefile.cbm"
 grep -q 'elif.*WITH_ZOVA' "$ROOT/scripts/build.sh"
 grep -q 'codebase-memory-mcp-linux-.*-portable.tar.gz' "$WORKFLOWS/_build.yml"
 grep -q 'os: darwin' "$WORKFLOWS/_build.yml"
+grep -q 'aarch64-macos.15.0' "$WORKFLOWS/_build.yml"
+grep -q 'x86_64-macos.15.0' "$WORKFLOWS/_build.yml"
+grep -q '^  zova-windows:' "$WORKFLOWS/_build.yml"
+grep -q 'needs: zova-windows' "$WORKFLOWS/_build.yml"
+grep -q 'zova-windows-${{ matrix.arch }}' "$WORKFLOWS/_build.yml"
+grep -q 'ZOVA_ROOT_PATH=$(cygpath -m' "$WORKFLOWS/_build.yml"
 grep -q 'codebase-memory-mcp-windows-' "$WORKFLOWS/_build.yml"
+grep -q -- '-fcompiler-rt' "$ROOT/Makefile.cbm"
 
 BRIDGE="$ROOT/src/zova/cbm_zova_bridge.zig"
 grep -q '@cInclude("foundation/compat_regex.h")' "$BRIDGE"
@@ -65,6 +74,7 @@ grep -q -- '-Isrc' "$ROOT/Makefile.cbm"
 grep -q 'workflow_dispatch:' "$WORKFLOWS/release.yml"
 grep -q 'contents: write' "$WORKFLOWS/release.yml"
 grep -q 'softprops/action-gh-release@' "$WORKFLOWS/release.yml"
+grep -q 'pattern: release-\*' "$WORKFLOWS/release.yml"
 grep -q 'checksums.txt' "$WORKFLOWS/release.yml"
 
 if rg -n -i \

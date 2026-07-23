@@ -594,7 +594,8 @@ $(CBM_CLI_ZIG_LIB): $(CBM_CLI_ZIG_SRC) src/cli/cli_zig.h | $(BUILD_DIR)
 	mkdir -p $(ZIG_GLOBAL_CACHE_DIR) $(ZIG_LOCAL_CACHE_DIR)
 	ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR) \
 	ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR) \
-		$(ZIG) build-lib -static -O ReleaseFast -lc $(ZIG_TARGET_FLAGS) -femit-bin=$@ $<
+		$(ZIG) build-lib -static -O ReleaseFast -lc -fcompiler-rt $(ZIG_TARGET_FLAGS) \
+			-femit-bin=$@ $<
 
 $(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bridge.h src/foundation/compat_regex.h $(ZOVA_LIB) $(ZOVA_ROOT)/src/root.zig | $(BUILD_DIR)
 	@command -v $(ZIG) >/dev/null 2>&1 || { \
@@ -694,9 +695,9 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
-		$(CBM_CLI_ZIG_LIB) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(ZOVA_LINK_LIBS) \
+		$(CBM_CLI_ZIG_LIB) \
 		$(LDFLAGS_TEST)
 
 test:
@@ -756,9 +757,9 @@ $(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRC
 		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
-		$(CBM_CLI_ZIG_LIB) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(ZOVA_LINK_LIBS) \
+		$(CBM_CLI_ZIG_LIB) \
 		$(LDFLAGS_TEST)
 
 test-repro: $(BUILD_DIR)/test-repro-runner
@@ -810,9 +811,9 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
-		$(CBM_CLI_ZIG_LIB) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(ZOVA_LINK_LIBS) \
+		$(CBM_CLI_ZIG_LIB) \
 		$(LDFLAGS)
 
 cbm:
@@ -839,9 +840,9 @@ cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(CBM_CLI_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LI
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_PROD) \
 		$(wildcard $(BUILD_DIR)/embedded/embed_*.o) \
-		$(CBM_CLI_ZIG_LIB) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(ZOVA_LINK_LIBS) \
+		$(CBM_CLI_ZIG_LIB) \
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
 

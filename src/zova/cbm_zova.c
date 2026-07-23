@@ -1223,68 +1223,122 @@ static int graph_adjacency_append_payload(
     return 0;
 }
 
-int cbm_zova_graph_session_adjacency(cbm_zova_graph_session_t *session,const char *workspace_id,
-    const char *graph_name,const char *node_id,const char *direction,
-    const char *const *edge_types,int edge_type_count,int max_results,
-    cbm_zova_graph_adjacency_t **out,int *out_count){
-    if(out)*out=NULL;if(out_count)*out_count=0;
-    char expected[CBM_ZOVA_WORKSPACE_ID_MAX+32];
-    if(!session||!workspace_name_component_valid(workspace_id)||
-       cbm_zova_workspace_graph_name(workspace_id,expected,sizeof(expected))!=0||
-       !graph_name||strcmp(graph_name,expected)!=0||!node_id||!node_id[0]||!direction||
-       edge_type_count<0||(edge_type_count&& !edge_types)||max_results<=0||!out||!out_count)return -1;
-    int dirs[2],nd=0;if(strcmp(direction,"outbound")==0||strcmp(direction,"both")==0)dirs[nd++]=ZOVA_GRAPH_NEIGHBOR_OUTGOING;
-    if(strcmp(direction,"inbound")==0||strcmp(direction,"both")==0)dirs[nd++]=ZOVA_GRAPH_NEIGHBOR_INCOMING;
-    if(!nd)return -1;int loops=edge_type_count?edge_type_count:1,cap=8,count=0,rc=0;
-    cbm_zova_graph_adjacency_t *items=calloc((size_t)cap,sizeof(*items));if(!items)return -1;
-    for(int d=0;rc==0&&d<nd;d++)for(int t=0;rc==0&&t<loops;t++){
-        zova_graph_keyed_neighbor_results results={0};
-        zova_graph_neighbors_keyed_request req={.db=session->zdb.db,.graph_name=graph_name,.node_id=node_id,
-            .direction=dirs[d],.edge_type=edge_type_count?edge_types[t]:NULL,
-            .limit=(size_t)(max_results-count),.out_results=&results};
-        if(status_ok(zova_graph_neighbors_keyed(&req),session->zdb.db,"graph.adjacency")!=0)rc=-1;
-        int64_t *edge_keys=results.len?calloc(results.len,sizeof(*edge_keys)):NULL;
-        zova_graph_edge_payload_results payloads={0};
-        if(rc==0&&results.len&&!edge_keys)rc=-1;
-        for(size_t i=0;rc==0&&i<results.len;i++)edge_keys[i]=results.items[i].edge_key;
-        if(rc==0&&results.len)rc=status_ok(zova_graph_edge_payload_get_many(
-            &(zova_graph_edge_payload_get_many_request){.db=session->zdb.db,
-                .graph_name=graph_name,.edge_keys=edge_keys,.key_count=results.len,
-                .out_results=&payloads}),session->zdb.db,"graph.adjacency.payloads");
-        if(rc==0&&payloads.len!=results.len)rc=-1;
-        for(size_t i=0;rc==0&&i<results.len&&count<max_results;i++){
-            const char *src=dirs[d]==ZOVA_GRAPH_NEIGHBOR_OUTGOING?node_id:results.items[i].node_id;
-            const char *dst=dirs[d]==ZOVA_GRAPH_NEIGHBOR_OUTGOING?results.items[i].node_id:node_id;
-            if(!payloads.items[i].found||payloads.items[i].edge_key!=results.items[i].edge_key){rc=-1;break;}
-            graph_adjacency_payload_context_t context={.items=&items,.count=&count,
-                .capacity=&cap,.max_results=max_results,.source=src,.target=dst,
-                .edge_type=results.items[i].edge_type,
-                .edge_type_len=results.items[i].edge_type_len};
-            if(cbm_zova_edge_payload_visit(payloads.items[i].payload,
-                    payloads.items[i].payload_len,graph_adjacency_append_payload,
-                    &context,NULL)!=0)rc=-1;
+int cbm_zova_graph_session_adjacency(
+    cbm_zova_graph_session_t *session, const char *workspace_id, const char *graph_name,
+    const char *node_id, const char *direction, const char *const *edge_types,
+    int edge_type_count, int max_results, cbm_zova_graph_adjacency_t **out, int *out_count) {
+    if (out) *out = NULL;
+    if (out_count) *out_count = 0;
+    char expected[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    if (!session || !workspace_name_component_valid(workspace_id) ||
+        cbm_zova_workspace_graph_name(workspace_id, expected, sizeof(expected)) != 0 ||
+        !graph_name || strcmp(graph_name, expected) != 0 || !node_id || !node_id[0] ||
+        !direction || edge_type_count < 0 || (edge_type_count && !edge_types) ||
+        max_results <= 0 || !out || !out_count)
+        return -1;
+    int dirs[2], nd = 0;
+    if (strcmp(direction, "outbound") == 0 || strcmp(direction, "both") == 0)
+        dirs[nd++] = ZOVA_GRAPH_NEIGHBOR_OUTGOING;
+    if (strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0)
+        dirs[nd++] = ZOVA_GRAPH_NEIGHBOR_INCOMING;
+    if (!nd) return -1;
+    int loops = edge_type_count ? edge_type_count : 1, cap = 8, count = 0, rc = 0;
+    cbm_zova_graph_adjacency_t *items = calloc((size_t)cap, sizeof(*items));
+    if (!items) return -1;
+    for (int d = 0; rc == 0 && d < nd; d++)
+        for (int t = 0; rc == 0 && t < loops; t++) {
+            zova_graph_keyed_neighbor_results results = {0};
+            zova_graph_neighbors_keyed_request req = {
+                .db = session->zdb.db, .graph_name = graph_name, .node_id = node_id,
+                .direction = dirs[d], .edge_type = edge_type_count ? edge_types[t] : NULL,
+                .limit = (size_t)(max_results - count), .out_results = &results};
+            if (status_ok(zova_graph_neighbors_keyed(&req), session->zdb.db,
+                          "graph.adjacency") != 0)
+                rc = -1;
+            int64_t *edge_keys =
+                results.len ? calloc(results.len, sizeof(*edge_keys)) : NULL;
+            zova_graph_edge_payload_results payloads = {0};
+            if (rc == 0 && results.len && !edge_keys) rc = -1;
+            for (size_t i = 0; rc == 0 && i < results.len; i++)
+                edge_keys[i] = results.items[i].edge_key;
+            if (rc == 0 && results.len)
+                rc = status_ok(
+                    zova_graph_edge_payload_get_many(
+                        &(zova_graph_edge_payload_get_many_request){
+                            .db = session->zdb.db, .graph_name = graph_name,
+                            .edge_keys = edge_keys, .key_count = results.len,
+                            .out_results = &payloads}),
+                    session->zdb.db, "graph.adjacency.payloads");
+            if (rc == 0 && payloads.len != results.len) rc = -1;
+            for (size_t i = 0; rc == 0 && i < results.len && count < max_results; i++) {
+                const char *src = dirs[d] == ZOVA_GRAPH_NEIGHBOR_OUTGOING
+                                      ? node_id
+                                      : results.items[i].node_id;
+                const char *dst = dirs[d] == ZOVA_GRAPH_NEIGHBOR_OUTGOING
+                                      ? results.items[i].node_id
+                                      : node_id;
+                if (!payloads.items[i].found ||
+                    payloads.items[i].edge_key != results.items[i].edge_key) {
+                    rc = -1;
+                    break;
+                }
+                graph_adjacency_payload_context_t context = {
+                    .items = &items, .count = &count, .capacity = &cap,
+                    .max_results = max_results, .source = src, .target = dst,
+                    .edge_type = results.items[i].edge_type,
+                    .edge_type_len = results.items[i].edge_type_len};
+                if (cbm_zova_edge_payload_visit(
+                        payloads.items[i].payload, payloads.items[i].payload_len,
+                        graph_adjacency_append_payload, &context, NULL) != 0)
+                    rc = -1;
+            }
+            free(edge_keys);
+            zova_graph_edge_payload_results_free(&payloads);
+            zova_graph_keyed_neighbor_results_free(&results);
         }
-        free(edge_keys);zova_graph_edge_payload_results_free(&payloads);
-        zova_graph_keyed_neighbor_results_free(&results);
+    if (rc) {
+        cbm_zova_graph_adjacency_free(items, count + 1);
+        return -1;
     }
-    if(rc){cbm_zova_graph_adjacency_free(items,count+1);return -1;}*out=items;*out_count=count;return 0;
+    *out = items;
+    *out_count = count;
+    return 0;
 }
 
-int cbm_zova_graph_session_degree(cbm_zova_graph_session_t *session,const char *workspace_id,
-    const char *graph_name,const char *node_id,const char *direction,
-    const char *const *edge_types,int edge_type_count,int *out_degree){
-    if(!out_degree)return -1;*out_degree=0;char expected[CBM_ZOVA_WORKSPACE_ID_MAX+32];
-    if(!session||cbm_zova_workspace_graph_name(workspace_id,expected,sizeof(expected))!=0||
-       !graph_name||strcmp(graph_name,expected)!=0||!node_id||!direction||edge_type_count<0||
-       (edge_type_count&&!edge_types))return -1;
-    int dirs[2],nd=0;if(strcmp(direction,"outbound")==0||strcmp(direction,"both")==0)dirs[nd++]=ZOVA_GRAPH_NEIGHBOR_OUTGOING;
-    if(strcmp(direction,"inbound")==0||strcmp(direction,"both")==0)dirs[nd++]=ZOVA_GRAPH_NEIGHBOR_INCOMING;if(!nd)return -1;
-    int loops=edge_type_count?edge_type_count:1;uint64_t total=0;
-    for(int d=0;d<nd;d++)for(int t=0;t<loops;t++){uint64_t degree=0;
-        zova_graph_degree_request req={.db=session->zdb.db,.graph_name=graph_name,.node_id=node_id,
-            .direction=dirs[d],.edge_type=edge_type_count?edge_types[t]:NULL,.out_degree=&degree};
-        if(status_ok(zova_graph_degree(&req),session->zdb.db,"graph.degree")!=0||degree>(uint64_t)INT_MAX-total)return -1;total+=degree;}
-    *out_degree=(int)total;return 0;
+int cbm_zova_graph_session_degree(
+    cbm_zova_graph_session_t *session, const char *workspace_id, const char *graph_name,
+    const char *node_id, const char *direction, const char *const *edge_types,
+    int edge_type_count, int *out_degree) {
+    if (!out_degree) return -1;
+    *out_degree = 0;
+    char expected[CBM_ZOVA_WORKSPACE_ID_MAX + 32];
+    if (!session ||
+        cbm_zova_workspace_graph_name(workspace_id, expected, sizeof(expected)) != 0 ||
+        !graph_name || strcmp(graph_name, expected) != 0 || !node_id || !direction ||
+        edge_type_count < 0 || (edge_type_count && !edge_types))
+        return -1;
+    int dirs[2], nd = 0;
+    if (strcmp(direction, "outbound") == 0 || strcmp(direction, "both") == 0)
+        dirs[nd++] = ZOVA_GRAPH_NEIGHBOR_OUTGOING;
+    if (strcmp(direction, "inbound") == 0 || strcmp(direction, "both") == 0)
+        dirs[nd++] = ZOVA_GRAPH_NEIGHBOR_INCOMING;
+    if (!nd) return -1;
+    int loops = edge_type_count ? edge_type_count : 1;
+    uint64_t total = 0;
+    for (int d = 0; d < nd; d++)
+        for (int t = 0; t < loops; t++) {
+            uint64_t degree = 0;
+            zova_graph_degree_request req = {
+                .db = session->zdb.db, .graph_name = graph_name, .node_id = node_id,
+                .direction = dirs[d], .edge_type = edge_type_count ? edge_types[t] : NULL,
+                .out_degree = &degree};
+            if (status_ok(zova_graph_degree(&req), session->zdb.db, "graph.degree") != 0 ||
+                degree > (uint64_t)INT_MAX - total)
+                return -1;
+            total += degree;
+        }
+    *out_degree = (int)total;
+    return 0;
 }
 
 int cbm_zova_graph_session_adjacency_prepare_count(

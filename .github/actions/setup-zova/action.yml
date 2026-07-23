@@ -39,16 +39,29 @@ runs:
         TARGET: ${{ inputs.target }}
       run: |
         set -euo pipefail
+        CACHE_ROOT="$RUNNER_TEMP"
+        if command -v cygpath >/dev/null 2>&1; then
+          CACHE_ROOT=$(cygpath -m "$CACHE_ROOT")
+        fi
         if [[ -n "$TARGET" ]]; then
           zig build c-abi \
-            --cache-dir "$RUNNER_TEMP/zova-cache" \
-            --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
+            --cache-dir "$CACHE_ROOT/zova-cache" \
+            --global-cache-dir "$CACHE_ROOT/zig-global-cache" \
             -Dtarget="$TARGET" -Doptimize=ReleaseSafe
         else
           zig build c-abi \
-            --cache-dir "$RUNNER_TEMP/zova-cache" \
-            --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
+            --cache-dir "$CACHE_ROOT/zova-cache" \
+            --global-cache-dir "$CACHE_ROOT/zig-global-cache" \
             -Doptimize=ReleaseSafe
+        fi
+
+    - name: Normalize Windows archive name
+      shell: bash
+      working-directory: ${{ github.workspace }}/.ci/zova
+      run: |
+        set -euo pipefail
+        if [[ -f zig-out/lib/zova_c.lib && ! -f zig-out/lib/libzova_c.a ]]; then
+          cp zig-out/lib/zova_c.lib zig-out/lib/libzova_c.a
         fi
 
     - name: Verify pinned Zova
