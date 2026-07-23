@@ -321,6 +321,7 @@ fn addZovaBridgeObject(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
         .link_libc = true,
     });
     bridge_module.addImport("zova", zova_module);
+    bridge_module.addIncludePath(b.path("src"));
     bridge_module.addIncludePath(b.path("vendored/sqlite3"));
     return b.addObject(.{
         .name = "cbm_zova_bridge",

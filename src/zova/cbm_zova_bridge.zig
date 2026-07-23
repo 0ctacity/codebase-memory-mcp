@@ -3,8 +3,8 @@ const zova = @import("zova");
 const sqlite = zova.sqlite;
 const c = sqlite.c;
 
-const posix = @cImport({
-    @cInclude("regex.h");
+const compat = @cImport({
+    @cInclude("foundation/compat_regex.h");
 });
 
 const HookError = sqlite.Error || error{
@@ -295,14 +295,18 @@ fn regexFunc(ctx: ?*c.sqlite3_context, argc: c_int, argv: [*c]?*c.sqlite3_value,
         c.sqlite3_result_int(context, 0);
         return;
     };
-    var re: posix.regex_t = undefined;
-    const flags: c_int = posix.REG_EXTENDED | posix.REG_NOSUB | if (case_insensitive) posix.REG_ICASE else 0;
-    if (posix.regcomp(&re, @ptrCast(pattern_raw), flags) != 0) {
+    var re: compat.cbm_regex_t = undefined;
+    const flags: c_int = compat.CBM_REG_EXTENDED | compat.CBM_REG_NOSUB |
+        if (case_insensitive) compat.CBM_REG_ICASE else 0;
+    if (compat.cbm_regcomp(&re, @ptrCast(pattern_raw), flags) != compat.CBM_REG_OK) {
         c.sqlite3_result_error(context, "invalid regex", -1);
         return;
     }
-    defer posix.regfree(&re);
-    c.sqlite3_result_int(context, if (posix.regexec(&re, @ptrCast(text_raw), 0, null, 0) == 0) 1 else 0);
+    defer compat.cbm_regfree(&re);
+    c.sqlite3_result_int(
+        context,
+        if (compat.cbm_regexec(&re, @ptrCast(text_raw), 0, null, 0) == compat.CBM_REG_OK) 1 else 0,
+    );
 }
 
 fn camelShouldSplit(input: []const u8, i: usize) bool {

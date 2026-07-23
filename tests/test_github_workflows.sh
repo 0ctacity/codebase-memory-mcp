@@ -44,6 +44,15 @@ grep -q 'codebase-memory-mcp-linux-.*-portable.tar.gz' "$WORKFLOWS/_build.yml"
 grep -q 'os: darwin' "$WORKFLOWS/_build.yml"
 grep -q 'codebase-memory-mcp-windows-' "$WORKFLOWS/_build.yml"
 
+BRIDGE="$ROOT/src/zova/cbm_zova_bridge.zig"
+grep -q '@cInclude("foundation/compat_regex.h")' "$BRIDGE"
+if grep -q '@cInclude("regex.h")' "$BRIDGE"; then
+  echo "error: Zova bridge must use CBM's portable regex abstraction" >&2
+  exit 1
+fi
+grep -q 'bridge_module.addIncludePath(b.path("src"))' "$ROOT/build.zig"
+grep -q -- '-Isrc' "$ROOT/Makefile.cbm"
+
 grep -q 'workflow_dispatch:' "$WORKFLOWS/release.yml"
 grep -q 'contents: write' "$WORKFLOWS/release.yml"
 grep -q 'softprops/action-gh-release@' "$WORKFLOWS/release.yml"

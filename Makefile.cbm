@@ -596,7 +596,7 @@ $(CBM_CLI_ZIG_LIB): $(CBM_CLI_ZIG_SRC) src/cli/cli_zig.h | $(BUILD_DIR)
 	ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR) \
 		$(ZIG) build-lib -static -O ReleaseFast -lc $(ZIG_TARGET_FLAGS) -femit-bin=$@ $<
 
-$(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bridge.h $(ZOVA_LIB) $(ZOVA_ROOT)/src/root.zig | $(BUILD_DIR)
+$(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bridge.h src/foundation/compat_regex.h $(ZOVA_LIB) $(ZOVA_ROOT)/src/root.zig | $(BUILD_DIR)
 	@command -v $(ZIG) >/dev/null 2>&1 || { \
 		echo "error: zig is required to build the Zova bridge (install Zig or set ZIG=/path/to/zig)." >&2; \
 		exit 1; \
@@ -605,8 +605,8 @@ $(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bri
 	ZIG_GLOBAL_CACHE_DIR=$(ZIG_GLOBAL_CACHE_DIR) \
 	ZIG_LOCAL_CACHE_DIR=$(ZIG_LOCAL_CACHE_DIR) \
 		$(ZIG) build-obj -O ReleaseFast -lc $(ZIG_TARGET_FLAGS) \
-			-Ivendored/sqlite3 \
-			-femit-bin=$@ --dep zova -Mroot=$< -Ivendored/sqlite3 -Mzova=$(ZOVA_ROOT)/src/root.zig
+			-Isrc -Ivendored/sqlite3 \
+			-femit-bin=$@ --dep zova -Mroot=$< -Isrc -Ivendored/sqlite3 -Mzova=$(ZOVA_ROOT)/src/root.zig
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
