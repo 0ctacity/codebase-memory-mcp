@@ -24,6 +24,10 @@ grep -q 'repository: ata-sesli/zova' "$ROOT/.github/actions/setup-zova/action.ym
 grep -q 'ref: e492609d480a60781c106012f11b17b2a1c9e330' \
   "$ROOT/.github/actions/setup-zova/action.yml"
 grep -q 'version: 0.16.0' "$ROOT/.github/actions/setup-zova/action.yml"
+[[ $(grep -c 'zig build c-abi' "$ROOT/.github/actions/setup-zova/action.yml") -eq 2 ]] || {
+  echo "error: native and cross-target Zova setup must build the C ABI artifact" >&2
+  exit 1
+}
 
 grep -q 'pull_request:' "$WORKFLOWS/ci.yml"
 grep -q 'push:' "$WORKFLOWS/ci.yml"

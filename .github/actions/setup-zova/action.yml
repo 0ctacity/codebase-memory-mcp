@@ -32,12 +32,12 @@ runs:
         ZOVA_ROOT="$GITHUB_WORKSPACE/.ci/zova"
         test "$(git -C "$ZOVA_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
         if [[ -n "$TARGET" ]]; then
-          zig build \
+          zig build c-abi \
             --cache-dir "$RUNNER_TEMP/zova-cache" \
             --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
             -Dtarget="$TARGET" -Doptimize=ReleaseSafe
         else
-          zig build \
+          zig build c-abi \
             --cache-dir "$RUNNER_TEMP/zova-cache" \
             --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
             -Doptimize=ReleaseSafe
