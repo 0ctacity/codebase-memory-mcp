@@ -178,11 +178,11 @@ fn addTestRunner(
     test_support: *std.Build.Step.Compile,
 ) *std.Build.Step.Compile {
     const module = createCModule(b, cfg, .tests);
-    module.linkLibrary(test_support);
     module.addCSourceFiles(.{
         .files = &all_test_sources,
         .flags = flags(b, cfg, .tests, .normal),
     });
+    module.linkLibrary(test_support);
     const exe = b.addExecutable(.{
         .name = "test-runner",
         .root_module = module,
@@ -199,7 +199,6 @@ fn addFocusedTestRunner(
     runner_define: []const u8,
 ) void {
     const module = createCModule(b, cfg, .tests);
-    module.linkLibrary(test_support);
     module.addCSourceFile(.{
         .file = b.path("tests/test_main.c"),
         .flags = flagsWithExtra(b, cfg, .tests, .normal, runner_define),
@@ -208,6 +207,7 @@ fn addFocusedTestRunner(
         .files = test_sources,
         .flags = flags(b, cfg, .tests, .normal),
     });
+    module.linkLibrary(test_support);
     const name = b.fmt("test-runner-{s}", .{group});
     const exe = b.addExecutable(.{
         .name = name,
