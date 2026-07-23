@@ -43,10 +43,36 @@ pub fn build(b: *std.Build) void {
     const cbm_step = b.step("cbm", "Build build/c/codebase-memory-mcp");
     cbm_step.dependOn(&cbm_copy.step);
 
-    const test_runner = addTestRunner(b, cfg);
+    const test_support = addTestSupportLibrary(b, cfg);
+    const test_runner = addTestRunner(b, cfg, test_support);
     const test_runner_copy = copyArtifact(b, test_runner, "build/c/test-runner");
     const test_runner_step = b.step("test-runner", "Build build/c/test-runner");
     test_runner_step.dependOn(&test_runner_copy.step);
+
+    addFocusedTestRunner(
+        b,
+        cfg,
+        test_support,
+        "zova",
+        &zova_test_sources,
+        "-DCBM_TEST_RUNNER_ZOVA=1",
+    );
+    addFocusedTestRunner(
+        b,
+        cfg,
+        test_support,
+        "mcp",
+        &mcp_test_sources,
+        "-DCBM_TEST_RUNNER_MCP=1",
+    );
+    addFocusedTestRunner(
+        b,
+        cfg,
+        test_support,
+        "pipeline",
+        &pipeline_test_sources,
+        "-DCBM_TEST_RUNNER_PIPELINE=1",
+    );
 
     _ = addRunSuiteStep(b, "test", "Run the full C test runner", test_runner, null, null);
     const test_cli_step = addRunSuiteStep(b, "test-cli", "Run focused CLI tests", test_runner, "cli", null);
@@ -136,9 +162,23 @@ fn addCbmExecutable(b: *std.Build, cfg: Config, kind: BuildKind, with_ui_assets:
     return exe;
 }
 
-fn addTestRunner(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
+fn addTestSupportLibrary(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
     const module = createCModule(b, cfg, .tests);
     addNativeSources(b, module, cfg, .tests, true, false);
+    return b.addLibrary(.{
+        .name = "cbm_test_support",
+        .linkage = .static,
+        .root_module = module,
+    });
+}
+
+fn addTestRunner(
+    b: *std.Build,
+    cfg: Config,
+    test_support: *std.Build.Step.Compile,
+) *std.Build.Step.Compile {
+    const module = createCModule(b, cfg, .tests);
+    module.linkLibrary(test_support);
     module.addCSourceFiles(.{
         .files = &all_test_sources,
         .flags = flags(b, cfg, .tests, .normal),
@@ -148,6 +188,34 @@ fn addTestRunner(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
         .root_module = module,
     });
     return exe;
+}
+
+fn addFocusedTestRunner(
+    b: *std.Build,
+    cfg: Config,
+    test_support: *std.Build.Step.Compile,
+    group: []const u8,
+    test_sources: []const []const u8,
+    runner_define: []const u8,
+) void {
+    const module = createCModule(b, cfg, .tests);
+    module.linkLibrary(test_support);
+    module.addCSourceFile(.{
+        .file = b.path("tests/test_main.c"),
+        .flags = flagsWithExtra(b, cfg, .tests, .normal, runner_define),
+    });
+    module.addCSourceFiles(.{
+        .files = test_sources,
+        .flags = flags(b, cfg, .tests, .normal),
+    });
+    const name = b.fmt("test-runner-{s}", .{group});
+    const exe = b.addExecutable(.{
+        .name = name,
+        .root_module = module,
+    });
+    const copy = copyArtifact(b, exe, b.fmt("build/c/{s}", .{name}));
+    const step = b.step(name, b.fmt("Build focused {s} test runner", .{group}));
+    step.dependOn(&copy.step);
 }
 
 fn createCModule(b: *std.Build, cfg: Config, kind: BuildKind) *std.Build.Module {
@@ -250,6 +318,20 @@ fn flags(b: *std.Build, cfg: Config, kind: BuildKind, flavor: SourceFlavor) []co
         .thread => list.appendSlice(a, &.{ "-fsanitize=thread", "-fno-omit-frame-pointer" }) catch @panic("OOM"),
     }
     return list.toOwnedSlice(a) catch @panic("OOM");
+}
+
+fn flagsWithExtra(
+    b: *std.Build,
+    cfg: Config,
+    kind: BuildKind,
+    flavor: SourceFlavor,
+    extra: []const u8,
+) []const []const u8 {
+    const base = flags(b, cfg, kind, flavor);
+    const result = b.allocator.alloc([]const u8, base.len + 1) catch @panic("OOM");
+    @memcpy(result[0..base.len], base);
+    result[base.len] = extra;
+    return result;
 }
 
 fn addNativeSources(
@@ -534,6 +616,37 @@ const native_sources = [_][]const u8{
     "internal/cbm/lz4_store.c",
     "internal/cbm/zstd_store.c",
     "internal/cbm/sqlite_writer.c",
+};
+
+const zova_test_sources = [_][]const u8{
+    "tests/test_zova.c",
+    "tests/test_zova_operations.c",
+    "tests/test_zova_migration.c",
+    "tests/test_zova_c_sql_functions.c",
+    "tests/test_zova_bridge.c",
+    "tests/test_zova_real_repo.c",
+    "tests/test_zova_graph_real_repo.c",
+    "tests/test_zova_single_file_real_repo.c",
+    "tests/test_incremental.c",
+};
+
+const mcp_test_sources = [_][]const u8{
+    "tests/test_mcp.c",
+};
+
+const pipeline_test_sources = [_][]const u8{
+    "tests/test_graph_buffer.c",
+    "tests/test_registry.c",
+    "tests/test_pipeline.c",
+    "tests/test_index_resilience.c",
+    "tests/test_fqn.c",
+    "tests/test_route_canon.c",
+    "tests/test_path_alias.c",
+    "tests/test_configlink.c",
+    "tests/test_infrascan.c",
+    "tests/test_worker_pool.c",
+    "tests/test_parallel.c",
+    "tests/test_incremental.c",
 };
 
 const all_test_sources = [_][]const u8{

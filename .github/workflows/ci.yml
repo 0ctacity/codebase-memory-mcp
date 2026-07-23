@@ -25,26 +25,88 @@ jobs:
         run: git diff --check
       - name: Validate GitHub Actions contract
         run: bash tests/test_github_workflows.sh
+      - name: Test pinned-SDK workflow
+        run: bash tests/test_zova_build_workflow.sh
 
-  test:
+  sdk:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: ./.github/actions/setup-zova
+
+  build:
+    needs: [checks, sdk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
       - uses: ./.github/actions/setup-zova
-      - name: Build Zova-CBM once
+      - name: Restore production build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/.zova-build-cache
+          key: cbm-prod-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-${{ hashFiles('build.zig', 'src/**', 'internal/**', 'vendored/**', 'scripts/zova-build-once.sh', 'scripts/zova-cache-repair.sh') }}
+          restore-keys: |
+            cbm-prod-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-
+      - name: Build production Zova-CBM
         run: scripts/zova-build-once.sh
       - name: Verify Zova is linked
         run: |
           nm build/c/codebase-memory-mcp > zova-symbols.txt
           grep -q 'zova_fresh_build_begin' zova-symbols.txt
-      - name: Run complete C test suite
-        env:
-          CBM_ZOVA_BUILD_SKIP: '1'
-        run: scripts/zova-run-tests.sh
-      - name: Test pinned-SDK workflow
-        run: bash tests/test_zova_build_workflow.sh
       - name: Test installer safety
         run: bash tests/test_install_script_safety.sh
+
+  test-build:
+    needs: [checks, sdk]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+      - uses: ./.github/actions/setup-zova
+      - name: Restore test build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/.zova-build-cache
+          key: cbm-tests-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-${{ hashFiles('build.zig', 'src/**', 'internal/**', 'vendored/**', 'tests/**', 'scripts/zova-build-test-runner.sh', 'scripts/zova-cache-repair.sh') }}
+          restore-keys: |
+            cbm-tests-${{ runner.os }}-${{ runner.arch }}-zig-0.16.0-zova-e492609d-
+      - name: Build complete C test runner
+        run: scripts/zova-build-test-runner.sh full
+      - name: Package test runner
+        run: tar -czf test-runner-linux-amd64.tar.gz -C build/c test-runner
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci-test-runner-linux-amd64
+          path: test-runner-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  test:
+    needs: test-build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [authority, mcp-query, pipeline, languages, core]
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci-test-runner-linux-amd64
+          path: .ci/test-runner
+      - name: Restore complete test runner
+        run: |
+          mkdir -p build/c
+          tar -xzf .ci/test-runner/test-runner-linux-amd64.tar.gz -C build/c
+          test -x build/c/test-runner
+      - name: Run C test shard
+        env:
+          CBM_ZOVA_BUILD_SKIP: '1'
+          CBM_ZOVA_REAL_TEST_RUNNER: ${{ github.workspace }}/build/c/test-runner
+        run: scripts/ci-test-shard.sh "${{ matrix.shard }}"

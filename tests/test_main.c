@@ -288,6 +288,34 @@ int main(int argc, char **argv) {
     g_suite_argv = argv;
     printf("\n  codebase-memory-mcp  C test suite\n");
 
+#if defined(CBM_TEST_RUNNER_ZOVA)
+    RUN_SELECTED_SUITE(zova_migration);
+    RUN_SELECTED_SUITE(zova_operations);
+    RUN_SELECTED_SUITE(zova);
+    RUN_EXPLICIT_SUITE(zova_normalization_benchmark);
+    RUN_SELECTED_SUITE(zova_c_sql_functions);
+    RUN_SELECTED_SUITE(zova_bridge);
+    RUN_EXPLICIT_SUITE(zova_real_repo);
+    RUN_EXPLICIT_SUITE(zova_graph_real_repo);
+    RUN_EXPLICIT_SUITE(zova_single_file_real_repo);
+    RUN_EXPLICIT_SUITE(zova_single_file_promotion_real_repo);
+    RUN_SELECTED_SUITE(zova_incremental_native);
+#elif defined(CBM_TEST_RUNNER_MCP)
+    RUN_SELECTED_SUITE(mcp);
+#elif defined(CBM_TEST_RUNNER_PIPELINE)
+    RUN_SELECTED_SUITE(graph_buffer);
+    RUN_SELECTED_SUITE(registry);
+    RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(index_resilience);
+    RUN_SELECTED_SUITE(fqn);
+    RUN_SELECTED_SUITE(route_canon);
+    RUN_SELECTED_SUITE(path_alias);
+    RUN_SELECTED_SUITE(configlink);
+    RUN_SELECTED_SUITE(infrascan);
+    RUN_SELECTED_SUITE(worker_pool);
+    RUN_SELECTED_SUITE(parallel);
+    RUN_SELECTED_SUITE(incremental);
+#else
     /* Foundation */
     RUN_SELECTED_SUITE(arena);
     RUN_SELECTED_SUITE(hash_table);
@@ -454,6 +482,7 @@ int main(int argc, char **argv) {
 
     RUN_SELECTED_SUITE(incremental);
     RUN_SELECTED_SUITE(zova_incremental_native);
+#endif
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

@@ -21,16 +21,24 @@ runs:
         path: .ci/zova
         persist-credentials: false
 
-    - name: Verify and build pinned Zova
+    - name: Restore pinned Zova build
+      id: zova-cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: |
+          .ci/zova/zig-out
+          ${{ runner.temp }}/zova-cache
+          ${{ runner.temp }}/zig-global-cache
+        key: zova-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target }}-zig-0.16.0-e492609d480a60781c106012f11b17b2a1c9e330
+
+    - name: Build pinned Zova
+      if: steps.zova-cache.outputs.cache-hit != 'true'
       shell: bash
       working-directory: ${{ github.workspace }}/.ci/zova
       env:
-        EXPECTED_COMMIT: e492609d480a60781c106012f11b17b2a1c9e330
         TARGET: ${{ inputs.target }}
       run: |
         set -euo pipefail
-        ZOVA_ROOT="$GITHUB_WORKSPACE/.ci/zova"
-        test "$(git -C "$ZOVA_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
         if [[ -n "$TARGET" ]]; then
           zig build c-abi \
             --cache-dir "$RUNNER_TEMP/zova-cache" \
@@ -42,6 +50,15 @@ runs:
             --global-cache-dir "$RUNNER_TEMP/zig-global-cache" \
             -Doptimize=ReleaseSafe
         fi
+
+    - name: Verify pinned Zova
+      shell: bash
+      env:
+        EXPECTED_COMMIT: e492609d480a60781c106012f11b17b2a1c9e330
+      run: |
+        set -euo pipefail
+        ZOVA_ROOT="$GITHUB_WORKSPACE/.ci/zova"
+        test "$(git -C "$ZOVA_ROOT" rev-parse HEAD)" = "$EXPECTED_COMMIT"
         test -f "$ZOVA_ROOT/zig-out/lib/libzova_c.a"
         grep -q 'Zova C ABI, v0.24.0 pre-1.0' "$ZOVA_ROOT/include/zova.h"
         {

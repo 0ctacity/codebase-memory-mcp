@@ -28,11 +28,20 @@ grep -q 'version: 0.16.0' "$ROOT/.github/actions/setup-zova/action.yml"
   echo "error: native and cross-target Zova setup must build the C ABI artifact" >&2
   exit 1
 }
+grep -q 'actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9' \
+  "$ROOT/.github/actions/setup-zova/action.yml"
+grep -q "steps.zova-cache.outputs.cache-hit != 'true'" \
+  "$ROOT/.github/actions/setup-zova/action.yml"
 
 grep -q 'pull_request:' "$WORKFLOWS/ci.yml"
 grep -q 'push:' "$WORKFLOWS/ci.yml"
-grep -q 'scripts/zova-run-tests.sh' "$WORKFLOWS/ci.yml"
 grep -q 'tests/test_zova_build_workflow.sh' "$WORKFLOWS/ci.yml"
+grep -q '^  sdk:' "$WORKFLOWS/ci.yml"
+grep -q '^  build:' "$WORKFLOWS/ci.yml"
+grep -q '^  test-build:' "$WORKFLOWS/ci.yml"
+grep -q '^  test:' "$WORKFLOWS/ci.yml"
+grep -q 'scripts/ci-test-shard.sh' "$WORKFLOWS/ci.yml"
+bash "$ROOT/scripts/ci-test-shard.sh" --verify
 
 grep -q 'CBM_WITH_ZOVA=1' "$WORKFLOWS/_build.yml"
 grep -q 'ZOVA_ROOT=' "$WORKFLOWS/_build.yml"

@@ -47,6 +47,7 @@ if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" == 1 ]]; then
     fail "build skip requires both built executables"
 else
   "$BUILD_ONCE"
+  "$ROOT/scripts/zova-build-test-runner.sh" full >/dev/null
 fi
 [[ -x "$BUILD" && -x "$TEST_RUNNER" ]] || fail "build did not produce required executables"
 

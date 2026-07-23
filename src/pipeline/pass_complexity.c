@@ -185,7 +185,9 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
                         : INT_MAX,
         };
     }
-    qsort(callees, (size_t)ne, sizeof(*callees), compare_complexity_callees);
+    if (ne > 1) {
+        qsort(callees, (size_t)ne, sizeof(*callees), compare_complexity_callees);
+    }
     for (int i = 0; i < ne; i++) {
         int64_t c = callees[i].id;
         if (c == id) {
@@ -268,7 +270,9 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     for (int64_t id = 1; id <= maxid; id++) {
         if (nptr[id]) ordered[ordered_count++] = nptr[id];
     }
-    qsort(ordered, (size_t)ordered_count, sizeof(*ordered), compare_complexity_nodes);
+    if (ordered_count > 1) {
+        qsort(ordered, (size_t)ordered_count, sizeof(*ordered), compare_complexity_nodes);
+    }
     for (int i = 0; i < ordered_count; i++) rank[ordered[i]->id] = i + 1;
 
     for (int i = 0; i < ordered_count; i++) {

@@ -12,7 +12,6 @@ LOCK_DIR=${CBM_ZOVA_BUILD_LOCK_DIR:-"$CACHE_ROOT/.build.lock"}
 ZOVA_LIB="$ZOVA_ROOT/zig-out/lib/libzova_c.a"
 ZOVA_HEADER="$ZOVA_ROOT/include/zova.h"
 ZOVA_ROOT_ZIG="$ZOVA_ROOT/src/root.zig"
-RUNNER=${CBM_ZOVA_REAL_TEST_RUNNER:-"$ROOT/build/c/test-runner"}
 BINARY=${CBM_ZOVA_REAL_BINARY:-"$ROOT/build/c/codebase-memory-mcp"}
 
 if [[ ! -d "$ZOVA_ROOT" ]]; then
@@ -28,9 +27,8 @@ done
 mkdir -p "$CACHE_ROOT" "$ROOT/build/c"
 
 if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" == "1" ]]; then
-  [[ -x "$RUNNER" ]] || { echo "error: test runner is missing: $RUNNER" >&2; exit 1; }
   [[ -x "$BINARY" ]] || { echo "error: CBM binary is missing: $BINARY" >&2; exit 1; }
-  printf '%s\n' "$RUNNER"
+  printf '%s\n' "$BINARY"
   exit 0
 fi
 
@@ -53,15 +51,9 @@ mkdir -p "$ZIG_GLOBAL_CACHE"
 # files; all valid cached objects remain reusable.
 mkdir -p "$CBM_ZIG_CACHE"
 "$ROOT/scripts/zova-cache-repair.sh" "$CBM_ZIG_CACHE" "$ZIG_GLOBAL_CACHE"
-# Zig 0.16 may execute duplicate intermediate libraries concurrently when both
-# top-level targets are requested together. Build them sequentially under this
-# script's lock while reusing the exact same cache.
-for target in cbm test-runner; do
-  zig build --cache-dir "$CBM_ZIG_CACHE" \
-    --global-cache-dir "$ZIG_GLOBAL_CACHE" \
-    "$target" -Dwith-zova=true -Dzova-root="$ZOVA_ROOT"
-done
+zig build --cache-dir "$CBM_ZIG_CACHE" \
+  --global-cache-dir "$ZIG_GLOBAL_CACHE" \
+  cbm -Dwith-zova=true -Dzova-root="$ZOVA_ROOT"
 
-[[ -x "$RUNNER" ]] || { echo "error: build did not produce $RUNNER" >&2; exit 1; }
 [[ -x "$BINARY" ]] || { echo "error: build did not produce $BINARY" >&2; exit 1; }
-printf '%s\n' "$RUNNER"
+printf '%s\n' "$BINARY"

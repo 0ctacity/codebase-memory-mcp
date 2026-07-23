@@ -42,6 +42,7 @@ if [[ "$MODE" == index-only ]]; then
   if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" != 1 ]]; then
     echo "ZOVA INDEX ONLY phase=build" >&2
     "$BUILD_ONCE" >/dev/null
+    "$ROOT/scripts/zova-build-test-runner.sh" full >/dev/null
   fi
   [[ -x "$BUILD" && -x "$TEST_RUNNER" ]] || fail "build products are missing"
 
@@ -164,6 +165,7 @@ run_gate() {
 if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" != 1 ]]; then
   echo "ZOVA OPTIMIZATION phase=build" >&2
   "$BUILD_ONCE" >/dev/null
+  "$ROOT/scripts/zova-build-test-runner.sh" full >/dev/null
 fi
 [[ -x "$BUILD" && -x "$TEST_RUNNER" ]] || fail "build products are missing"
 

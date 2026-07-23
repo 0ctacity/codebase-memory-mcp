@@ -19,6 +19,7 @@ done
 if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" != "1" ]]; then
   echo "SECTION 8 BUILD: once" >&2
   bash "$ROOT/scripts/zova-build-once.sh" >/dev/null
+  bash "$ROOT/scripts/zova-build-test-runner.sh" full >/dev/null
 fi
 
 echo "SECTION 8 FOCUSED: synthetic suites" >&2

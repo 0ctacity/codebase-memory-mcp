@@ -7713,6 +7713,30 @@ TEST(pipeline_complexity_cycle_is_independent_of_temporary_ids) {
     PASS();
 }
 
+TEST(pipeline_complexity_leaf_and_non_function_graphs_do_not_sort_null) {
+    cbm_gbuf_t *leaf_graph = cbm_gbuf_new("complexity-leaf", "/tmp/complexity-leaf");
+    ASSERT_NOT_NULL(leaf_graph);
+    ASSERT_TRUE(cbm_gbuf_upsert_node(
+        leaf_graph, "Function", "Leaf", "Leaf", "leaf.c", 1, 1,
+        "{\"loop_depth\":2,\"self_recursive\":false}") != 0);
+    cbm_pipeline_ctx_t leaf_ctx = {.gbuf = leaf_graph};
+    cbm_pipeline_pass_complexity(&leaf_ctx);
+    const cbm_gbuf_node_t *leaf = cbm_gbuf_find_by_qn(leaf_graph, "Leaf");
+    ASSERT_NOT_NULL(leaf);
+    ASSERT_TRUE(strstr(leaf->properties_json, "\"transitive_loop_depth\":2") != NULL);
+    cbm_gbuf_free(leaf_graph);
+
+    cbm_gbuf_t *file_graph = cbm_gbuf_new("complexity-file", "/tmp/complexity-file");
+    ASSERT_NOT_NULL(file_graph);
+    ASSERT_TRUE(cbm_gbuf_upsert_node(
+        file_graph, "File", "leaf.c", "leaf.c", "leaf.c", 1, 1, "{}") != 0);
+    cbm_pipeline_ctx_t file_ctx = {.gbuf = file_graph};
+    cbm_pipeline_pass_complexity(&file_ctx);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(file_graph, "leaf.c"));
+    cbm_gbuf_free(file_graph);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -7948,6 +7972,7 @@ SUITE(pipeline) {
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     RUN_TEST(pipeline_complexity_cycle_is_independent_of_temporary_ids);
+    RUN_TEST(pipeline_complexity_leaf_and_non_function_graphs_do_not_sort_null);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);

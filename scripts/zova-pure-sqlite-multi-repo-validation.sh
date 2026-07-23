@@ -36,6 +36,7 @@ trap cleanup_lock EXIT INT TERM
 if [[ "${CBM_ZOVA_BUILD_SKIP:-0}" != 1 ]]; then
   echo "PURE SQLITE phase=build" >&2
   "$BUILD_ONCE" >/dev/null
+  "$ROOT/scripts/zova-build-test-runner.sh" full >/dev/null
 fi
 
 validate_repository() {

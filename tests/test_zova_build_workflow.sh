@@ -151,9 +151,16 @@ cat > "$FAKE_BIN/zig" <<'EOF'
 set -euo pipefail
 printf 'PWD=%s %s\n' "$PWD" "$*" >> "${CBM_ZOVA_FAKE_BUILD_LOG:?}"
 mkdir -p "${CBM_ZOVA_FAKE_OUTPUT_DIR:?}"
-touch "${CBM_ZOVA_FAKE_OUTPUT_DIR}/codebase-memory-mcp"
-touch "${CBM_ZOVA_FAKE_OUTPUT_DIR}/test-runner"
-chmod +x "${CBM_ZOVA_FAKE_OUTPUT_DIR}/codebase-memory-mcp" "${CBM_ZOVA_FAKE_OUTPUT_DIR}/test-runner"
+for target in cbm test-runner test-runner-zova test-runner-mcp test-runner-pipeline; do
+  case " $* " in
+    *" $target "*)
+      output=$target
+      [[ "$target" == cbm ]] && output=codebase-memory-mcp
+      printf '#!/usr/bin/env bash\nexit 0\n' > "${CBM_ZOVA_FAKE_OUTPUT_DIR}/$output"
+      chmod +x "${CBM_ZOVA_FAKE_OUTPUT_DIR}/$output"
+      ;;
+  esac
+done
 EOF
 chmod +x "$FAKE_BIN/zig"
 
@@ -168,14 +175,52 @@ CBM_ZOVA_FAKE_OUTPUT_DIR="$TMP/output" \
   bash "$ROOT/scripts/zova-build-once.sh" >/dev/null
 
 grep -F -- "-Dzova-root=$PINNED_ZOVA" "$FAKE_BUILD_LOG"
-[[ "$(wc -l < "$FAKE_BUILD_LOG" | tr -d ' ')" == "2" ]]
+[[ "$(wc -l < "$FAKE_BUILD_LOG" | tr -d ' ')" == "1" ]]
 grep -q ' cbm -Dwith-zova=true ' "$FAKE_BUILD_LOG"
-grep -q ' test-runner -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+if grep -q ' test-runner' "$FAKE_BUILD_LOG"; then
+  echo "error: production-only build compiled a test runner" >&2
+  exit 1
+fi
 if grep -q "PWD=$PINNED_ZOVA" "$FAKE_BUILD_LOG"; then
   echo "error: CBM build attempted to rebuild Zova" >&2
   exit 1
 fi
-echo "PASS: CBM builds only against the pinned Zova SDK"
+echo "PASS: production build uses the pinned Zova SDK without compiling tests"
+
+: > "$FAKE_BUILD_LOG"
+PATH="$FAKE_BIN:$PATH" \
+CBM_ZOVA_PIN_ROOT="$PINNED_ZOVA" \
+CBM_ZOVA_BUILD_CACHE="$TMP/build-cache" \
+CBM_ZOVA_BUILD_LOCK_DIR="$TMP/build-cache/.lock" \
+CBM_ZOVA_TEST_RUNNER_DIR="$TMP/output" \
+CBM_ZOVA_FAKE_BUILD_LOG="$FAKE_BUILD_LOG" \
+CBM_ZOVA_FAKE_OUTPUT_DIR="$TMP/output" \
+CBM_ZOVA_TEST_CACHE_DIR="$TMP/test-cache" \
+  bash "$ROOT/scripts/zova-run-tests.sh" zova mcp pipeline
+
+[[ "$(wc -l < "$FAKE_BUILD_LOG" | tr -d ' ')" == "3" ]]
+grep -q ' test-runner-zova -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+grep -q ' test-runner-mcp -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+grep -q ' test-runner-pipeline -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+if grep -q ' test-runner -Dwith-zova=true ' "$FAKE_BUILD_LOG"; then
+  echo "error: focused suites compiled the full test runner" >&2
+  exit 1
+fi
+echo "PASS: focused suites build only their focused test runners"
+
+: > "$FAKE_BUILD_LOG"
+PATH="$FAKE_BIN:$PATH" \
+CBM_ZOVA_PIN_ROOT="$PINNED_ZOVA" \
+CBM_ZOVA_BUILD_CACHE="$TMP/build-cache" \
+CBM_ZOVA_BUILD_LOCK_DIR="$TMP/build-cache/.lock" \
+CBM_ZOVA_TEST_RUNNER_DIR="$TMP/output" \
+CBM_ZOVA_FAKE_BUILD_LOG="$FAKE_BUILD_LOG" \
+CBM_ZOVA_FAKE_OUTPUT_DIR="$TMP/output" \
+CBM_ZOVA_TEST_CACHE_DIR="$TMP/test-cache" \
+  bash "$ROOT/scripts/zova-run-tests.sh"
+[[ "$(wc -l < "$FAKE_BUILD_LOG" | tr -d ' ')" == "1" ]]
+grep -q ' test-runner -Dwith-zova=true ' "$FAKE_BUILD_LOG"
+echo "PASS: complete verification retains the full test runner"
 
 mkdir -p "$TMP/local-cache/h" "$TMP/build-cache/zig-global-cache/h"
 : > "$TMP/local-cache/h/interrupted.txt"

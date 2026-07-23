@@ -543,13 +543,20 @@ and true incremental publication performs no full clear or unchanged-row rewrite
 
 CBM builds against an immutable local snapshot in `.zova-sdk`, not the live
 neighboring Zova checkout. Pin the currently built Zova library and headers
-once, build CBM once, then run any number of suites directly:
+once, build the production binary, then build and run only the test groups you
+request:
 
 ```bash
 scripts/zova-pin-current.sh
 scripts/zova-build-once.sh
 scripts/zova-run-tests.sh zova mcp
 ```
+
+`zova-build-once.sh` does not compile tests. `zova-run-tests.sh` selects a
+focused Zova, MCP, or pipeline runner when possible; running it without suite
+arguments builds and executes the complete C test runner used by CI. Focused
+runners share one cached production-support library, so later groups compile
+only their own test sources.
 
 Later changes under `../zova` are ignored. Refresh the snapshot only when a
 Zova update is intentionally being adopted:
