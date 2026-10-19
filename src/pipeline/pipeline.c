@@ -136,12 +136,46 @@ static const char *itoa_buf(int val) {
     return bufs[i];
 }
 
-/* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
-static void log_phase_mem(const char *phase) {
+/* Log current + peak RSS and the budget at a pipeline phase boundary (memory
+ * profiling). The process peak is cumulative, so the boundary where peak_mb
+ * first rises is the phase that set it (#49). */
+void cbm_pipeline_log_phase_mem(const char *phase) {
     enum { PL_BYTES_PER_MB = 1024 * 1024 };
     cbm_log_info("mem.phase", "phase", phase, "rss_mb",
                  itoa_buf((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
-                 itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
+                 itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)), "budget_mb",
+                 itoa_buf((int)(cbm_mem_budget() / PL_BYTES_PER_MB)));
+}
+
+/* Post-extraction budget gate. The extract phase enforces the budget with
+ * back-pressure and result spill, but registry/resolve/derived passes/dump
+ * work on the whole graph at once. Reclaim freed pages, then fail the attempt
+ * whole if the resident graph is still over budget, before anything is
+ * published, so the previously served generation keeps answering.
+ *
+ * Only an explicit CBM_MEM_BUDGET_MB hard-fails. The detected RAM-fraction
+ * default stays a soft target: it is sized for extraction's spill heuristics,
+ * and a run that overshoots it after extraction already finishes today (#49
+ * measurements). Hard-failing it would turn successful indexes into repeatable
+ * over_memory_budget errors with no way to configure out but the env var.
+ * Returns 0 when under budget, when the budget is implicit, or when none is
+ * configured. Every call site is single-threaded: the workers have joined, so
+ * there is no transient to wait for. */
+int cbm_pipeline_budget_gate(const char *phase) {
+    if (cbm_mem_budget() == 0 || !cbm_mem_budget_explicit()) {
+        return 0;
+    }
+    if (!cbm_mem_over_budget()) {
+        return 0;
+    }
+    cbm_mem_collect();
+    if (!cbm_mem_over_budget()) {
+        return 0;
+    }
+    cbm_log_error("mem.budget.exceeded", "rss_mb", itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))),
+                  "budget_mb", itoa_buf((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
+                  phase ? phase : "post_extract", "action", "fail_whole");
+    return CBM_PIPELINE_ABORT_OVER_BUDGET;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -962,7 +996,7 @@ static void predump_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_importance(ctx);
 }
 
-static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
         const char *name;
@@ -987,11 +1021,22 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         if (passes[i].moderate_only && p->mode == CBM_MODE_FAST) {
             continue;
         }
+        /* #49: each derived pass allocates whole-graph scratch. Check before
+         * it starts so an over-budget run stops instead of stacking another
+         * pass's working set on top. */
+        char phase[CBM_SZ_64];
+        snprintf(phase, sizeof(phase), "before_%s", passes[i].name);
+        int gate_rc = cbm_pipeline_budget_gate(phase);
+        if (gate_rc != 0) {
+            return gate_rc;
+        }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         passes[i].fn(ctx);
         cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        cbm_pipeline_log_phase_mem(passes[i].name);
     }
+    return 0;
 }
 
 /* Adapter that lets cbm_pipeline_pass_lsp_cross slot into the seq_passes
@@ -1042,6 +1087,17 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     };
     int rc = 0;
     for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
+        /* #49: definitions is the extract step; every later pass re-reads the
+         * whole cache/graph. Gate each one so an over-budget run stops before
+         * stacking another pass's working set. */
+        if (si > 0) {
+            char phase[CBM_SZ_64];
+            snprintf(phase, sizeof(phase), "before_%s", seq_passes[si].name);
+            rc = cbm_pipeline_budget_gate(phase);
+            if (rc != 0) {
+                break;
+            }
+        }
         cbm_clock_gettime(CLOCK_MONOTONIC, t);
         int pr = seq_passes[si].fn(ctx, files, file_count);
         if (pr != 0 && !seq_passes[si].ignore_err) {
@@ -1049,6 +1105,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(*t)));
+        cbm_pipeline_log_phase_mem(seq_passes[si].name);
         if (check_cancel(p)) {
             rc = CBM_NOT_FOUND;
         }
@@ -1113,7 +1170,11 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     rc = cbm_build_registry_from_cache(ctx, files, file_count, cache);
     cbm_log_info("pass.timing", "pass", "registry_build", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("registry_build");
+    cbm_pipeline_log_phase_mem("registry_build");
+    /* #49: registry_build is the first post-extract whole-graph allocation. */
+    if (rc == 0 && !check_cancel(p)) {
+        rc = cbm_pipeline_budget_gate("before_lsp_cross_prepare");
+    }
     if (rc != 0 || check_cancel(p)) {
         for (int i = 0; i < file_count; i++) {
             if (cache[i]) {
@@ -1191,13 +1252,21 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("lsp_cross_prepare");
-    cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
-                              def_count, def_modules, module_def_index, &cross_registries);
-    cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("parallel_resolve");
+    cbm_pipeline_log_phase_mem("lsp_cross_prepare");
+    /* #49: the cross-file registries are a whole-graph working set allocated
+     * after extract. Stop before resolve if they pushed RSS over the budget. */
+    if (cbm_pipeline_budget_gate("before_parallel_resolve") != 0) {
+        rc = CBM_PIPELINE_ABORT_OVER_BUDGET;
+    }
+    if (rc == 0) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, t);
+        rc =
+            cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
+                                 def_count, def_modules, module_def_index, &cross_registries);
+        cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(*t)));
+        cbm_pipeline_log_phase_mem("parallel_resolve");
+    }
     cbm_pxc_free_module_def_index(module_def_index);
     free((void *)cross_registries.zig_args);
     cbm_arena_destroy(&cross_lsp_arena); /* releases all per-lang registries */
@@ -1209,8 +1278,13 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(def_modules);
     }
     cbm_pipeline_sync_next_id(p->gbuf, &shared_ids);
-    cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, ctx->spill, file_count);
-    cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, ctx->spill, file_count);
+    /* A budget abort means stop allocating: the infra passes would run over
+     * the same cache only to return the abort below. Other resolve errors keep
+     * main's behaviour and still run them. */
+    if (rc != CBM_PIPELINE_ABORT_OVER_BUDGET) {
+        cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, ctx->spill, file_count);
+        cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, ctx->spill, file_count);
+    }
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);
@@ -1521,6 +1595,14 @@ int cbm_pipeline_publish_zova_user_database_delta(
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    /* #49: dump + publish materialize the whole graph again (normalization,
+     * native topology, FTS, vectors). Check before starting; nothing has been
+     * published yet, so an abort leaves the previous generation serving. */
+    cbm_pipeline_log_phase_mem("pre_dump");
+    int gate_rc = cbm_pipeline_budget_gate("before_dump");
+    if (gate_rc != 0) {
+        return gate_rc;
+    }
     char zova_dir[CBM_SZ_1K];
     if (cbm_zova_user_database_path(zova_dir, sizeof(zova_dir)) == 0) {
         char *last_slash = strrchr(zova_dir, '/');
@@ -1540,11 +1622,20 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         cbm_log_error("pipeline.err", "phase", "zova_prepare");
         return prepare_rc;
     }
+    cbm_pipeline_log_phase_mem("zova_prepare");
+    /* Preparing the dump releases the gbuf indexes; if RSS is still over
+     * budget now, publishing would only raise it further. Abort before the
+     * atomic publication starts. */
+    gate_rc = cbm_pipeline_budget_gate("before_publish");
+    if (gate_rc != 0) {
+        return gate_rc;
+    }
     int publish_rc = cbm_pipeline_publish_zova_user_database(p, p->gbuf, files, file_count, NULL, 0);
     if (publish_rc != 0) {
         cbm_log_error("pipeline.err", "phase", "zova_single_file");
         return publish_rc;
     }
+    cbm_pipeline_log_phase_mem("zova_publish");
     return 0;
 }
 
@@ -1615,14 +1706,25 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 /* Run tests, git history, predump passes, and dump+persist. */
 static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count) {
-    int rc = run_tests_and_history(p, ctx, files, file_count);
+    /* #49: extract already enforces the budget. Everything from here on works
+     * on the whole graph, so gate the entry too. */
+    cbm_pipeline_log_phase_mem("extract_done");
+    int rc = cbm_pipeline_budget_gate("before_tests_and_history");
     if (rc != 0) {
         return rc;
     }
+    rc = run_tests_and_history(p, ctx, files, file_count);
+    if (rc != 0) {
+        return rc;
+    }
+    cbm_pipeline_log_phase_mem("tests_and_history");
 
     CBM_PROF_START(t_predump);
-    run_predump_passes(p, ctx);
+    rc = run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
+    if (rc != 0) {
+        return rc;
+    }
 
     if (!check_cancel(p)) {
         struct timespec t;
@@ -1784,6 +1886,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         goto cleanup;
     }
 
+    cbm_pipeline_log_phase_mem("pipeline_done");
     cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
                  itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));

@@ -200,6 +200,10 @@ affected graph, metadata, full-text, and vector rows; unchanged files are not re
 
 Indexing keeps results in memory up to a budget (a fraction of system RAM, or `CBM_MEM_BUDGET_MB`)
 and spills extraction results to disk beyond it, so a large repository does not have to fit in RAM.
+When `CBM_MEM_BUDGET_MB` is set explicitly, the same limit also covers the post-extraction phases:
+if the resident graph still exceeds it, indexing stops before publication and the previously
+indexed generation keeps serving. The detected RAM fraction stays advisory after extraction, so a
+run that would finish today with a soft overshoot is not turned into an error.
 
 > **Research.** The design and benchmarks are described in the preprint
 > [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277).
@@ -461,7 +465,7 @@ codebase-memory-mcp config reset auto_index            # back to the default
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Where `cbm.zova` and settings live. |
 | `CBM_ALLOWED_ROOT` | unset | Refuse to index any path that resolves outside this directory. Useful when an untrusted caller drives the server. |
 | `CBM_WORKERS` | detected | Indexing workers. `0` is sequential; `1`–`256` sets the count. |
-| `CBM_MEM_BUDGET_MB` | fraction of RAM | Indexing memory budget in MiB. Beyond it, extraction results spill to disk. |
+| `CBM_MEM_BUDGET_MB` | fraction of RAM | Indexing memory budget in MiB. Beyond it, extraction results spill to disk. An explicit value also stops post-extraction phases before publication; the detected default does not hard-fail after extraction. |
 | `CBM_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`, or `none`. Logs go to stderr; stdout carries MCP JSON-RPC. |
 | `CBM_DIAGNOSTICS` | off | `1` writes periodic resource snapshots; see [Diagnostics](#diagnostics-and-troubleshooting). |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | If fewer than this fraction of indexed nodes persist, `index_repository` reports `status: "degraded"`. `0` disables the check. |
@@ -571,7 +575,7 @@ The trajectory holds resource counters only, no source code or query text.
 | `index_repository` fails | Pass an absolute `repo_path`. Check `CBM_ALLOWED_ROOT` if it is set. |
 | `trace_path` finds nothing | Find the exact name first with `search_graph(name_pattern=".*Partial.*")`. |
 | Results come from the wrong project | Pass `project`; `list_projects` shows the selectors. |
-| Indexing reports a memory-budget error | Raise `CBM_MEM_BUDGET_MB` or lower `CBM_WORKERS`. |
+| Indexing reports a memory-budget error | Raise `CBM_MEM_BUDGET_MB`; for extraction-phase aborts, lowering `CBM_WORKERS` also helps. |
 | Binary not found after install | Add `~/.local/bin` to `PATH`. |
 
 ## Current boundaries

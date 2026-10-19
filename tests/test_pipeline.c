@@ -10984,6 +10984,121 @@ static bool write_backpressure_fixture(void) {
     return true;
 }
 
+/* #49: post-extraction phases use the same budget contract as extract, but
+ * only an explicit CBM_MEM_BUDGET_MB hard-fails. The detected RAM-fraction
+ * default must stay advisory: the #49 measurements are runs that finish today
+ * with a soft overshoot, so aborting them would break indexing that works.
+ * Capture every return code, restore the budget, then assert. */
+TEST(pipeline_post_extract_budget_gate) {
+    size_t saved_budget = cbm_mem_budget();
+    bool saved_explicit = cbm_mem_budget_explicit();
+
+    cbm_mem_set_budget_for_tests(0, true);
+    int no_budget_rc = cbm_pipeline_budget_gate("test_no_budget");
+
+    cbm_mem_set_budget_for_tests(SIZE_MAX, true);
+    int under_rc = cbm_pipeline_budget_gate("test_under_budget");
+
+    /* The process resident set is permanently over 1 MiB. Implicit = advisory. */
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, false);
+    int implicit_rc = cbm_pipeline_budget_gate("test_implicit_over_budget");
+
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, true);
+    int explicit_rc = cbm_pipeline_budget_gate("test_explicit_over_budget");
+
+    cbm_mem_set_budget_for_tests(saved_budget, saved_explicit);
+
+    ASSERT_EQ(no_budget_rc, 0);
+    ASSERT_EQ(under_rc, 0);
+    ASSERT_EQ(implicit_rc, 0);
+    ASSERT_EQ(explicit_rc, CBM_PIPELINE_ABORT_OVER_BUDGET);
+    PASS();
+}
+
+#if CBM_WITH_ZOVA
+static int pipeline_zova_graph_digest(const char *project, pipeline_sql_digest_t *nodes,
+                                      pipeline_sql_digest_t *edges);
+#endif
+
+/* #49 end-to-end: lower the budget from the before-dump hook so the gate runs
+ * inside cbm_pipeline_run after extraction and the derived passes, not just as
+ * a unit call. The abort must reach the caller before publication. */
+static void lower_budget_before_dump(const cbm_gbuf_t *gb, void *ctx) {
+    (void)gb;
+    int *calls = ctx;
+    (*calls)++;
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, true);
+}
+
+TEST(pipeline_post_extract_gate_aborts_before_publication) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+#if CBM_WITH_ZOVA
+    /* Generation 1 at the process budget: publishes normally. */
+    cbm_pipeline_t *gen1 = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    int rc_gen1 = gen1 ? cbm_pipeline_run(gen1) : -1;
+    char *project = gen1 ? strdup(cbm_pipeline_project_name(gen1)) : NULL;
+    cbm_pipeline_free(gen1);
+    pipeline_sql_digest_t nodes_before = {0};
+    pipeline_sql_digest_t edges_before = {0};
+    int digest_before_rc =
+        project ? pipeline_zova_graph_digest(project, &nodes_before, &edges_before) : -1;
+
+    /* Make generation 2 non-empty for the incremental route. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.go", g_tmpdir);
+    FILE *f = fopen(path, "a");
+    bool mutated = f != NULL;
+    if (f) {
+        fprintf(f, "\nfunc Added() {}\n");
+        fclose(f);
+    }
+#endif
+
+    size_t saved_budget = cbm_mem_budget();
+    bool saved_explicit = cbm_mem_budget_explicit();
+    int hook_calls = 0;
+    cbm_pipeline_set_before_dump_hook_for_tests(lower_budget_before_dump, &hook_calls);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+
+    cbm_pipeline_set_before_dump_hook_for_tests(NULL, NULL);
+    cbm_mem_set_budget_for_tests(saved_budget, saved_explicit);
+    cbm_pipeline_free(p);
+
+#if CBM_WITH_ZOVA
+    pipeline_sql_digest_t nodes_after = {0};
+    pipeline_sql_digest_t edges_after = {0};
+    int digest_after_rc =
+        project ? pipeline_zova_graph_digest(project, &nodes_after, &edges_after) : -1;
+    free(project);
+#endif
+    teardown_test_repo();
+
+#if CBM_WITH_ZOVA
+    ASSERT_EQ(rc_gen1, 0);
+    ASSERT_EQ(digest_before_rc, 0);
+    ASSERT_GT(nodes_before.rows, 0);
+    ASSERT_TRUE(mutated);
+#endif
+    /* Engaged: the run reached the dump boundary and the hook lowered the
+     * budget. rc==0 here would mean the gate never fired. */
+    ASSERT_EQ(hook_calls, 1);
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_OVER_BUDGET);
+#if CBM_WITH_ZOVA
+    /* The served generation is untouched (publish is atomic and was skipped). */
+    ASSERT_EQ(digest_after_rc, 0);
+    ASSERT_EQ(nodes_after.rows, nodes_before.rows);
+    ASSERT_TRUE(nodes_after.hash == nodes_before.hash);
+    ASSERT_EQ(edges_after.rows, edges_before.rows);
+    ASSERT_TRUE(edges_after.hash == edges_before.hash);
+#endif
+    PASS();
+}
+
 TEST(pipeline_backpressure_futile_nap_disengages) {
     /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
      * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
@@ -11009,7 +11124,8 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
         FAIL("failed to pin CBM_WORKERS");
     }
     size_t saved_budget = cbm_mem_budget();
-    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    bool saved_explicit = cbm_mem_budget_explicit();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, true);
     bool budget_set = cbm_mem_budget() > 0;
     bool over_at_start = cbm_mem_over_budget();
 
@@ -11019,7 +11135,7 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     long cycles = cbm_pp_bp_nap_cycles();
 
     /* Restore the caller-visible budget and workers BEFORE asserting. */
-    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_mem_set_budget_for_tests(saved_budget, saved_explicit);
     int restore_workers_rc =
         saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
     free(saved_workers);
@@ -11125,7 +11241,8 @@ TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_generation) {
         }
     }
     size_t saved_budget = cbm_mem_budget();
-    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    bool saved_explicit = cbm_mem_budget_explicit();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, true);
     bool over_at_start = cbm_mem_over_budget();
     cbm_pp_bp_nap_cycles_reset();
     p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
@@ -11134,7 +11251,7 @@ TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_generation) {
         p ? cbm_pipeline_get_last_route(p) : CBM_PIPELINE_ROUTE_UNKNOWN;
     long cycles = cbm_pp_bp_nap_cycles();
     /* Restore the caller-visible budget BEFORE any assertion. */
-    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_mem_set_budget_for_tests(saved_budget, saved_explicit);
     cbm_pipeline_free(p);
 
     pipeline_sql_digest_t nodes_after = {0};
@@ -12084,6 +12201,8 @@ SUITE(pipeline) {
     /* Extraction back-pressure */
     /* Fail-whole stops the 1 MiB-budget runs at extraction, before any
      * database dump, so these run in the default suite again. */
+    RUN_TEST(pipeline_post_extract_budget_gate);
+    RUN_TEST(pipeline_post_extract_gate_aborts_before_publication);
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_generation);
     /* Extraction result spill (F1) */

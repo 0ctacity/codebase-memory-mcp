@@ -720,6 +720,20 @@ void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file_info_t
  * Implementation: pipeline.c. */
 void cbm_pipeline_stamp_coverage(cbm_pipeline_t *p, cbm_gbuf_t *gbuf);
 
+/* Log current + peak RSS and the configured budget at a phase boundary.
+ * Successive boundaries show which phase pushed the process peak up. */
+void cbm_pipeline_log_phase_mem(const char *phase);
+
+/* Post-extraction memory-budget gate (#49). The extract phase enforces the
+ * budget with back-pressure + result spill; registry, resolve, derived passes,
+ * dump and publish work on the whole graph at once. This reclaims freed pages
+ * and returns CBM_PIPELINE_ABORT_OVER_BUDGET when the resident graph is still
+ * over an *explicit* CBM_MEM_BUDGET_MB, so the caller stops before publication
+ * and the served generation is preserved. The detected RAM-fraction default is
+ * advisory here: hard-failing it would break runs that today finish with a
+ * soft overshoot. Returns 0 when under budget or when the budget is implicit. */
+int cbm_pipeline_budget_gate(const char *phase);
+
 /* ── Pass function prototypes ────────────────────────────────────── */
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
