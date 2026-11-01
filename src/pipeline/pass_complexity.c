@@ -219,7 +219,11 @@ static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_
     for (int i = 0; i < count; i++) {
         const cbm_gbuf_node_t *n = nodes[i];
         if (n->id >= 1 && n->id <= maxid) {
-            loop_depth[n->id] = json_get_int(n->properties_json, "loop_depth", 0);
+            /* CBM_WALK_METRIC_UNAVAILABLE (-1) marks a body whose metric walk
+             * could not grow its stack; propagate it as "no loops of its own"
+             * rather than letting it subtract from its callers' depth. */
+            int ld = json_get_int(n->properties_json, "loop_depth", 0);
+            loop_depth[n->id] = ld < 0 ? 0 : ld;
             recursive[n->id] = json_get_bool(n->properties_json, "self_recursive");
             nptr[n->id] = (cbm_gbuf_node_t *)n;
         }

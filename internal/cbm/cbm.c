@@ -837,19 +837,46 @@ static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_
 /* Walks to the end even after the cap is full, so `dropped` is the real number
  * of ranges lost rather than a lower bound. This costs little: the walk never
  * descends into an ERROR subtree — it records the top-most node and moves on —
- * so it only visits the spine of nodes that contain an error, plus one level. */
+ * so it only visits the spine of nodes that contain an error, plus one level.
+ *
+ * That descent follows the nesting of the construct that failed — every
+ * ancestor of the failing node carries ts_node_has_error — so a recursive walk
+ * used one stack frame per nesting level of the indexed file, and a deep
+ * enough nest ran the worker thread out of stack. The cursor keeps that path
+ * on the heap. The nodes visited and their order are those of the child-index
+ * loop it replaced: the cursor stops on exactly the children ts_node_child
+ * enumerates. */
 static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
                                       int source_len) {
-    uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k; i++) {
-        TSNode c = ts_node_child(n, i);
+    TSTreeCursor cursor = ts_tree_cursor_new(n);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    int depth = 0; /* 0 while on a direct child of n */
+    for (;;) {
+        TSNode c = ts_tree_cursor_current_node(&cursor);
+        bool descend = false;
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
-                continue; /* absent final newline only — nothing was dropped */
+            /* An absent final newline only means nothing was dropped. Anything
+             * else is the top-most region; do not descend. */
+            if (!cbm_is_eof_terminator_miss(c, source, source_len)) {
+                cbm_error_regions_push(acc, c);
             }
-            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source, source_len);
+            descend = true;
+        }
+        if (descend && ts_tree_cursor_goto_first_child(&cursor)) {
+            depth++;
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (depth == 0) {
+                ts_tree_cursor_delete(&cursor);
+                return;
+            }
+            (void)ts_tree_cursor_goto_parent(&cursor);
+            depth--;
         }
     }
 }
