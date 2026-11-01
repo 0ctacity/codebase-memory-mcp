@@ -255,8 +255,12 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
  *     macro-prefixed functions are nodes; a bodyless `struct X` is no node.
  * 3 = Zig node identities: declarations inside a named container are
  *     `<container>.<name>` (methods, nested structs/enums/unions, and alias
- *     Variables such as `pub const Db = impl.Database;`). */
-#define CBM_INDEX_FORMAT_VERSION_STR "3"
+ *     Variables such as `pub const Db = impl.Database;`).
+ * 4 = A file and the directory beside it with one stem (`pkg/foo.sh`,
+ *     `pkg/foo/`) no longer share a QN (cbm_stem_marks_t): the Folder is
+ *     `proj.pkg.foo/`, or, where the directory is a Java/Go package, the
+ *     file's Module is `proj.pkg.foo#sh`. */
+#define CBM_INDEX_FORMAT_VERSION_STR "4"
 
 /* Runs share no process-global state, so several may run in one process.
  * Same-workspace exclusion is the workspace lease
