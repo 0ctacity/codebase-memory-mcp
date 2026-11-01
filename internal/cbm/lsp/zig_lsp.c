@@ -2,6 +2,7 @@
 #include "zig_lsp.h"
 #include "scope.h" /* cbm_lsp_max_walk_depth */
 #include "../helpers.h"
+#include "../cbm.h" // cbm_parse_source
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "tree_sitter/api.h"
@@ -1917,7 +1918,7 @@ void cbm_run_zig_lsp_cross_ex(CBMArena *arena, const char *source, int source_le
         TSParser *parser = ts_parser_new();
         if (parser) {
             ts_parser_set_language(parser, tree_sitter_zig());
-            tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+            tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
             ts_parser_delete(parser);
             owns_tree = true;
         }

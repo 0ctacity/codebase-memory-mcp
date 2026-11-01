@@ -639,6 +639,13 @@ const char *cbm_index_quarantine_phase(const char *rel_path);
 void cbm_index_mark_start(const char *rel_path);
 void cbm_index_mark_done(const char *rel_path);
 
+// Parse `source` as if its last line ended with "\n" (#53). The virtual newline
+// is edited back out of the returned tree, so every node range covers only the
+// real `source_len` bytes. Empty sources and sources already ending in "\n"
+// parse unchanged. Returns NULL when the parse fails or times out.
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts);
+
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file parse timeout in microseconds (0 = no timeout).

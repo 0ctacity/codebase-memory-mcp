@@ -30,6 +30,8 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "lang_specs.h"
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -473,16 +475,38 @@ TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610) {
 }
 
 /* GUARD: a MISSING/ERROR node WITH WIDTH at EOF is a genuine loss and must
- * still be flagged. A Makefile whose final recipe line lacks its newline really
- * does drop the recipe from the tree — cbm's flag is honest there. */
+ * still be flagged. The construct here is broken whether or not the line is
+ * terminated, so neither the zero-width rule nor the virtual final newline
+ * (#53) may excuse it.
+ *
+ * This guard used a Makefile whose final recipe line lacks its newline, which
+ * really did drop the recipe from the tree. Since #53 the parser sees that
+ * line terminated and the recipe parses, so there is no loss left to report --
+ * see makefile_unterminated_recipe_is_parsed_issue53. */
 TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
-    const char *src = "all:\n\techo hi"; /* no trailing newline; recipe is lost */
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1,"; /* unclosed at EOF */
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
     if (!flagged) {
         FAIL("a width-bearing parse failure at EOF must still be reported");
+    }
+    PASS();
+}
+
+/* #53: the recipe the old #1610 guard lost is now parsed -- the file is not
+ * flagged, with or without a trailing blank. */
+TEST(makefile_unterminated_recipe_is_parsed_issue53) {
+    const char *cases[] = {"all:\n\techo hi", "all:\n\techo hi "};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MAKEFILE, "Makefile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("an unterminated final recipe line must parse like a terminated one");
+        }
     }
     PASS();
 }
@@ -558,11 +582,12 @@ TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746) {
     PASS();
 }
 
-/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too — the
- * Makefile recipe really is dropped, and only zero-width nodes are excused. */
+/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too, and
+ * only zero-width nodes are excused. (Formerly the unterminated Makefile
+ * recipe, which #53 now parses -- see the #1610 guard above.) */
 TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
-    const char *src = "all:\n\techo hi ";
-    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    const char *src = "def ok():\n    return 1\nx = (1, ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "eof.py");
     ASSERT_NOT_NULL(r);
     bool flagged = r->parse_incomplete;
     cbm_free_result(r);
@@ -728,6 +753,283 @@ TEST(coverage_range_never_ends_past_the_last_line_issue963) {
     PASS();
 }
 
+/* ── #53: every file is parsed as if it ended with a newline ─────────────────
+ *
+ * Several grammars need a line terminator that a file's last line may simply
+ * not have. tree-sitter-markdown is the sharpest case: an opening code fence,
+ * an ATX heading or a bare list marker as the final bytes of a file leaves a
+ * WIDTH-BEARING ERROR (so the #1610 zero-width rule cannot excuse it), and a
+ * file that is only "```" came back as a whole-file error.
+ *
+ * cbm now feeds the parser one virtual "\n" past EOF when the last byte is not
+ * already a newline, then clamps the tree back to the real length, so no
+ * consumer sees a byte, a line or a range that is not in the file. */
+TEST(markdown_unterminated_last_line_is_clean_issue53) {
+    const char *cases[] = {
+        "text\n```", /* opening fence at EOF */
+        "```",       /* the whole file is one opening fence */
+        "# Top",     /* ATX heading */
+        "- ",        /* bare list marker */
+    };
+    int flagged = 0;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        if (r->parse_incomplete || r->parse_unusable) {
+            fprintf(stderr, "  case %zu flagged: partial=%d unusable=%d ranges=%s\n", i,
+                    r->parse_incomplete, r->parse_unusable,
+                    r->error_ranges ? r->error_ranges : "(none)");
+            flagged++;
+        }
+        cbm_free_result(r);
+    }
+    if (flagged) {
+        FAIL("a markdown file must not be flagged only because its last line is unterminated");
+    }
+    PASS();
+}
+
+/* Controls: the same bytes WITH the newline were already clean and stay so. */
+TEST(markdown_terminated_last_line_controls_unchanged_issue53) {
+    const char *cases[] = {"text\n```\n", "```\n", "# Top\n", "- \n"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_MARKDOWN, "doc.md");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT_FALSE(r->parse_unusable);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Everything extraction reports, as one string, so two results compare
+ * byte-for-byte: defs (every text field and range), calls (start bytes),
+ * imports and the coverage verdict. */
+enum { DUMP_CAP = 1 << 16 };
+
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;
+} dump_buf_t;
+
+static void dump_str(dump_buf_t *b, const char *tag, const char *s) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%s", tag, s ? s : "~");
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+static void dump_num(dump_buf_t *b, const char *tag, long v) {
+    int n = snprintf(b->buf + b->len, b->cap - b->len, " %s=%ld", tag, v);
+    if (n > 0 && (size_t)n < b->cap - b->len) {
+        b->len += (size_t)n;
+    }
+}
+
+/* The Module def spans the whole file, and its end line follows the line
+ * convention for a terminated last line (#1967), so it is compared on its own
+ * rather than through the dump. */
+static char *dump_extraction(const CBMFileResult *r) {
+    dump_buf_t b = {(char *)calloc(DUMP_CAP, 1), DUMP_CAP, 0};
+    if (!b.buf) {
+        return NULL;
+    }
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Module") == 0) {
+            continue;
+        }
+        dump_str(&b, "\nD", d->qualified_name);
+        dump_str(&b, "name", d->name);
+        dump_str(&b, "label", d->label);
+        dump_num(&b, "start", d->start_line);
+        dump_num(&b, "end", d->end_line);
+        dump_num(&b, "lines", d->lines);
+        dump_num(&b, "cx", d->complexity);
+        dump_num(&b, "params", d->param_count);
+        dump_str(&b, "sig", d->signature);
+        dump_str(&b, "ret", d->return_type);
+        dump_str(&b, "doc", d->docstring);
+        dump_str(&b, "prof", d->structural_profile);
+        dump_str(&b, "tok", d->body_tokens);
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        dump_str(&b, "\nC", c->callee_name);
+        dump_str(&b, "in", c->enclosing_func_qn);
+        dump_num(&b, "line", c->start_line);
+        dump_num(&b, "from", (long)c->site_start_byte);
+        dump_num(&b, "args", c->arg_count);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        dump_str(&b, "\nI", r->imports.items[i].local_name);
+        dump_str(&b, "path", r->imports.items[i].module_path);
+    }
+    dump_str(&b, "\nP", r->error_ranges);
+    dump_num(&b, "partial", r->parse_incomplete);
+    dump_num(&b, "unusable", r->parse_unusable);
+    dump_str(&b, "", "\n");
+    return b.buf;
+}
+
+static uint32_t module_end_line(const CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return r->defs.items[i].end_line;
+        }
+    }
+    return 0;
+}
+
+static char *extract_dump(const char *src, CBMLanguage lang, const char *path,
+                          uint32_t *module_end) {
+    CBMFileResult *r = do_extract(src, lang, path);
+    if (!r) {
+        return NULL;
+    }
+    char *d = dump_extraction(r);
+    if (module_end) {
+        *module_end = module_end_line(r);
+    }
+    cbm_free_result(r);
+    return d;
+}
+
+/* GUARD: for code grammars a trailing newline is insignificant, so a file
+ * without one must extract byte-identically to the same file with one -- every
+ * def, range, text field and call start byte. The virtual newline may never
+ * show up as phantom content or a phantom line. */
+TEST(code_without_final_newline_extracts_identically_issue53) {
+    struct {
+        const char *src; /* no trailing newline */
+        CBMLanguage lang;
+        const char *path;
+        uint32_t lines;
+    } cases[] = {
+        {"#include <stdio.h>\n\nstatic int beta(int x) {\n    return x + 1;\n}\n\n"
+         "void alpha(void) { printf(\"a\"); beta(2); }",
+         CBM_LANG_C, "a.c", 7},
+        {"import os\n\n\nclass K:\n    def m(self, a):\n        return os.path.join(a)\n\n\n"
+         "def f(x):\n    \"\"\"doc\"\"\"\n    return K().m(x)",
+         CBM_LANG_PYTHON, "a.py", 11},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t n = strlen(cases[i].src);
+        char *terminated = (char *)malloc(n + 2);
+        ASSERT_NOT_NULL(terminated);
+        memcpy(terminated, cases[i].src, n);
+        terminated[n] = '\n';
+        terminated[n + 1] = '\0';
+        uint32_t bare_module_end = 0;
+        char *bare = extract_dump(cases[i].src, cases[i].lang, cases[i].path, &bare_module_end);
+        char *term = extract_dump(terminated, cases[i].lang, cases[i].path, NULL);
+        free(terminated);
+        ASSERT_NOT_NULL(bare);
+        ASSERT_NOT_NULL(term);
+        bool same = strcmp(bare, term) == 0;
+        if (!same) {
+            fprintf(stderr, "  %s differs:\n--- without final newline%s--- with final newline%s",
+                    cases[i].path, bare, term);
+        }
+        free(bare);
+        free(term);
+        if (!same) {
+            FAIL("extraction must not depend on whether the last line is terminated");
+        }
+        if (bare_module_end != cases[i].lines) {
+            fprintf(stderr, "  %s: module ends on line %u, file has %u\n", cases[i].path,
+                    bare_module_end, cases[i].lines);
+            FAIL("the virtual newline must not add a line to the module");
+        }
+    }
+    PASS();
+}
+
+/* GUARD against phantom content: a heading on an unterminated last line is a
+ * one-line file. No def may end past line 1 and no text may carry the virtual
+ * newline. */
+TEST(virtual_newline_adds_no_phantom_line_or_text_issue53) {
+    CBMFileResult *r = do_extract("# Top", CBM_LANG_MARKDOWN, "top.md");
+    ASSERT_NOT_NULL(r);
+    bool found = has_def(r, "Top");
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->end_line > 1 || d->start_line > 1) {
+            fprintf(stderr, "  def %s spans %u-%u\n", d->name ? d->name : "?", d->start_line,
+                    d->end_line);
+            cbm_free_result(r);
+            FAIL("no def may reach past the last real line");
+        }
+        if ((d->name && strchr(d->name, '\n')) || (d->signature && strchr(d->signature, '\n'))) {
+            cbm_free_result(r);
+            FAIL("no extracted text may contain the virtual newline");
+        }
+    }
+    cbm_free_result(r);
+    if (!found) {
+        /* Before #53 the unterminated heading was silently dropped: no
+         * Section, and no parse_incomplete flag to say so. */
+        FAIL("the heading on an unterminated last line must be extracted as a Section");
+    }
+    PASS();
+}
+
+/* GUARD: the empty file and a file that is exactly "\n" get no virtual
+ * newline (nothing is unterminated) and stay clean. */
+TEST(empty_and_newline_only_files_unchanged_issue53) {
+    const char *srcs[] = {"", "\n"};
+    CBMLanguage langs[] = {CBM_LANG_MARKDOWN, CBM_LANG_PYTHON, CBM_LANG_C};
+    const char *paths[] = {"e.md", "e.py", "e.c"};
+    for (size_t s = 0; s < sizeof(srcs) / sizeof(srcs[0]); s++) {
+        for (size_t l = 0; l < sizeof(langs) / sizeof(langs[0]); l++) {
+            CBMFileResult *r = do_extract(srcs[s], langs[l], paths[l]);
+            ASSERT_NOT_NULL(r);
+            ASSERT_FALSE(r->parse_incomplete);
+            ASSERT_FALSE(r->parse_unusable);
+            cbm_free_result(r);
+        }
+    }
+    PASS();
+}
+
+/* An LSP pass with no retained tree re-parses the file itself. That fallback
+ * must see the tree extraction saw, and neither may reach past the real
+ * bytes. */
+TEST(parse_source_matches_retained_tree_issue53) {
+    const char *src = "all:\n\techo hi";
+    uint32_t len = (uint32_t)strlen(src);
+    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->cached_tree);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_MAKEFILE)));
+    TSTree *fallback = cbm_parse_source(parser, src, len, (TSParseOptions){0});
+    ts_parser_delete(parser);
+    ASSERT_NOT_NULL(fallback);
+    TSNode kept = ts_tree_root_node(r->cached_tree);
+    TSNode again = ts_tree_root_node(fallback);
+    char *kept_sexp = ts_node_string(kept);
+    char *again_sexp = ts_node_string(again);
+    bool same = strcmp(kept_sexp, again_sexp) == 0;
+    bool kept_in_bounds = ts_node_end_byte(kept) <= len && ts_node_end_point(kept).row == 1;
+    bool again_in_bounds = ts_node_end_byte(again) <= len && ts_node_end_point(again).row == 1;
+    bool clean = !ts_node_has_error(again);
+    if (!same) {
+        fprintf(stderr, "  retained: %s\n  fallback: %s\n", kept_sexp, again_sexp);
+    }
+    free(kept_sexp);
+    free(again_sexp);
+    ts_tree_delete(fallback);
+    cbm_free_result(r);
+    ASSERT_TRUE(same);
+    ASSERT_TRUE(kept_in_bounds);
+    ASSERT_TRUE(again_in_bounds);
+    ASSERT_TRUE(clean);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -752,12 +1054,19 @@ SUITE(parse_coverage) {
     RUN_TEST_LANG(CBM_LANG_DOCKERFILE, dockerfile_crlf_trailing_space_at_eof_not_flagged_issue1746);
     RUN_TEST_LANG(CBM_LANG_GOMOD, missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
-    RUN_TEST_LANG(CBM_LANG_MAKEFILE, width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST_LANG(CBM_LANG_MAKEFILE, makefile_unterminated_recipe_is_parsed_issue53);
     RUN_TEST_LANG(CBM_LANG_PERL, perl_malformed_source_remains_partial_issue1838);
     RUN_TEST_LANG(CBM_LANG_DOCKERFILE, dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
     RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
-    RUN_TEST_LANG(CBM_LANG_MAKEFILE, width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
+    RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(c_thread_local_grammar_limit_is_pinned_issue963);
     RUN_TEST(coverage_repeated_error_line_reports_one_range_issue963);
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
+    RUN_TEST_LANG(CBM_LANG_MARKDOWN, markdown_unterminated_last_line_is_clean_issue53);
+    RUN_TEST_LANG(CBM_LANG_MARKDOWN, markdown_terminated_last_line_controls_unchanged_issue53);
+    RUN_TEST(code_without_final_newline_extracts_identically_issue53);
+    RUN_TEST_LANG(CBM_LANG_MARKDOWN, virtual_newline_adds_no_phantom_line_or_text_issue53);
+    RUN_TEST_LANG(CBM_LANG_MARKDOWN, empty_and_newline_only_files_unchanged_issue53);
+    RUN_TEST_LANG(CBM_LANG_MAKEFILE, parse_source_matches_retained_tree_issue53);
 }
