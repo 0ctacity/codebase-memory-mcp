@@ -2,6 +2,7 @@
 #define CBM_GIT_CONTEXT_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 typedef struct {
     bool is_git;
@@ -23,5 +24,10 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
+
+/* `git -C <repo_path> ls-files -z`: the tracked paths below repo_path,
+ * relative to it and NUL-separated, in one malloc'd buffer the caller frees.
+ * A NUL follows the output; *length excludes it. NULL when git fails. */
+char *cbm_git_ls_files(const char *repo_path, size_t *length);
 
 #endif
