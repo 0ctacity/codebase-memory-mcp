@@ -7568,6 +7568,266 @@ TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full) {
 }
 
 #if CBM_WITH_ZOVA
+/* Re-index g_incr_tmpdir over its existing graph and require `route`, then
+ * compare with a fresh full index. 0 when both hold. */
+static int stem_reindex_matches_full(const char *project, cbm_pipeline_route_t route) {
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, NULL, CBM_MODE_FULL);
+    if (!p || cbm_pipeline_run(p) != 0 || cbm_pipeline_get_last_route(p) != route) {
+        printf("    route %d, want %d\n", p ? (int)cbm_pipeline_get_last_route(p) : -1, (int)route);
+        cbm_pipeline_free(p);
+        return -1;
+    }
+    cbm_pipeline_free(p);
+    pipeline_zova_project_info_t after;
+    pipeline_zova_project_info_t full;
+    if (pipeline_zova_project_info(project, &after) != 0 ||
+        pipeline_zova_fresh_full_info(project, &full) != 0) {
+        return -2;
+    }
+    return pipeline_zova_project_info_equal(&after, &full) ? 0 : 1;
+}
+
+/* 1 when the node `<project>.<suffix>` has this label and file path. */
+static int stem_incr_node(const char *project, const char *suffix, const char *label,
+                          const char *file_path) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, suffix);
+    bool exists = false;
+    return pipeline_zova_trace_node_exists(project, label, file_path, qn, &exists) == 0 && exists;
+}
+#endif
+
+/* Which side of a stem collision yields depends on the whole file set, so an
+ * incremental run that adds or deletes a file on either side must fall back to
+ * a full index (#51). Edits that keep the file set must stay incremental, and
+ * every result must equal a fresh full index. */
+TEST(pipeline_incremental_stem_collision_matches_fresh_full) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    const char *dir = g_incr_tmpdir;
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    th_write_file(TH_PATH(dir, "genproto/one.sh"), "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    th_write_file(TH_PATH(dir, "goapi/api.sh"), "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    th_write_file(TH_PATH(dir, "goapi/api/server.go"), "package api\n\nfunc Serve() {}\n");
+    th_write_file(TH_PATH(dir, "goapi/api/run.sh"), "#!/bin/sh\nrun() {\n  echo run\n}\n");
+    th_write_file(TH_PATH(dir, "misc/other.sh"), "#!/bin/sh\nother() {\n  echo other\n}\n");
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(dir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+    ASSERT_TRUE(stem_incr_node(project, "genproto/", "Folder", "genproto"));
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api#sh", "Module", "goapi/api.sh"));
+
+    /* Same file set: incremental, same spelling as a full index. */
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all2\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto", "Module", "genproto.sh"));
+    ASSERT_EQ(remove(TH_PATH(dir, "misc/other.sh")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+
+    /* Deleting or re-adding the file side flips the Folder's spelling. */
+    ASSERT_EQ(remove(TH_PATH(dir, "genproto.sh")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto", "Folder", "genproto"));
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto/", "Folder", "genproto"));
+
+    /* The directory stops being a Go package: the Module takes the plain QN
+     * back and the Folder yields instead. */
+    ASSERT_EQ(remove(TH_PATH(dir, "goapi/api/server.go")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api", "Module", "goapi/api.sh"));
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api/", "Folder", "goapi/api"));
+
+    /* A new file inside an already-marked directory changes no side. */
+    th_write_file(TH_PATH(dir, "genproto/two.sh"), "#!/bin/sh\ngen_two() {\n  echo two\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+/* 1 when the node `<project>.<suffix>` exists with this label and, when
+ * file_path is set, this file path. */
+static int stem_node(cbm_store_t *s, const char *project, const char *suffix, const char *label,
+                     const char *file_path) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, suffix);
+    cbm_node_t node = {0};
+    int found = cbm_store_find_node_by_qn(s, project, qn, &node) == CBM_STORE_OK &&
+                strcmp(node.label, label) == 0 &&
+                (!file_path || (node.file_path && strcmp(node.file_path, file_path) == 0));
+    cbm_node_free_fields(&node);
+    return found;
+}
+
+/* Edges of `type` into the node with QN `target` whose source has this label
+ * and file path. */
+static int stem_edges_into(cbm_store_t *s, const char *project, const char *type,
+                           const char *target, const char *src_label, const char *src_file) {
+    cbm_node_t node = {0};
+    int n = 0;
+    if (cbm_store_find_node_by_qn(s, project, target, &node) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        cbm_store_find_edges_by_target_type(s, node.id, type, &edges, &count);
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                strcmp(src.label, src_label) == 0 && src.file_path &&
+                strcmp(src.file_path, src_file) == 0) {
+                n++;
+            }
+            cbm_node_free_fields(&src);
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_node_free_fields(&node);
+    return n;
+}
+
+/* Folder nodes whose QN is also a Module node's QN. */
+static int stem_shared_qns(cbm_store_t *s, const char *project) {
+    cbm_node_t *folders = NULL;
+    cbm_node_t *modules = NULL;
+    int nf = 0;
+    int nm = 0;
+    cbm_store_find_nodes_by_label(s, project, "Folder", &folders, &nf);
+    cbm_store_find_nodes_by_label(s, project, "Module", &modules, &nm);
+    int shared = 0;
+    for (int f = 0; f < nf; f++) {
+        for (int m = 0; m < nm; m++) {
+            shared += strcmp(folders[f].qualified_name, modules[m].qualified_name) == 0;
+        }
+    }
+    cbm_store_free_nodes(folders, nf);
+    cbm_store_free_nodes(modules, nm);
+    return shared;
+}
+
+/* Every collision shape of cbm_stem_marks_t, plus `fillers` plain scripts. */
+static void stem_repo(const char *tmp, int fillers) {
+    th_write_file(TH_PATH(tmp, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    th_write_file(TH_PATH(tmp, "genproto/one.sh"), "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    th_write_file(TH_PATH(tmp, "rs/foo.rs"), "pub mod bar;\npub fn top() {}\n");
+    th_write_file(TH_PATH(tmp, "rs/foo/bar.rs"), "pub fn inner() {}\n");
+    th_write_file(TH_PATH(tmp, "c/foo.h"), "int foo_add(int a, int b);\n");
+    th_write_file(TH_PATH(tmp, "c/foo.c"),
+                  "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    th_write_file(TH_PATH(tmp, "c/foo/x.c"), "int foo_x(void) { return 1; }\n");
+    th_write_file(TH_PATH(tmp, "go.mod"), "module example.com/stem\n\ngo 1.21\n");
+    th_write_file(TH_PATH(tmp, "goapi/api.sh"), "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    th_write_file(TH_PATH(tmp, "goapi/api/server.go"), "package api\n\nfunc Serve() {}\n");
+    th_write_file(TH_PATH(tmp, "goapi/main/main.go"),
+                  "package main\n\nimport \"example.com/stem/goapi/api\"\n\n"
+                  "func main() { api.Serve() }\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "fill/f%02d.sh", i);
+        snprintf(body, sizeof(body), "#!/bin/sh\nfill_%02d() {\n  echo %d\n}\n", i, i);
+        th_write_file(TH_PATH(tmp, name), body);
+    }
+}
+
+/* A file and the directory beside it with one stem (genproto.sh, genproto/)
+ * shared a QN, and the graph buffer kept only the Folder: the file's Module
+ * was lost (#51). Now one side yields (cbm_stem_marks_t). The Folder is
+ * spelled `genproto/` -- unless the directory is a Go package: it IS that
+ * package's module and Go imports land on it, so the file's Module yields as
+ * `goapi.api#sh`. Rust's foo.rs beside foo/ keeps its symbol QNs, and C's
+ * foo.h/foo.c stem pair still shares one Module. Run small (sequential
+ * extraction) and past MIN_FILES_FOR_PARALLEL (parallel workers), which
+ * insert Modules on separate paths. */
+static int check_stem_collision(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_stem_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    stem_repo(tmp, fillers);
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, NULL, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = rc == 0 ? th_open_repo_store(tmp) : NULL;
+    enum { STEM_CHECKS = 15 };
+    int got[STEM_CHECKS] = {0};
+    int shared = -1;
+    if (s) {
+        char qn[512];
+        got[0] = stem_node(s, project, "genproto", "Module", "genproto.sh");
+        got[1] = stem_node(s, project, "genproto/", "Folder", "genproto");
+        char *one_qn = cbm_pipeline_fqn_compute(project, "genproto/one.sh", "__file__");
+        got[2] =
+            one_qn ? stem_edges_into(s, project, "CONTAINS_FILE", one_qn, "Folder", "genproto") : 0;
+        free(one_qn);
+        snprintf(qn, sizeof(qn), "%s.genproto", project);
+        got[3] = stem_edges_into(s, project, "DEFINES", qn, "File", "genproto.sh");
+        got[4] = stem_node(s, project, "genproto.gen_all", "Function", "genproto.sh");
+        got[5] = stem_node(s, project, "rs.foo", "Module", "rs/foo.rs");
+        got[6] = stem_node(s, project, "rs.foo.top", "Function", "rs/foo.rs");
+        got[7] = stem_node(s, project, "rs.foo.bar", "Module", "rs/foo/bar.rs");
+        got[8] = stem_node(s, project, "rs.foo/", "Folder", "rs/foo");
+        got[9] = stem_node(s, project, "c.foo", "Module", NULL);
+        got[10] = stem_node(s, project, "c.foo/", "Folder", "c/foo");
+        got[11] = stem_node(s, project, "goapi.api", "Folder", "goapi/api");
+        got[12] = stem_node(s, project, "goapi.api#sh", "Module", "goapi/api.sh");
+        snprintf(qn, sizeof(qn), "%s.goapi.api#sh", project);
+        got[13] = stem_edges_into(s, project, "DEFINES", qn, "File", "goapi/api.sh");
+        snprintf(qn, sizeof(qn), "%s.goapi.api", project);
+        got[14] = stem_edges_into(s, project, "IMPORTS", qn, "File", "goapi/main/main.go") > 0;
+        shared = stem_shared_qns(s, project);
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (fillers > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    free(saved);
+    th_rmtree(tmp);
+    printf("    fillers=%d checks:", fillers);
+    for (int c = 0; c < STEM_CHECKS; c++) {
+        printf(" %d", got[c]);
+    }
+    printf(" shared=%d\n", shared);
+    ASSERT_EQ(rc, 0);
+    for (int c = 0; c < STEM_CHECKS; c++) {
+        ASSERT_EQ(got[c], 1);
+    }
+    ASSERT_EQ(shared, 0);
+    PASS();
+}
+
+TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
+    int rc = check_stem_collision(0);
+    if (rc != 0) {
+        return rc;
+    }
+    return check_stem_collision(60);
+}
+
+#if CBM_WITH_ZOVA
 /* Index g_incr_tmpdir fully, apply `edit`, re-index on the incremental route,
  * and compare the result with a fresh full index of the edited tree. */
 static int pipeline_incremental_edit_matches_full(void (*edit)(void), char **out_project) {
@@ -10051,6 +10311,7 @@ SUITE(pipeline) {
     /* File persistence */
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
@@ -10264,6 +10525,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_single_file_preserves_and_removes_exact_project_summary);
     RUN_TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full);
     RUN_TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full);
+    RUN_TEST(pipeline_incremental_stem_collision_matches_fresh_full);
     RUN_TEST(pipeline_incremental_infra_route_change_matches_fresh_full);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

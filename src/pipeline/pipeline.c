@@ -26,6 +26,9 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "zova/cbm_zova_repository.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
+#include "arena.h"
+#include "cbm.h"
+#include "helpers.h" /* cbm_fqn_module_source_lang, cbm_fqn_folder */
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
@@ -442,13 +445,98 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
 
 /* ── Pass 1: Structure ──────────────────────────────────────────── */
 
+/* True for languages whose module QN is the CONTAINING DIRECTORY (Java/Go
+ * package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c). */
+static bool stem_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
+/* Each file's Module QN, computed as extraction computes it, and the Folder
+ * QN of every directory above it. */
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count) {
+    cbm_arena_init(&m->arena);
+    m->module_qns = cbm_ht_create(CBM_SZ_256);
+    m->dir_module_qns = cbm_ht_create(CBM_SZ_64);
+    m->folder_qns = cbm_ht_create(CBM_SZ_256);
+    for (int i = 0; i < file_count; i++) {
+        const char *rel = files[i].rel_path;
+        if (!rel) {
+            continue;
+        }
+        char *qn = cbm_fqn_module_source_lang(&m->arena, project, rel, files[i].language);
+        if (qn) {
+            cbm_ht_set(stem_module_is_dir(files[i].language) ? m->dir_module_qns : m->module_qns,
+                       qn, qn);
+        }
+        for (const char *s = strchr(rel, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+            char *dir = cbm_arena_strndup(&m->arena, rel, (size_t)(s - rel));
+            char *fqn = dir ? cbm_fqn_folder(&m->arena, project, dir) : NULL;
+            if (fqn) {
+                cbm_ht_set(m->folder_qns, fqn, fqn);
+            }
+        }
+    }
+}
+
+void cbm_stem_marks_free(cbm_stem_marks_t *m) {
+    cbm_ht_free(m->module_qns);
+    cbm_ht_free(m->dir_module_qns);
+    cbm_ht_free(m->folder_qns);
+    cbm_arena_destroy(&m->arena);
+}
+
+int cbm_stem_marks_side(const cbm_stem_marks_t *m, const char *qn) {
+    if (!m || !qn || !cbm_ht_get(m->module_qns, qn)) {
+        return CBM_STEM_NONE;
+    }
+    if (cbm_ht_get(m->dir_module_qns, qn)) {
+        return CBM_STEM_MODULE_YIELDS;
+    }
+    return cbm_ht_get(m->folder_qns, qn) ? CBM_STEM_FOLDER_YIELDS : CBM_STEM_NONE;
+}
+
+/* The extension names the yielding Module's file ("sh" for genproto.sh);
+ * "file" when there is none. */
+static const char *stem_mark_suffix(const char *rel_path) {
+    const char *base = strrchr(rel_path, '/');
+    base = base ? base + SKIP_ONE : rel_path;
+    const char *dot = strrchr(base, '.');
+    return dot && dot != base && dot[SKIP_ONE] ? dot + SKIP_ONE : "file";
+}
+
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size) {
+    if (!m || !qn || !rel_path || stem_module_is_dir(lang) || !cbm_ht_get(m->dir_module_qns, qn)) {
+        return qn;
+    }
+    int n = snprintf(buf, buf_size, "%s#%s", qn, stem_mark_suffix(rel_path));
+    return n > 0 && (size_t)n < buf_size ? buf : qn;
+}
+
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size) {
+    char *qn = cbm_pipeline_fqn_folder(project, rel_dir);
+    if (!qn) {
+        return NULL;
+    }
+    bool mark = m && cbm_ht_get(m->module_qns, qn) && !cbm_ht_get(m->dir_module_qns, qn);
+    int n = snprintf(buf, buf_size, "%s%s", qn, mark ? "/" : "");
+    free(qn);
+    return n >= 0 && (size_t)n < buf_size ? buf : NULL;
+}
+
 /* Create Project, Folder/Package, and File nodes in the graph buffer. */
 /* Walk directory chain upward, creating Folder nodes and CONTAINS_FOLDER edges. */
-static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable *seen_dirs) {
+static void create_folder_chain(cbm_pipeline_t *p, const cbm_stem_marks_t *marks, const char *dir,
+                                CBMHashTable *seen_dirs) {
     char *walk = strdup(dir);
     while (walk[0] != '\0' && !cbm_ht_get(seen_dirs, walk)) {
         cbm_ht_set(seen_dirs, strdup(walk), intptr_to_ptr(SKIP_ONE));
-        char *folder_qn = cbm_pipeline_fqn_folder(p->project_name, walk);
+        char folder_buf[CBM_SZ_8K];
+        const char *folder_qn =
+            cbm_stem_marks_folder_qn(marks, p->project_name, walk, folder_buf, sizeof(folder_buf));
         const char *dir_base = strrchr(walk, '/');
         dir_base = dir_base ? dir_base + SKIP_ONE : walk;
         cbm_gbuf_upsert_node(p->gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
@@ -462,20 +550,17 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
             pdir = strdup("");
         }
         const char *pqn;
-        char *pqn_heap = NULL;
+        char pqn_buf[CBM_SZ_8K];
         if (pdir[0] == '\0') {
             pqn = p->branch_qn ? p->branch_qn : p->project_name;
         } else {
-            pqn_heap = cbm_pipeline_fqn_folder(p->project_name, pdir);
-            pqn = pqn_heap;
+            pqn = cbm_stem_marks_folder_qn(marks, p->project_name, pdir, pqn_buf, sizeof(pqn_buf));
         }
         const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_qn(p->gbuf, folder_qn);
         const cbm_gbuf_node_t *pn = cbm_gbuf_find_by_qn(p->gbuf, pqn);
         if (fn && pn) {
             cbm_gbuf_insert_edge(p->gbuf, pn->id, fn->id, "CONTAINS_FOLDER", "{}");
         }
-        free(folder_qn);
-        free(pqn_heap);
         char *up = strrchr(walk, '/');
         if (up) {
             *up = '\0';
@@ -487,7 +572,8 @@ static void create_folder_chain(cbm_pipeline_t *p, const char *dir, CBMHashTable
     free(walk);
 }
 
-static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count) {
+static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
+                          const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
     /* Project node */
@@ -551,16 +637,16 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         }
 
         const char *parent_qn;
-        char *parent_qn_heap = NULL;
+        char parent_buf[CBM_SZ_8K];
         if (dir[0] == '\0') {
             parent_qn = branch_qn;
         } else {
-            parent_qn_heap = cbm_pipeline_fqn_folder(p->project_name, dir);
-            parent_qn = parent_qn_heap;
+            parent_qn = cbm_stem_marks_folder_qn(marks, p->project_name, dir, parent_buf,
+                                                 sizeof(parent_buf));
         }
 
         /* Walk up directory chain, creating Folder nodes */
-        create_folder_chain(p, dir, seen_dirs);
+        create_folder_chain(p, marks, dir, seen_dirs);
 
         /* Now create the CONTAINS_FILE edge */
         const cbm_gbuf_node_t *fnode = cbm_gbuf_find_by_qn(p->gbuf, file_qn);
@@ -571,7 +657,6 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
 
         free(file_qn);
         free(dir);
-        free(parent_qn_heap);
     }
 
     /* Free seen_dirs keys */
@@ -1187,6 +1272,11 @@ static int try_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
                                                                &snapshot, preloaded);
                     preloaded = NULL;
                     cbm_zova_workspace_snapshot_free(&snapshot);
+                    if (rc == CBM_PIPELINE_INCREMENTAL_DECLINED) {
+                        cbm_log_info("pipeline.route", "path", "incremental_declined_reindex",
+                                     "authority", "zova");
+                        return CBM_NOT_FOUND;
+                    }
                     if (rc == CBM_PIPELINE_ABORT_OVER_BUDGET) {
                         return rc;
                     }
@@ -1507,12 +1597,12 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 #define MIN_FILES_FOR_PARALLEL 50
 
 /* Run structure + extraction passes (parallel or sequential). */
-static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
-                                const cbm_file_info_t *files, int file_count) {
+static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                        const cbm_file_info_t *files, int file_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     CBM_PROF_START(t_struct);
-    pass_structure(p, files, file_count);
+    pass_structure(p, ctx->stem_marks, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
     if (check_cancel(p)) {
@@ -1531,6 +1621,19 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc == 0) {
         cbm_pipeline_stamp_coverage(p, p->gbuf);
     }
+    return rc;
+}
+
+/* The stem collisions decide Folder QNs (structure) and Module QNs
+ * (extraction); both phases read the one set. */
+static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                const cbm_file_info_t *files, int file_count) {
+    cbm_stem_marks_t marks;
+    cbm_stem_marks_init(&marks, p->project_name, files, file_count);
+    ctx->stem_marks = &marks;
+    int rc = run_structure_and_extraction(p, ctx, files, file_count);
+    ctx->stem_marks = NULL;
+    cbm_stem_marks_free(&marks);
     return rc;
 }
 
