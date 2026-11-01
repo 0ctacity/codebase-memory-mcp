@@ -1884,12 +1884,14 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
     uint64_t lsp_start = now_ns();
+    bool c_lsp_complete = true; // the raw C/C++ walk did not stop on a failure
     {
         if (language == CBM_LANG_GO) {
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-            cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
+            c_lsp_complete =
+                cbm_run_c_lsp(a, result, source, source_len, root, language != CBM_LANG_C);
         }
         if (language == CBM_LANG_PHP) {
             cbm_run_php_lsp(a, result, source, source_len, root);
@@ -1988,9 +1990,12 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
 
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing
-                    // block). Runs in every mode.
-                    cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
-                                  language != CBM_LANG_C);
+                    // block). Runs in every mode, unless the raw walk already
+                    // stopped on a memo or depth failure.
+                    if (c_lsp_complete) {
+                        cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
+                                      language != CBM_LANG_C);
+                    }
 
                     ts_tree_delete(pp_tree);
                 }

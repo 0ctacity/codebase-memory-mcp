@@ -1597,6 +1597,11 @@ typedef struct {
     /* Counters for parallel.resolve.lsp_cross_done summary. */
     _Atomic int lsp_cross_processed;
     _Atomic int lsp_cross_skipped_no_source;
+    /* Error message of a cross-file LSP walk that stopped incomplete, per
+     * file index. Each file is owned by one worker; the coordinator reports
+     * them after join, so the pipeline's error list is never mutated
+     * concurrently. */
+    const char **lsp_failures;
 
     /* Per-sub-phase timing (ns aggregated across workers) — surfaces
      * exactly where parallel_resolve's wall time is spent so we stop
@@ -3093,11 +3098,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                  * file around the resolve so a hang HERE is attributed to
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
+                bool had_error = result->has_error;
                 cbm_pxc_dispatch_file(lang, result, lsp_source, lsp_source_len, rel, def_module,
                                       rc->cross_registries, rc->module_def_index, rc->all_defs,
                                       rc->def_count, imp_keys, imp_vals, imp_count,
                                       pp_rust_shared_registry_get, rc);
                 cbm_index_mark_done(rel);
+                if (!had_error && result->has_error) {
+                    rc->lsp_failures[file_idx] = result->error_msg;
+                }
                 /* Free the on-demand re-read (no-op when source was retained). */
                 free_source(lsp_source_owned);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
@@ -3206,6 +3215,11 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return CBM_NOT_FOUND;
     }
     memset(workers, 0, (size_t)worker_count * sizeof(resolve_worker_state_t));
+    const char **lsp_failures = calloc((size_t)file_count, sizeof(*lsp_failures));
+    if (!lsp_failures) {
+        cbm_aligned_free(workers);
+        return CBM_NOT_FOUND;
+    }
 
     bool have_rust = false;
     for (int i = 0; i < file_count; i++) {
@@ -3246,6 +3260,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         .module_def_index = module_def_index,
         .cross_registries = cross_registries,
         .rust_manifest = rust_manifest_ptr,
+        .lsp_failures = lsp_failures,
     };
     atomic_init(&rc.next_file_idx, 0);
     atomic_init(&rc.lsp_cross_processed, 0);
@@ -3264,6 +3279,13 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_parallel_for(worker_count, resolve_worker, &rc, opts);
     CBM_PROF_END_N("parallel_resolve", "1_dispatch_workers_parallel", t_resolve_dispatch,
                    file_count);
+    for (int i = 0; i < file_count; i++) {
+        if (lsp_failures[i] && ctx->pipeline) {
+            cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, lsp_failures[i],
+                                        "lsp_incomplete");
+        }
+    }
+    free(lsp_failures);
     /* Workers joined: the shared Rust registry (if built) is no longer read.
      * Free its dedicated arena + the lock (registry was self-contained: it strdup'd
      * all QNs, so freeing all_defs afterward is safe). */
