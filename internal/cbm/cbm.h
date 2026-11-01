@@ -406,6 +406,18 @@ typedef struct {
     int cap;
 } CBMResolvedCallArray;
 
+/* Outcome of a type-aware resolver (LSP) walk. The failures stop the walk,
+ * which then drops its own output; output produced before it is kept. */
+typedef enum {
+    CBM_LSP_COMPLETE = 0,
+    CBM_LSP_MEMO_FAILED,
+    CBM_LSP_DEPTH_EXCEEDED,
+} CBMLSPStatus;
+
+// Walk kinds for the cbm_*_lsp_test_fail_walks test hooks: the per-file walks
+// run during extraction, and the cross-file walks run by the pipeline.
+enum { CBM_LSP_TEST_FILE_WALKS = 1, CBM_LSP_TEST_CROSS_WALKS = 2 };
+
 // Growable arrays used during extraction.
 typedef struct {
     CBMDefinition *items;

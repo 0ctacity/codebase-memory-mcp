@@ -208,10 +208,15 @@ typedef struct {
                    * "parse timeout", "read failed"). For the partial phases
                    * this is the 1-based line-range list ("12-40,88-90"). */
     char *phase;  /* "read" | "extract" | "oversized" | "crash" | "hang" |
-                   * "parse_partial" | "parse_unusable". Neither is a skip: the
-                   * file was indexed but has unrecovered parse-error regions
+                   * "parse_partial" | "parse_unusable" | "lsp_incomplete".
+                   * The partial phases are not skips: the file was indexed
+                   * but has unrecovered parse-error regions
                    * ("parse_unusable": one range covers most of the file); the
-                   * MCP layer reports them apart from skipped[]. "cross_lsp" is a RESERVED
+                   * MCP layer reports them apart from skipped[].
+                   * "lsp_incomplete": the file was indexed, but its
+                   * cross-file C/C++ or Python walk hit the depth or memo
+                   * limit and kept only the calls resolved before it; it is
+                   * listed with the skips. "cross_lsp" is a RESERVED
                    * phase string for Track C's crash-attribution signal and is
                    * intentionally NOT emitted today (the cross-LSP passes are
                    * best-effort/void with no genuine per-file failure). */

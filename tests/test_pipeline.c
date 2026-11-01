@@ -10,6 +10,8 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "git/git_context.h"
@@ -2480,6 +2482,138 @@ static void teardown_usages_repo(void) {
     if (g_usages_tmpdir[0])
         rm_rf(g_usages_tmpdir);
     g_usages_tmpdir[0] = '\0';
+}
+
+/* #54: a C/C++ or Python LSP walk that stops on its depth or memo limit is
+ * reported on the pipeline's per-file error list, by both drivers. A failed
+ * per-file walk surfaces through extraction (phase "extract"); a failed
+ * cross-file walk as phase "lsp_incomplete". The failure is forced with the
+ * process-wide test hook so that it also reaches the parallel workers. */
+static int pipeline_lsp_failure_case(bool parallel, bool cross, bool python, bool depth) {
+    const char *src = python ? "class S:\n    def m(self):\n        return 1\n"
+                               "def run():\n    s = S()\n    s.m()\n"
+                             : "struct S { int m() { return 1; } };\n"
+                               "void run() { S s; s.m(); }\n";
+    const char *filename = python ? "walk.py" : "walk.cpp";
+    const char *extra_name = NULL;
+    const char *extra_src = NULL;
+    /* The cross walk needs a call the per-file walk cannot resolve. */
+    if (cross) {
+        src = python ? "from walk_def import S\ndef run():\n    s = S()\n    s.m()\n"
+                     : "void run() { S s; s.m(); }\n";
+        extra_name = python ? "walk_def.py" : "walk_def.cpp";
+        extra_src = python ? "class S:\n    def m(self):\n        return 1\n"
+                           : "struct S { int m() { return 1; } };\n";
+    }
+    if (setup_usages_repo(filename, src, extra_name, extra_src) != 0)
+        FAIL("failed to create LSP failure fixture");
+    char path[512];
+    if (parallel) {
+        /* The parallel driver runs above MIN_FILES_FOR_PARALLEL files. */
+        for (int i = 0; i < 51; i++) {
+            snprintf(path, sizeof(path), "%s/walk_pad_%02d.%s", g_usages_tmpdir, i,
+                     python ? "py" : "cpp");
+            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
+                                           : "// inert parallel routing fixture\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to create parallel routing fixture");
+            }
+        }
+    }
+    const char *old = getenv("CBM_WORKERS");
+    char *saved = old ? strdup(old) : NULL;
+    if (old && !saved) {
+        teardown_usages_repo();
+        FAIL("failed to save CBM_WORKERS");
+    }
+    int set_rc = cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    CBMLSPStatus status = depth ? CBM_LSP_DEPTH_EXCEEDED : CBM_LSP_MEMO_FAILED;
+    int kinds = cross ? CBM_LSP_TEST_CROSS_WALKS : CBM_LSP_TEST_FILE_WALKS;
+    if (python)
+        cbm_py_lsp_test_fail_walks(status, kinds);
+    else
+        cbm_c_lsp_test_fail_walks(status, kinds);
+    snprintf(path, sizeof(path), "%s/walk.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = set_rc == 0 ? cbm_pipeline_new(g_usages_tmpdir, path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_py_lsp_test_fail_walks(CBM_LSP_COMPLETE, 0);
+    cbm_c_lsp_test_fail_walks(CBM_LSP_COMPLETE, 0);
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    if (p)
+        cbm_pipeline_get_file_errors(p, &errors, &error_count);
+    const char *expected_reason = depth ? (python ? CBM_PY_LSP_DEPTH_ERROR : CBM_C_LSP_DEPTH_ERROR)
+                                        : (python ? CBM_PY_LSP_MEMO_ERROR : CBM_C_LSP_MEMO_ERROR);
+    const char *expected_phase = cross ? "lsp_incomplete" : "extract";
+    int walk_errors = 0;
+    bool precise = true;
+    for (int i = 0; i < error_count; i++) {
+        if (errors[i].path && strcmp(errors[i].path, filename) == 0) {
+            walk_errors++;
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, expected_phase) == 0 &&
+                      errors[i].reason && strcmp(errors[i].reason, expected_reason) == 0;
+        }
+    }
+    if (p)
+        cbm_pipeline_free(p);
+    int restore_rc = saved ? cbm_setenv("CBM_WORKERS", saved, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved);
+    teardown_usages_repo();
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(walk_errors, 1);
+    ASSERT_TRUE(precise);
+    PASS();
+}
+
+TEST(pipeline_issue54_c_file_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, false, false);
+}
+TEST(pipeline_issue54_c_file_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, false, false);
+}
+TEST(pipeline_issue54_c_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, false, false);
+}
+TEST(pipeline_issue54_c_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, false, false);
+}
+TEST(pipeline_issue54_c_file_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, false, true);
+}
+TEST(pipeline_issue54_c_file_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, false, true);
+}
+TEST(pipeline_issue54_c_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, false, true);
+}
+TEST(pipeline_issue54_c_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, false, true);
+}
+TEST(pipeline_issue54_python_file_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, true, false);
+}
+TEST(pipeline_issue54_python_file_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, true, false);
+}
+TEST(pipeline_issue54_python_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, true, false);
+}
+TEST(pipeline_issue54_python_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, true, false);
+}
+TEST(pipeline_issue54_python_file_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, true, true);
+}
+TEST(pipeline_issue54_python_file_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, true, true);
+}
+TEST(pipeline_issue54_python_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, true, true);
+}
+TEST(pipeline_issue54_python_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, true, true);
 }
 
 TEST(usages_creates_edges) {
@@ -10367,6 +10501,22 @@ TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
 }
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_issue54_c_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_depth_failure_parallel);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_null_repo);
