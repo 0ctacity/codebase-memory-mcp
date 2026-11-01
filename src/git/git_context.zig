@@ -51,7 +51,7 @@ fn gitCapture(repo_path: [*:0]const u8, git_args: []const u8, out: *[*c]u8) c_in
         std.mem.span(repo_path), git_args, null_dev,
     }, 0) catch return c.CBM_NOT_FOUND;
 
-    const fp = c.cbm_popen(cmd_z.ptr, "r");
+    const fp = c.cbm_popen_git(cmd_z.ptr);
     if (fp == null) return c.CBM_NOT_FOUND;
 
     var buf: [GIT_OUTPUT_MAX]u8 = undefined;
@@ -86,7 +86,7 @@ pub export fn cbm_git_ls_files(repo_path_c: ?[*:0]const u8, length_c: ?*usize) ?
         std.mem.span(repo_path), null_dev,
     }, 0) catch return null;
 
-    const fp = c.cbm_popen(cmd_z.ptr, "r");
+    const fp = c.cbm_popen_git(cmd_z.ptr);
     if (fp == null) return null;
 
     var cap: usize = GIT_OUTPUT_MAX;

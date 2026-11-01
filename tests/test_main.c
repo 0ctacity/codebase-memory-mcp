@@ -366,6 +366,9 @@ static const char *tf_isolate_user_cache(void) {
 }
 
 int main(int argc, char **argv) {
+    /* #56: never let a caller's GIT_DIR/GIT_INDEX_FILE/... redirect fixture
+     * git commands at the caller's real repository. */
+    th_clear_git_repo_env();
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
      * inheritable socket handle crossed into this child and exit before any suite. */
     int probe_rc = tf_maybe_run_socket_probe(argc, argv);
