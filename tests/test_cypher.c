@@ -913,6 +913,303 @@ TEST(cypher_exec_deadline_covers_joins_and_sorts) {
     PASS();
 }
 
+/* #59: ORDER BY, DISTINCT, GROUP BY and COUNT(DISTINCT) moved from quadratic
+ * scans to a merge sort and hash lookups. These differential tests check the
+ * results against the engine's own unsorted, undeduplicated, ungrouped rows.
+ * Fixture: 400 functions whose names repeat every 37, files every 13 and
+ * start lines every 50, so sorts have ties, DISTINCT has duplicates, groups
+ * are large and per-group distinct sets outgrow the linear-scan threshold. */
+enum { ORDER_FIXTURE_NODES = 400 };
+
+static cbm_store_t *setup_order_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    for (int i = 0; i < ORDER_FIXTURE_NODES; i++) {
+        char name[32];
+        char qn[48];
+        char file[32];
+        snprintf(name, sizeof(name), "fn%02d", (i * 7) % 37);
+        snprintf(qn, sizeof(qn), "test.mod.fn_%03d", i);
+        snprintf(file, sizeof(file), "file%02d.go", (i * 5) % 13);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = file,
+                        .start_line = (i * 11) % 50 + 1,
+                        .end_line = 60};
+        cbm_store_upsert_node(s, &n);
+    }
+    return s;
+}
+
+/* How the reference sort compares one key: RETURN compares numeric columns
+ * as integers, WITH compares numerically when both values parse as numbers. */
+typedef enum { KEY_TEXT, KEY_INT, KEY_WITH } order_mode_t;
+
+typedef struct {
+    int col;
+    bool desc;
+    order_mode_t mode;
+} order_key_t;
+
+static int order_cmp(const char **a, const char **b, const order_key_t *keys, int nkeys) {
+    int cmp = 0;
+    for (int k = 0; k < nkeys && cmp == 0; k++) {
+        const char *x = a[keys[k].col];
+        const char *y = b[keys[k].col];
+        char *ex = NULL;
+        char *ey = NULL;
+        double dx = strtod(x, &ex);
+        double dy = strtod(y, &ey);
+        if (keys[k].mode == KEY_INT) {
+            long lx = strtol(x, NULL, 10);
+            long ly = strtol(y, NULL, 10);
+            cmp = (lx > ly) - (lx < ly);
+        } else if (keys[k].mode == KEY_WITH && ex != x && ey != y) {
+            cmp = (dx > dy) - (dx < dy);
+        } else {
+            cmp = strcmp(x, y);
+        }
+        if (keys[k].desc) {
+            cmp = -cmp;
+        }
+    }
+    return cmp;
+}
+
+static bool run_rows(cbm_store_t *s, const char *query, cbm_cypher_result_t *r) {
+    memset(r, 0, sizeof(*r));
+    int rc = cbm_cypher_execute(s, query, "test", 0, r);
+    if (rc != 0 || r->error) {
+        printf("\n    query failed: %s\n    error: %s\n", query, r->error ? r->error : "(none)");
+        return false;
+    }
+    return true;
+}
+
+static bool row_equals(const char **a, const char **b, int cols) {
+    for (int c = 0; c < cols; c++) {
+        if (strcmp(a[c], b[c]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* `sorted` must return exactly the rows of `unsorted`, in the order a stable
+ * insertion sort with the given keys puts them. */
+static bool sorted_like(const char *unsorted, const char *sorted, const order_key_t *keys,
+                        int nkeys) {
+    cbm_store_t *s = setup_order_store();
+    cbm_cypher_result_t ru;
+    cbm_cypher_result_t rs;
+    bool ok = run_rows(s, unsorted, &ru) && run_rows(s, sorted, &rs) &&
+              ru.row_count == ORDER_FIXTURE_NODES && rs.row_count == ru.row_count &&
+              rs.col_count == ru.col_count;
+    int *idx = malloc(ORDER_FIXTURE_NODES * sizeof(int));
+    for (int i = 0; ok && i < ru.row_count; i++) {
+        idx[i] = i;
+        for (int j = i; j > 0 && order_cmp(ru.rows[idx[j - 1]], ru.rows[idx[j]], keys, nkeys) > 0;
+             j--) {
+            int t = idx[j];
+            idx[j] = idx[j - 1];
+            idx[j - 1] = t;
+        }
+    }
+    for (int i = 0; ok && i < ru.row_count; i++) {
+        if (!row_equals(rs.rows[i], ru.rows[idx[i]], ru.col_count)) {
+            printf("\n    %s\n    row %d: got %s, want %s\n", sorted, i, rs.rows[i][0],
+                   ru.rows[idx[i]][0]);
+            ok = false;
+        }
+    }
+    free(idx);
+    cbm_cypher_result_free(&ru);
+    cbm_cypher_result_free(&rs);
+    cbm_store_close(s);
+    return ok;
+}
+
+TEST(cypher_exec_order_by_matches_stable_sort) {
+    const order_key_t by_name[] = {{0, false, KEY_TEXT}};
+    ASSERT_TRUE(sorted_like("MATCH (f:Function) RETURN f.name, f.qualified_name",
+                            "MATCH (f:Function) RETURN f.name, f.qualified_name ORDER BY f.name",
+                            by_name, 1));
+    const order_key_t by_line_desc_name[] = {{0, true, KEY_INT}, {1, false, KEY_TEXT}};
+    ASSERT_TRUE(sorted_like(
+        "MATCH (f:Function) RETURN f.start_line AS l, f.name AS n, f.qualified_name",
+        "MATCH (f:Function) RETURN f.start_line AS l, f.name AS n, f.qualified_name "
+        "ORDER BY l DESC, n",
+        by_line_desc_name, 2));
+    const order_key_t all_tied[] = {{0, false, KEY_TEXT}};
+    ASSERT_TRUE(
+        sorted_like("MATCH (f:Function) RETURN f.label, f.qualified_name",
+                    "MATCH (f:Function) RETURN f.label, f.qualified_name ORDER BY f.label",
+                    all_tied, 1));
+
+    const order_key_t with_name[] = {{0, false, KEY_WITH}};
+    ASSERT_TRUE(sorted_like(
+        "MATCH (f:Function) WITH f.name AS n, f.qualified_name AS q RETURN n, q",
+        "MATCH (f:Function) WITH f.name AS n, f.qualified_name AS q ORDER BY n RETURN n, q",
+        with_name, 1));
+    const order_key_t with_line_desc_name[] = {{0, true, KEY_WITH}, {1, false, KEY_WITH}};
+    ASSERT_TRUE(sorted_like("MATCH (f:Function) WITH f.start_line AS l, f.name AS n, "
+                            "f.qualified_name AS q RETURN l, n, q",
+                            "MATCH (f:Function) WITH f.start_line AS l, f.name AS n, "
+                            "f.qualified_name AS q ORDER BY l DESC, n RETURN l, n, q",
+                            with_line_desc_name, 2));
+    const order_key_t with_tied[] = {{0, false, KEY_WITH}};
+    ASSERT_TRUE(sorted_like(
+        "MATCH (f:Function) WITH f.label AS t, f.qualified_name AS q RETURN t, q",
+        "MATCH (f:Function) WITH f.label AS t, f.qualified_name AS q ORDER BY t RETURN t, q",
+        with_tied, 1));
+    PASS();
+}
+
+/* `distinct` must return the first occurrence of every distinct row of `all`,
+ * in order. */
+static bool distinct_like(const char *all, const char *distinct) {
+    cbm_store_t *s = setup_order_store();
+    cbm_cypher_result_t ra;
+    cbm_cypher_result_t rd;
+    bool ok = run_rows(s, all, &ra) && run_rows(s, distinct, &rd) &&
+              ra.row_count == ORDER_FIXTURE_NODES && rd.col_count == ra.col_count;
+    int want = 0;
+    for (int i = 0; ok && i < ra.row_count; i++) {
+        bool seen = false;
+        for (int j = 0; j < i && !seen; j++) {
+            seen = row_equals(ra.rows[i], ra.rows[j], ra.col_count);
+        }
+        if (seen) {
+            continue;
+        }
+        if (want >= rd.row_count || !row_equals(rd.rows[want], ra.rows[i], ra.col_count)) {
+            printf("\n    %s\n    row %d differs from first occurrence %d\n", distinct, want, i);
+            ok = false;
+        }
+        want++;
+    }
+    if (ok && want != rd.row_count) {
+        printf("\n    %s\n    rows: got %d, want %d\n", distinct, rd.row_count, want);
+        ok = false;
+    }
+    cbm_cypher_result_free(&ra);
+    cbm_cypher_result_free(&rd);
+    cbm_store_close(s);
+    return ok && want > 0 && want < ORDER_FIXTURE_NODES;
+}
+
+TEST(cypher_exec_distinct_keeps_first_occurrences) {
+    ASSERT_TRUE(distinct_like("MATCH (f:Function) RETURN f.name, f.label",
+                              "MATCH (f:Function) RETURN DISTINCT f.name, f.label"));
+    ASSERT_TRUE(
+        distinct_like("MATCH (f:Function) WITH f.file_path AS p, f.label AS t RETURN p, t",
+                      "MATCH (f:Function) WITH DISTINCT f.file_path AS p, f.label AS t RETURN p, t"));
+    PASS();
+}
+
+/* WITH DISTINCT compares whole values: "a|b","c" and "a","b|c" are different
+ * rows even though their values joined with '|' are the same string. */
+TEST(cypher_exec_with_distinct_separator_in_values) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t a = {.project = "test",
+                    .label = "Function",
+                    .name = "a|b",
+                    .qualified_name = "test.a1",
+                    .file_path = "c"};
+    cbm_node_t b = {.project = "test",
+                    .label = "Function",
+                    .name = "a",
+                    .qualified_name = "test.a2",
+                    .file_path = "b|c"};
+    cbm_store_upsert_node(s, &a);
+    cbm_store_upsert_node(s, &b);
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  s, "MATCH (f:Function) WITH DISTINCT f.name AS n, f.file_path AS p RETURN n, p",
+                  "test", 0, &r),
+              0);
+    ASSERT_EQ(r.row_count, 2);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* `grouped` returns (key, count) per group; it must list the keys of `pairs`
+ * (key, value) in first-seen order, with the number of rows per key, or with
+ * the number of distinct values when `distinct`. */
+static bool grouped_like(const char *pairs, const char *grouped, bool distinct) {
+    cbm_store_t *s = setup_order_store();
+    cbm_cypher_result_t rp;
+    cbm_cypher_result_t rg;
+    bool ok = run_rows(s, pairs, &rp) && run_rows(s, grouped, &rg) &&
+              rp.row_count == ORDER_FIXTURE_NODES && rp.col_count == 2 && rg.col_count == 2;
+    int groups = 0;
+    for (int i = 0; ok && i < rp.row_count; i++) {
+        bool first = true;
+        for (int j = 0; j < i && first; j++) {
+            first = strcmp(rp.rows[i][0], rp.rows[j][0]) != 0;
+        }
+        if (!first) {
+            continue;
+        }
+        int count = 0;
+        for (int j = i; j < rp.row_count; j++) {
+            if (strcmp(rp.rows[j][0], rp.rows[i][0]) != 0) {
+                continue;
+            }
+            bool counted = false;
+            for (int m = i; distinct && m < j && !counted; m++) {
+                counted = strcmp(rp.rows[m][0], rp.rows[i][0]) == 0 &&
+                          strcmp(rp.rows[m][1], rp.rows[j][1]) == 0;
+            }
+            count += counted ? 0 : 1;
+        }
+        char want[16];
+        snprintf(want, sizeof(want), "%d", count);
+        if (groups >= rg.row_count || strcmp(rg.rows[groups][0], rp.rows[i][0]) != 0 ||
+            strcmp(rg.rows[groups][1], want) != 0) {
+            printf("\n    %s\n    group %d: got %s=%s, want %s=%s\n", grouped, groups,
+                   groups < rg.row_count ? rg.rows[groups][0] : "(none)",
+                   groups < rg.row_count ? rg.rows[groups][1] : "", rp.rows[i][0], want);
+            ok = false;
+        }
+        groups++;
+    }
+    if (ok && groups != rg.row_count) {
+        printf("\n    %s\n    groups: got %d, want %d\n", grouped, rg.row_count, groups);
+        ok = false;
+    }
+    cbm_cypher_result_free(&rp);
+    cbm_cypher_result_free(&rg);
+    cbm_store_close(s);
+    return ok && groups > 0;
+}
+
+TEST(cypher_exec_group_by_keeps_first_seen_groups) {
+    ASSERT_TRUE(grouped_like("MATCH (f:Function) RETURN f.name, f.qualified_name",
+                             "MATCH (f:Function) RETURN f.name, count(f)", false));
+    ASSERT_TRUE(grouped_like("MATCH (f:Function) RETURN f.name, f.qualified_name",
+                             "MATCH (f:Function) WITH f.name AS n, count(f) AS c RETURN n, c",
+                             false));
+    PASS();
+}
+
+TEST(cypher_exec_count_distinct_matches_reference) {
+    ASSERT_TRUE(grouped_like("MATCH (f:Function) RETURN f.file_path, f.name",
+                             "MATCH (f:Function) RETURN f.file_path, count(DISTINCT f.name)",
+                             true));
+    ASSERT_TRUE(grouped_like("MATCH (f:Function) RETURN f.label, f.name",
+                             "MATCH (f:Function) RETURN f.label, count(DISTINCT f.name)", true));
+    ASSERT_TRUE(grouped_like("MATCH (f:Function) RETURN f.file_path, f.name",
+                             "MATCH (f:Function) WITH f.file_path AS p, "
+                             "count(DISTINCT f.name) AS c RETURN p, c",
+                             true));
+    PASS();
+}
+
 /* Upstream 73a3c347 (#797): variable-length / repeated-variable path
  * semantics. Fixture: loopy has a SELF-LOOP as one of its outbound CALLS
  * edges plus a real 2-chain loopy->mid->leaf. Correct semantics:
@@ -4164,6 +4461,11 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_exec_deadline_covers_joins_and_sorts);
+    RUN_TEST(cypher_exec_order_by_matches_stable_sort);
+    RUN_TEST(cypher_exec_distinct_keeps_first_occurrences);
+    RUN_TEST(cypher_exec_with_distinct_separator_in_values);
+    RUN_TEST(cypher_exec_group_by_keeps_first_seen_groups);
+    RUN_TEST(cypher_exec_count_distinct_matches_reference);
     RUN_TEST(cypher_deep_nesting_rejected_not_crash);
     RUN_TEST(cypher_parse_unwind_oversized_literal_no_overflow);
     RUN_TEST(cypher_parse_unwind_many_elements_no_overflow);
