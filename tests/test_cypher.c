@@ -3626,6 +3626,298 @@ TEST(cypher_exec_with_rename) {
     PASS();
 }
 
+/* #57: a node carried IN SCOPE through WITH must project every property
+ * exactly as the same node does without the WITH. The carried var used to be a
+ * name-only stub whose qualified_name slot held the variable name and whose
+ * start_line was 0, so f.qualified_name returned "f" and f.start_line "0". */
+static int64_t issue57_id_of(cbm_store_t *s, const char *qn) {
+    cbm_node_t n = {0};
+    int64_t id = 0;
+    if (cbm_store_find_node_by_qn(s, "test", qn, &n) == CBM_STORE_OK) {
+        id = n.id;
+        cbm_node_free_fields(&n);
+    }
+    return id;
+}
+
+static cbm_store_t *setup_issue57_store(void) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_node_t twins[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "ProjectionTwin",
+         .qualified_name = "test.ProjectionA",
+         .file_path = "projection_a.go",
+         .start_line = 30,
+         .end_line = 40,
+         .properties_json = "{\"marker\":\"alpha\"}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "ProjectionTwin",
+         .qualified_name = "test.ProjectionB",
+         .file_path = "projection_b.go",
+         .start_line = 10,
+         .end_line = 20,
+         .properties_json = "{\"marker\":\"beta\"}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "ProjectionTwin",
+         .qualified_name = "test.ProjectionC",
+         .file_path = "projection_c.go",
+         .start_line = 20,
+         .end_line = 30,
+         .properties_json = "{\"marker\":\"gamma\"}"},
+    };
+    int64_t ids[3];
+    for (int i = 0; i < 3; i++) {
+        ids[i] = cbm_store_upsert_node(s, &twins[i]);
+    }
+    /* Callers: A has 2 (HandleOrder, ValidateOrder), B has 1 (HandleOrder), C none. */
+    int64_t handle = issue57_id_of(s, "test.HandleOrder");
+    int64_t validate = issue57_id_of(s, "test.ValidateOrder");
+    cbm_edge_t e1 = {.project = "test", .source_id = handle, .target_id = ids[0], .type = "CALLS"};
+    cbm_edge_t e2 = {
+        .project = "test", .source_id = validate, .target_id = ids[0], .type = "CALLS"};
+    cbm_edge_t e3 = {.project = "test", .source_id = handle, .target_id = ids[1], .type = "CALLS"};
+    cbm_store_insert_edge(s, &e1);
+    cbm_store_insert_edge(s, &e2);
+    cbm_store_insert_edge(s, &e3);
+    return s;
+}
+
+/* The reporter's exact shape: aggregate WITH carrying the node beside count(). */
+TEST(cypher_issue57_with_agg_carried_node_props) {
+    cbm_store_t *s = setup_issue57_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function {qualified_name: 'test.ProjectionA'}) "
+                                "OPTIONAL MATCH (caller)-[r:CALLS]->(f) "
+                                "WITH f, count(r) AS refs "
+                                "RETURN f.qualified_name, f.file_path, f.start_line, "
+                                "f.end_line, f.label, f.marker, f.name, refs",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ProjectionA");
+    ASSERT_STR_EQ(r.rows[0][1], "projection_a.go");
+    ASSERT_STR_EQ(r.rows[0][2], "30");
+    ASSERT_STR_EQ(r.rows[0][3], "40");
+    ASSERT_STR_EQ(r.rows[0][4], "Function");
+    ASSERT_STR_EQ(r.rows[0][5], "alpha");
+    ASSERT_STR_EQ(r.rows[0][6], "ProjectionTwin");
+    ASSERT_STR_EQ(r.rows[0][7], "2");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Aggregate WITH groups by node IDENTITY, not display name: three same-named
+ * functions stay three rows, each with its own properties and caller count
+ * (they used to collapse into one row with one node's props and summed refs). */
+TEST(cypher_issue57_with_agg_groups_by_node_identity) {
+    cbm_store_t *s = setup_issue57_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function {name: 'ProjectionTwin'}) "
+                                "OPTIONAL MATCH (caller)-[r:CALLS]->(f) "
+                                "WITH f, count(r) AS refs "
+                                "RETURN f.qualified_name, f.start_line, refs "
+                                "ORDER BY f.qualified_name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ProjectionA");
+    ASSERT_STR_EQ(r.rows[0][1], "30");
+    ASSERT_STR_EQ(r.rows[0][2], "2");
+    ASSERT_STR_EQ(r.rows[1][0], "test.ProjectionB");
+    ASSERT_STR_EQ(r.rows[1][1], "10");
+    ASSERT_STR_EQ(r.rows[1][2], "1");
+    ASSERT_STR_EQ(r.rows[2][0], "test.ProjectionC");
+    ASSERT_STR_EQ(r.rows[2][1], "20");
+    /* rows[2][2] (count(r) for the caller-less C) is not asserted here: count()
+     * of an unbound OPTIONAL var is a separate defect (#58). */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Simple (non-aggregate) WITH: a bare node stays a node (renamed or not);
+ * scalar items stay scalars; OPTIONAL null stays null; post-WITH WHERE and
+ * WITH ... ORDER BY see the real node properties. */
+TEST(cypher_issue57_with_simple_carried_node_props) {
+    cbm_store_t *s = setup_issue57_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.qualified_name = 'test.ProjectionA' "
+                                "WITH f "
+                                "RETURN f.name, f.qualified_name, f.file_path, f.label, "
+                                "f.start_line, f.marker",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "ProjectionTwin");
+    ASSERT_STR_EQ(r.rows[0][1], "test.ProjectionA");
+    ASSERT_STR_EQ(r.rows[0][2], "projection_a.go");
+    ASSERT_STR_EQ(r.rows[0][3], "Function");
+    ASSERT_STR_EQ(r.rows[0][4], "30");
+    ASSERT_STR_EQ(r.rows[0][5], "alpha");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE f.qualified_name = 'test.ProjectionA' "
+                            "WITH f AS g, f.name AS n, labels(f) AS ls "
+                            "RETURN g.qualified_name, g.file_path, n, ls, n.file_path, "
+                            "ls.file_path",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ProjectionA");
+    ASSERT_STR_EQ(r.rows[0][1], "projection_a.go");
+    ASSERT_STR_EQ(r.rows[0][2], "ProjectionTwin");
+    ASSERT_STR_EQ(r.rows[0][3], "[\"Function\"]");
+    ASSERT_STR_EQ(r.rows[0][4], "");
+    ASSERT_STR_EQ(r.rows[0][5], "");
+    cbm_cypher_result_free(&r);
+
+    /* OPTIONAL null carried through WITH stays null (no fabricated node). */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE f.name = 'LogError' "
+                            "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+                            "WITH g AS projected "
+                            "RETURN projected, projected.file_path, projected.qualified_name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "");
+    ASSERT_STR_EQ(r.rows[0][1], "");
+    ASSERT_STR_EQ(r.rows[0][2], "");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WITH f AS g "
+                            "WHERE g.file_path = 'projection_b.go' "
+                            "RETURN g.qualified_name",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ProjectionB");
+    cbm_cypher_result_free(&r);
+
+    /* A(30), B(10), C(20): ascending then SKIP 1 LIMIT 1 selects C. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE f.name = 'ProjectionTwin' "
+                            "WITH f AS g ORDER BY g.start_line ASC SKIP 1 LIMIT 1 "
+                            "RETURN g.qualified_name, g.start_line",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "test.ProjectionC");
+    ASSERT_STR_EQ(r.rows[0][1], "20");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #57: id(), keys() and labels() read the carried node, and a scalar WITH
+ * alias exposes no fields of its own: its name used to sit in qualified_name,
+ * so nm.qualified_name returned "nm" and keys(nm) listed "qualified_name". */
+TEST(cypher_issue57_with_carried_id_and_scalar_alias) {
+    cbm_store_t *s = setup_issue57_store();
+    char want_id[32];
+    snprintf(want_id, sizeof(want_id), "%lld", (long long)issue57_id_of(s, "test.ProjectionB"));
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.qualified_name = 'test.ProjectionB' "
+                                "WITH f RETURN id(f), labels(f), f.end_line",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], want_id);
+    ASSERT_STR_EQ(r.rows[0][1], "[\"Function\"]");
+    ASSERT_STR_EQ(r.rows[0][2], "20");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE f.qualified_name = 'test.ProjectionB' "
+                            "WITH f.name AS nm RETURN nm, nm.qualified_name, keys(nm)",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "ProjectionTwin");
+    ASSERT_STR_EQ(r.rows[0][1], "");
+    ASSERT_NULL(strstr(r.rows[0][2], "qualified_name"));
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #57: a function item grouped beside an aggregate stays a scalar. The group
+ * used to tag it with the node's id, so l.file_path re-fetched f's file. */
+TEST(cypher_issue57_with_agg_func_item_not_a_node) {
+    cbm_store_t *s = setup_issue57_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function {name: 'ProjectionTwin'}) "
+                                "WITH labels(f) AS l, count(*) AS c "
+                                "RETURN l, l.file_path, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "[\"Function\"]");
+    ASSERT_STR_EQ(r.rows[0][1], "");
+    ASSERT_STR_EQ(r.rows[0][2], "3");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #57: WITH ... ORDER BY on a carried node's JSON string property sorts more
+ * rows than node_prop has rotating buffers (8). Each value is copied before
+ * the sort; keeping the buffer pointers would compare overwritten strings. */
+TEST(cypher_issue57_with_order_by_carried_prop_many_rows) {
+    cbm_store_t *s = setup_cypher_store();
+    static const int lines[] = {107, 103, 111, 101, 109, 105, 112, 102, 110, 104, 108, 106};
+    enum { N = (int)(sizeof(lines) / sizeof(lines[0])) };
+    for (int i = 0; i < N; i++) {
+        char qn[64];
+        char props[64];
+        snprintf(qn, sizeof(qn), "test.OrderTwin%d", i);
+        snprintf(props, sizeof(props), "{\"rank\":\"r%d\"}", lines[i]);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = "OrderTwin",
+                        .qualified_name = qn,
+                        .file_path = "order.go",
+                        .start_line = lines[i],
+                        .end_line = lines[i] + 1,
+                        .properties_json = props};
+        cbm_store_upsert_node(s, &n);
+    }
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = 'OrderTwin' "
+                                "WITH f AS g ORDER BY g.rank DESC "
+                                "RETURN g.rank, g.start_line",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, N);
+    for (int i = 0; i < N; i++) {
+        char want[16];
+        snprintf(want, sizeof(want), "r%d", 112 - i);
+        ASSERT_STR_EQ(r.rows[i][0], want);
+        snprintf(want, sizeof(want), "%d", 112 - i);
+        ASSERT_STR_EQ(r.rows[i][1], want);
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_with_count) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4616,6 +4908,12 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_case);
     /* Phase 6: WITH clause */
     RUN_TEST(cypher_exec_with_rename);
+    RUN_TEST(cypher_issue57_with_agg_carried_node_props);
+    RUN_TEST(cypher_issue57_with_agg_groups_by_node_identity);
+    RUN_TEST(cypher_issue57_with_simple_carried_node_props);
+    RUN_TEST(cypher_issue57_with_carried_id_and_scalar_alias);
+    RUN_TEST(cypher_issue57_with_agg_func_item_not_a_node);
+    RUN_TEST(cypher_issue57_with_order_by_carried_prop_many_rows);
     RUN_TEST(cypher_exec_with_count);
     RUN_TEST(cypher_exec_with_node_groupvar_prop);
     RUN_TEST(cypher_exec_with_where);

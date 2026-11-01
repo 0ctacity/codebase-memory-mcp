@@ -2321,7 +2321,6 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
-static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
 static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
     if (!n || !prop) {
@@ -2331,8 +2330,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     if (str && str[0]) {
         return str;
     }
-    /* Note: a string field that exists but is empty ("") falls through here so a
-     * WITH-aggregation node stub (below) can re-fetch it. */
     /* Computed and JSON-derived values live in rotating thread-local buffers:
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
@@ -2368,40 +2365,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
         if (v && v[0]) {
             return v;
-        }
-    }
-    /* WITH aggregation carries a node group var by id + name only (the group key
-     * is the node name), so every other property is absent on the stub. Detect
-     * the stub (id set, but the full string fields were never populated) and
-     * re-fetch the node so RETURN g.file_path / g.label / g.<metric> project
-     * correctly instead of returning blank. The gate is heuristic, not an exact
-     * stub discriminator: a real bound node with NULL label AND file_path would
-     * also match, but in that case the worst case is one redundant indexed fetch
-     * that returns the same value — never a wrong result. */
-    if (store && n->id > 0 && !n->file_path && !n->label) {
-        cbm_node_t full = {0};
-        if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
-            const char *res = NULL;
-            const char *rv = node_string_field(&full, prop);
-            if (rv && rv[0]) {
-                snprintf(out, CBM_SZ_512, "%s", rv);
-                res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
-            } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
-            } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
-                if (jv && jv[0]) {
-                    res = out;
-                }
-            }
-            node_fields_free(&full);
-            if (res) {
-                return res;
-            }
         }
     }
     return "";
@@ -4140,6 +4103,7 @@ typedef struct {
     const char **values; /* values[i * keys + k]: binding i's ORDER BY key k */
     bool *numbered;      /* whether strtod consumed a number from that value */
     double *numbers;
+    char **owned; /* owned[i * keys + k]: copy of a transient value, else NULL */
 } with_order_ctx_t;
 
 /* One WITH ORDER BY comparison: per key, numerically when both values start
@@ -4164,14 +4128,49 @@ static int with_order_compare(const void *context, int a, int b) {
     return cmp;
 }
 
-/* Resolve binding i's ORDER BY keys into the context. binding_get_virtual
- * without a property returns strings the binding owns, so the pointers stay
- * valid while the bindings are only reordered. */
+/* Resolve one WITH ORDER BY key on a projected binding. The key is either a
+ * projected name (`c`, or an unaliased `f.name`) or a property of a carried
+ * node (`g.start_line` after `WITH f AS g`, #57): an exact projected name
+ * wins, otherwise `var.prop` is split and resolved on the carried node. A
+ * property value may live in node_prop's rotating buffers, so it is reported
+ * as transient. */
+static const char *order_key_value(binding_t *b, const char *key, bool *transient) {
+    *transient = false;
+    const char *dot = strchr(key, '.');
+    if (!dot) {
+        return binding_get_virtual(b, key, NULL);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], key) == 0) {
+            return binding_get_virtual(b, key, NULL);
+        }
+    }
+    char var[CBM_SZ_256];
+    size_t vlen = (size_t)(dot - key);
+    if (vlen >= sizeof(var)) {
+        return "";
+    }
+    memcpy(var, key, vlen);
+    var[vlen] = '\0';
+    *transient = true;
+    return binding_get_virtual(b, var, dot + SKIP_ONE);
+}
+
+/* Resolve binding i's ORDER BY keys into the context. A projected name
+ * resolves to a string the binding owns, which stays valid while the bindings
+ * are only reordered; a carried node's property is copied into ctx->owned. */
 static void with_order_resolve(with_order_ctx_t *ctx, binding_t *b, int i) {
     size_t keys = (size_t)ctx->wc->order_key_count;
     for (size_t k = 0; k < keys; k++) {
         size_t cell = ((size_t)i * keys) + k;
-        const char *v = binding_get_virtual(b, ctx->wc->order_keys[k], NULL);
+        bool transient = false;
+        const char *v = order_key_value(b, ctx->wc->order_keys[k], &transient);
+        free(ctx->owned[cell]);
+        ctx->owned[cell] = NULL;
+        if (transient) {
+            ctx->owned[cell] = heap_strdup(v);
+            v = ctx->owned[cell] ? ctx->owned[cell] : "";
+        }
         char *end = NULL;
         ctx->values[cell] = v;
         ctx->numbers[cell] = strtod(v, &end);
@@ -4190,10 +4189,11 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
     with_order_ctx_t ctx = {.wc = wc,
                             .values = malloc(cells * sizeof(const char *)),
                             .numbered = malloc(cells * sizeof(bool)),
-                            .numbers = malloc(cells * sizeof(double))};
+                            .numbers = malloc(cells * sizeof(double)),
+                            .owned = calloc(cells, sizeof(char *))};
     int *idx = malloc((size_t)count * sizeof(int));
     binding_t *sorted = malloc((size_t)count * sizeof(binding_t));
-    if (ctx.values && ctx.numbered && ctx.numbers && idx && sorted) {
+    if (ctx.values && ctx.numbered && ctx.numbers && ctx.owned && idx && sorted) {
         for (int i = 0; i < count; i++) {
             idx[i] = i;
             with_order_resolve(&ctx, &vbindings[i], i);
@@ -4209,8 +4209,12 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
         const char *pair_values[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
         bool pair_numbered[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
         double pair_numbers[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
-        with_order_ctx_t pair = {
-            .wc = wc, .values = pair_values, .numbered = pair_numbered, .numbers = pair_numbers};
+        char *pair_owned[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN] = {0};
+        with_order_ctx_t pair = {.wc = wc,
+                                 .values = pair_values,
+                                 .numbered = pair_numbered,
+                                 .numbers = pair_numbers,
+                                 .owned = pair_owned};
         for (int i = SKIP_ONE; i < count; i++) {
             if (cypher_deadline_exceeded_at("sort_bindings")) {
                 break;
@@ -4226,10 +4230,19 @@ static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clau
                 vbindings[j - SKIP_ONE] = tmp;
             }
         }
+        for (size_t c = 0; c < keys * PAIR_LEN; c++) {
+            free(pair_owned[c]);
+        }
+    }
+    if (ctx.owned) {
+        for (size_t c = 0; c < cells; c++) {
+            free(ctx.owned[c]);
+        }
     }
     free(ctx.values);
     free(ctx.numbered);
     free(ctx.numbers);
+    free(ctx.owned);
     free(idx);
     free(sorted);
 }
@@ -4290,8 +4303,27 @@ typedef struct {
     char ***distinct_lists;       /* per-item set of seen values for COUNT(DISTINCT) */
     int *distinct_n;              /* per-item distinct count (#239) */
     CBMHashTable **distinct_sets; /* per-item hash over distinct_lists (lazy) */
-    int64_t *group_node_ids;      /* per-item node id when the group var is a node (0 = not) */
+    cbm_node_t *group_nodes;      /* per-item carried node (deep copy; id 0 = not a node) */
 } with_agg_t;
+
+/* A WITH item that is a bare, bound node variable (`WITH f`, `WITH f AS g`)
+ * carries the node itself, not a scalar: return that node, else NULL. Property
+ * items, functions (labels/id/keys/...) and unbound OPTIONAL vars (id 0) stay
+ * scalar. The carried node keeps every field, so a later g.<prop> resolves
+ * exactly as it would without the WITH (#57). */
+static const cbm_node_t *with_item_carried_node(const cbm_return_item_t *item, binding_t *b) {
+    if (item->func || item->property || !item->variable) {
+        return NULL;
+    }
+    const cbm_node_t *n = binding_get(b, item->variable);
+    return (n && n->id > 0) ? n : NULL;
+}
+
+/* Name a carried node is bound under: the AST-owned alias or variable, which
+ * outlives every binding of the query (binding_set does not copy the name). */
+static const char *with_item_node_alias(const cbm_return_item_t *item) {
+    return item->alias ? item->alias : item->variable;
+}
 
 /* Build a group key from non-aggregate WITH items */
 static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
@@ -4301,7 +4333,12 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
             continue;
         }
         char vbuf[CBM_SZ_512];
-        const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn) {
+            /* Group a node by identity, never by its (non-unique) name. */
+            (void)snprintf(vbuf, sizeof(vbuf), "#%lld", (long long)gn->id);
+        }
+        const char *v = gn ? vbuf : project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
         if (kl >= (int)key_sz) {
             kl = (int)key_sz - SKIP_ONE;
@@ -4338,7 +4375,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
     (*aggs)[found].distinct_sets = calloc(wc->count, sizeof(CBMHashTable *));
-    (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
+    (*aggs)[found].group_nodes = calloc(wc->count, sizeof(cbm_node_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
         (*aggs)[found].maxs[ci] = -CYP_DBL_MAX;
@@ -4351,14 +4388,9 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         char vbuf[CBM_SZ_512];
         const char *v = project_item(b, &wc->items[ci], vbuf, sizeof(vbuf));
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
-        /* If this group item is a bare node variable, remember its id so the
-         * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). */
-        if (!wc->items[ci].property && wc->items[ci].variable) {
-            cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
-            if (gn) {
-                (*aggs)[found].group_node_ids[ci] = gn->id;
-            }
+        const cbm_node_t *gn = with_item_carried_node(&wc->items[ci], b);
+        if (gn && (*aggs)[found].group_nodes) {
+            node_deep_copy(&(*aggs)[found].group_nodes[ci], gn);
         }
     }
     return found;
@@ -4402,11 +4434,14 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
     }
 }
 
-/* Add a virtual variable binding for one WITH item */
+/* Add a scalar virtual variable binding for one WITH item. The value lives in
+ * .name; the owned alias string (var_names points at it) lives in .project,
+ * which no property accessor exposes. It used to live in .qualified_name, so
+ * alias.qualified_name / keys(alias) returned the variable name as data (#57). */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
+    cbm_node_t vn = {.name = heap_strdup(val), .project = heap_strdup(alias)};
     if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
+        vb->var_names[vb->var_count] = vn.project;
         vb->var_nodes[vb->var_count] = vn;
         vb->var_count++;
     }
@@ -4435,7 +4470,12 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
         free(aggs[a].distinct_sets);
-        free(aggs[a].group_node_ids);
+        if (aggs[a].group_nodes) {
+            for (int ci = 0; ci < item_count; ci++) {
+                node_fields_free(&aggs[a].group_nodes[ci]);
+            }
+        }
+        free(aggs[a].group_nodes);
     }
     free(aggs);
 }
@@ -4464,8 +4504,8 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
     }
     for (int a = 0; a < agg_cnt; a++) {
         binding_t vb = {0};
-        /* Carry the store so node_prop can re-fetch a carried node's properties
-         * (and compute in_degree/out_degree) on the projected virtual binding. */
+        /* Carry the store so node_prop can compute a carried node's
+         * in_degree/out_degree on the projected virtual binding. */
         vb.store = (bind_count > 0) ? bindings[0].store : NULL;
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
@@ -4478,13 +4518,10 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                     with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
                 }
                 with_add_vbinding_var(&vb, alias, vbuf);
+            } else if (aggs[a].group_nodes && aggs[a].group_nodes[ci].id > 0) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), &aggs[a].group_nodes[ci]);
             } else {
                 with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
-                /* Tag the carried virtual var with the node id (when the group
-                 * var is a node) so node_prop can re-fetch its full properties. */
-                if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
-                    vb.var_nodes[vb.var_count - 1].id = aggs[a].group_node_ids[ci];
-                }
             }
         }
         (*vbindings)[(*vcount)++] = vb;
@@ -4497,10 +4534,15 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
                                 binding_t *vbindings, int *vcount) {
     for (int bi = 0; bi < bind_count; bi++) {
         binding_t vb = {0};
-        vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
+        vb.store = bindings[bi].store; /* so node_prop can compute degrees on the projection */
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
+            const cbm_node_t *carried = with_item_carried_node(&wc->items[ci], &bindings[bi]);
+            if (carried) {
+                binding_set(&vb, with_item_node_alias(&wc->items[ci]), carried);
+                continue;
+            }
             char func_buf[CBM_SZ_512];
             const char *val =
                 project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
