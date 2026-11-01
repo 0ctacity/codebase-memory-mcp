@@ -1271,58 +1271,79 @@ static cbm_expr_t *parse_not_expr(parser_t *p) { // NOLINT(misc-no-recursion)
     return parse_atom_expr(p);
 }
 
+/* A chain `a OP b OP c ...` of one associative operator is linked along the
+ * RIGHT child: OP(a, OP(b, OP(c, ...))). The chain's length is bounded only by
+ * the message size, so a left-deep fold would hand every walker (evaluate,
+ * seed-selectivity, free) a tree as deep as the chain is long; linked this
+ * way each walker follows the chain in a loop and only recurses into the
+ * operands, whose nesting the parse-depth cap bounds. Operand order and the
+ * left-to-right short-circuit are the same as in the nested form. `next` is
+ * the operand just parsed; `more` says whether another OP follows it. */
+static void expr_chain_link(cbm_expr_t **tail, cbm_expr_type_t type, cbm_expr_t *next, bool more) {
+    if (more) {
+        cbm_expr_t *node = expr_binary(type, next, NULL);
+        (*tail)->right = node;
+        *tail = node;
+    } else {
+        (*tail)->right = next;
+    }
+}
+
 /* AND: not (AND not)* */
 static cbm_expr_t *parse_and_expr(parser_t *p) { // NOLINT(misc-no-recursion)
-    cbm_expr_t *left = parse_not_expr(p);
-    if (!left) {
-        return NULL;
+    cbm_expr_t *first = parse_not_expr(p);
+    if (!first || !check(p, TOK_AND)) {
+        return first;
     }
-    while (check(p, TOK_AND)) {
-        advance(p);
-        cbm_expr_t *right = parse_not_expr(p);
-        if (!right) {
-            expr_free(left);
+    cbm_expr_t *head = expr_binary(EXPR_AND, first, NULL);
+    cbm_expr_t *tail = head;
+    while (match(p, TOK_AND)) {
+        cbm_expr_t *next = parse_not_expr(p);
+        if (!next) {
+            expr_free(head);
             return NULL;
         }
-        left = expr_binary(EXPR_AND, left, right);
+        expr_chain_link(&tail, EXPR_AND, next, check(p, TOK_AND));
     }
-    return left;
+    return head;
 }
 
 /* XOR: and (XOR and)* */
 static cbm_expr_t *parse_xor_expr(parser_t *p) { // NOLINT(misc-no-recursion)
-    cbm_expr_t *left = parse_and_expr(p);
-    if (!left) {
-        return NULL;
+    cbm_expr_t *first = parse_and_expr(p);
+    if (!first || !check(p, TOK_XOR)) {
+        return first;
     }
-    while (check(p, TOK_XOR)) {
-        advance(p);
-        cbm_expr_t *right = parse_and_expr(p);
-        if (!right) {
-            expr_free(left);
+    cbm_expr_t *head = expr_binary(EXPR_XOR, first, NULL);
+    cbm_expr_t *tail = head;
+    while (match(p, TOK_XOR)) {
+        cbm_expr_t *next = parse_and_expr(p);
+        if (!next) {
+            expr_free(head);
             return NULL;
         }
-        left = expr_binary(EXPR_XOR, left, right);
+        expr_chain_link(&tail, EXPR_XOR, next, check(p, TOK_XOR));
     }
-    return left;
+    return head;
 }
 
 /* OR: xor (OR xor)* */
 static cbm_expr_t *parse_or_expr(parser_t *p) { // NOLINT(misc-no-recursion)
-    cbm_expr_t *left = parse_xor_expr(p);
-    if (!left) {
-        return NULL;
+    cbm_expr_t *first = parse_xor_expr(p);
+    if (!first || !check(p, TOK_OR)) {
+        return first;
     }
-    while (check(p, TOK_OR)) {
-        advance(p);
-        cbm_expr_t *right = parse_xor_expr(p);
-        if (!right) {
-            expr_free(left);
+    cbm_expr_t *head = expr_binary(EXPR_OR, first, NULL);
+    cbm_expr_t *tail = head;
+    while (match(p, TOK_OR)) {
+        cbm_expr_t *next = parse_xor_expr(p);
+        if (!next) {
+            expr_free(head);
             return NULL;
         }
-        left = expr_binary(EXPR_OR, left, right);
+        expr_chain_link(&tail, EXPR_OR, next, check(p, TOK_OR));
     }
-    return left;
+    return head;
 }
 
 /* Parse WHERE clause — builds expression tree */
@@ -1862,20 +1883,28 @@ tail:
         }
     }
 
-    /* Optional SKIP */
+    /* Optional SKIP. A missing or non-numeric operand is a parse error:
+     * expect() has already filled p->error, and dropping the clause instead
+     * would leave r->skip at its "none" default while the query still reports
+     * success (#58). */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
-    /* Optional LIMIT */
+    /* Optional LIMIT. Same rule: a dropped LIMIT would hand the caller the
+     * whole result set for a bounded query. */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -1994,9 +2023,9 @@ static int parse_match_chain(parser_t *p, cbm_query_t *q, int *pat_cap) {
     return 0;
 }
 
-/* Parse post-WHERE clauses: additional MATCH, WITH, RETURN, UNION */
-static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recursion)
-                            int *pat_cap) {
+/* Parse post-WHERE clauses: additional MATCH, WITH, RETURN. A UNION keyword
+ * is left for cbm_parse, which reads the branches in a loop. */
+static int parse_post_where(parser_t *p, cbm_query_t *q, int *pat_cap) {
     /* More MATCH / OPTIONAL MATCH after WHERE */
     if (parse_match_chain(p, q, pat_cap) < 0) {
         return CBM_NOT_FOUND;
@@ -2021,57 +2050,44 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
     if (parse_return(p, &q->ret) < 0) {
         return CBM_NOT_FOUND;
     }
-    /* UNION [ALL] */
-    if (check(p, TOK_UNION)) {
-        advance(p);
-        q->union_all = match(p, TOK_ALL);
-        cbm_parse_result_t sub = {0};
-        if (cbm_parse(&p->tokens[p->pos], p->count - p->pos, &sub) < 0) {
-            if (sub.error) {
-                snprintf(p->error, sizeof(p->error), "%s", sub.error);
-            }
-            cbm_parse_free(&sub);
-            return CBM_NOT_FOUND;
-        }
-        q->union_next = sub.query;
-        sub.query = NULL;
-        cbm_parse_free(&sub);
-        /* The branch after UNION was parsed by a SEPARATE parser over a slice
-         * of these tokens, so this parser's cursor never moved past the UNION
-         * keyword. That sub-parse now refuses to succeed with anything left
-         * over, so everything from here to the end is accounted for. Move the
-         * cursor to the end to say so, or cbm_parse's end-of-input check reads
-         * a fully parsed UNION query as unfinished. */
-        p->pos = p->count;
-    }
     return 0;
 }
 
-int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recursion)
-              cbm_parse_result_t *out) {
-    memset(out, 0, sizeof(*out));
-    parser_t p = {.tokens = tokens, .count = token_count, .pos = 0};
+/* A stage that failed without writing a message gets the stage's own. */
+static void parse_error_default(parser_t *p, const char *msg) {
+    if (!p->error[0]) {
+        (void)snprintf(p->error, sizeof(p->error), "%s", msg);
+    }
+}
+
+/* One MATCH ... RETURN block: the whole query, or one branch of a UNION. On
+ * failure p->error holds the message and *out stays NULL. */
+static int parse_query_block(parser_t *p, cbm_query_t **out) {
+    *out = NULL;
+    /* Each block starts with a clean message, as it did when every UNION
+     * branch had a parser of its own. */
+    p->error[0] = '\0';
 
     /* Check for unsupported leading keywords */
-    const char *unsup = unsupported_clause_error(peek(&p)->type);
+    const char *unsup = unsupported_clause_error(peek(p)->type);
     if (unsup) {
-        out->error = heap_strdup(unsup);
+        (void)snprintf(p->error, sizeof(p->error), "%s", unsup);
         return CBM_NOT_FOUND;
     }
 
     cbm_query_t *q = calloc(CBM_ALLOC_ONE, sizeof(cbm_query_t));
 
-    if (check(&p, TOK_UNWIND)) {
-        parse_unwind_clause(&p, q);
+    if (check(p, TOK_UNWIND)) {
+        parse_unwind_clause(p, q);
     }
 
     bool first_optional = false;
-    if (check(&p, TOK_OPTIONAL)) {
-        advance(&p);
+    if (check(p, TOK_OPTIONAL)) {
+        advance(p);
         first_optional = true;
     }
-    if (!expect(&p, TOK_MATCH)) {
-        out->error = heap_strdup(p.error[0] ? p.error : "expected MATCH");
+    if (!expect(p, TOK_MATCH)) {
+        parse_error_default(p, "expected MATCH");
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -2080,30 +2096,64 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
     q->patterns = malloc(pat_cap * sizeof(cbm_pattern_t));
     q->pattern_optional = malloc(pat_cap * sizeof(bool));
 
-    if (parse_match_pattern(&p, &q->patterns[0]) < 0) {
-        out->error = heap_strdup(p.error[0] ? p.error : "failed to parse pattern");
+    if (parse_match_pattern(p, &q->patterns[0]) < 0) {
+        parse_error_default(p, "failed to parse pattern");
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
     q->pattern_optional[0] = first_optional;
     q->pattern_count = SKIP_ONE;
 
-    if (parse_match_chain(&p, q, &pat_cap) < 0) {
-        out->error = heap_strdup(p.error[0] ? p.error : "failed to parse additional pattern");
+    if (parse_match_chain(p, q, &pat_cap) < 0) {
+        parse_error_default(p, "failed to parse additional pattern");
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
-    if (parse_where(&p, &q->where) < 0) {
-        out->error = heap_strdup(p.error[0] ? p.error : "failed to parse WHERE");
+    if (parse_where(p, &q->where) < 0) {
+        parse_error_default(p, "failed to parse WHERE");
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
 
-    if (parse_post_where(&p, q, &pat_cap) < 0) {
-        out->error = heap_strdup(p.error[0] ? p.error : "failed to parse query");
+    if (parse_post_where(p, q, &pat_cap) < 0) {
+        parse_error_default(p, "failed to parse query");
         cbm_query_free(q);
         return CBM_NOT_FOUND;
+    }
+
+    *out = q;
+    return 0;
+}
+
+int cbm_parse(const cbm_token_t *tokens, int token_count, cbm_parse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    parser_t p = {.tokens = tokens, .count = token_count, .pos = 0};
+
+    /* The branches of a UNION are read one after another by this one parser
+     * and linked as they come, so the number of branches is a loop count, not
+     * a recursion depth (#58). */
+    cbm_query_t *q = NULL;
+    cbm_query_t *tail = NULL;
+    for (;;) {
+        cbm_query_t *block = NULL;
+        if (parse_query_block(&p, &block) < 0) {
+            out->error = heap_strdup(p.error);
+            cbm_query_free(q);
+            return CBM_NOT_FOUND;
+        }
+        if (tail) {
+            tail->union_next = block;
+        } else {
+            q = block;
+        }
+        tail = block;
+        /* UNION [ALL]: the ALL flag sits on the branch before the keyword. */
+        if (!check(&p, TOK_UNION)) {
+            break;
+        }
+        advance(&p);
+        tail->union_all = match(&p, TOK_ALL);
     }
 
     /* Every token must be consumed. The grammar accepts at most one WITH and
@@ -2737,24 +2787,40 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     return c->negated ? !result : result;
 }
 
-/* Recursive expression tree evaluator */
+/* Expression tree evaluator. Recurses into NOT and into the left operand of a
+ * binary node; a chain of one operator is linked along the right child (see
+ * expr_chain_link) and is walked here in a loop. */
 static bool eval_expr(const cbm_expr_t *e, binding_t *b) { // NOLINT(misc-no-recursion)
     if (!e) {
         return true;
     }
-    switch (e->type) {
-    case EXPR_CONDITION:
+    if (e->type == EXPR_CONDITION) {
         return eval_condition(&e->cond, b);
-    case EXPR_AND:
-        return (eval_expr(e->left, b) && eval_expr(e->right, b)) != 0;
-    case EXPR_OR:
-        return (eval_expr(e->left, b) || eval_expr(e->right, b)) != 0;
-    case EXPR_NOT:
-        return (!eval_expr(e->left, b)) != 0;
-    case EXPR_XOR:
-        return eval_expr(e->left, b) != eval_expr(e->right, b);
     }
-    return true;
+    if (e->type == EXPR_NOT) {
+        return (!eval_expr(e->left, b)) != 0;
+    }
+    /* AND / OR / XOR. The nested form `a OP (b OP (c ...))` evaluates a, then
+     * b, then c, and AND/OR stop at the first operand that decides the result;
+     * the loop does exactly that, one link per iteration. A right child that
+     * is not a link of the same operator is the chain's last operand. */
+    const cbm_expr_type_t type = e->type;
+    bool acc = eval_expr(e->left, b);
+    const cbm_expr_t *rest = e->right;
+    for (;;) {
+        if ((type == EXPR_AND && !acc) || (type == EXPR_OR && acc)) {
+            return acc;
+        }
+        bool linked = rest && rest->type == type;
+        bool v = eval_expr(linked ? rest->left : rest, b);
+        /* AND reaches here only with acc true, OR only with acc false, so the
+         * combined value is v itself; XOR keeps the running parity. */
+        acc = (type == EXPR_XOR) ? (acc != v) : v;
+        if (!linked) {
+            return acc;
+        }
+        rest = rest->right;
+    }
 }
 
 /* Evaluate WHERE clause — uses expression tree if available, falls back to legacy */
@@ -3774,6 +3840,63 @@ static void rb_apply_distinct(result_builder_t *rb) {
     free(key_buf);
 }
 
+/* DISTINCT while projecting (#58). RETURN DISTINCT used to project up to the
+ * row cap and only then drop duplicates, so a value first seen past the cap
+ * never reached the result (`RETURN DISTINCT type(r)` over more edges than
+ * max_rows could miss a rare type). The projection loops now skip duplicates
+ * as they go, so the cap counts distinct rows. Only admitted rows are keyed. */
+typedef struct {
+    bool on;
+    cypher_key_index_t seen;
+    char *key_buf;
+    size_t key_cap;
+} rb_distinct_t;
+
+static void rb_distinct_free(rb_distinct_t *d) {
+    key_index_free(&d->seen);
+    free(d->key_buf);
+}
+
+/* Whether vals equals a row rb already holds, column by column. */
+static bool rb_holds_row(const result_builder_t *rb, const char *const *vals) {
+    for (int j = 0; j < rb->row_count; j++) {
+        bool same = true;
+        for (int c = 0; c < rb->col_count && same; c++) {
+            same = strcmp(rb->rows[j][c], vals[c]) == 0;
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Add one projected row under a row cap, skipping a row DISTINCT already
+ * holds. Returns false once a new row arrives with the cap full: the caller
+ * stops projecting. vals entries may be NULL; they project as "". */
+static bool rb_add_row_capped(result_builder_t *rb, rb_distinct_t *d, const char **vals, int cap) {
+    const char *key = NULL;
+    if (d->on) {
+        for (int c = 0; c < rb->col_count; c++) {
+            vals[c] = vals[c] ? vals[c] : "";
+        }
+        key = row_key(vals, rb->col_count, &d->key_buf, &d->key_cap);
+        d->seen.failed = d->seen.failed || !key;
+        int found = key_index_find(&d->seen, key);
+        if (found == KEY_INDEX_UNKNOWN ? rb_holds_row(rb, vals) : found >= 0) {
+            return true;
+        }
+    }
+    if (rb->row_count >= cap) {
+        return false;
+    }
+    if (d->on) {
+        key_index_add(&d->seen, key, rb->row_count);
+    }
+    rb_add_row(rb, vals);
+    return true;
+}
+
 static void rb_free(result_builder_t *rb) {
     for (int i = 0; i < rb->row_count; i++) {
         for (int c = 0; c < rb->col_count; c++) {
@@ -4396,10 +4519,37 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     return found;
 }
 
+/* Whether an aggregate's argument has a value in this row: `*`, a WITH
+ * projection name, or a bound node/edge. An OPTIONAL MATCH with no match keeps
+ * its row with the variable unbound, which COUNT must skip (#58). */
+static bool binding_has_value(binding_t *b, const char *var, const char *prop) {
+    if (!var || strcmp(var, "*") == 0) {
+        return true;
+    }
+    char full[CBM_SZ_256];
+    if (prop) {
+        (void)snprintf(full, sizeof(full), "%s.%s", var, prop);
+    } else {
+        (void)snprintf(full, sizeof(full), "%s", var);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], full) == 0) {
+            return true;
+        }
+    }
+    return binding_get_edge(b, var) != NULL || binding_get(b, var) != NULL;
+}
+
+/* COUNT(x) over a row where x is unbound: skipped, so it counts 0, not 1. */
+static bool count_skips_row(const cbm_return_item_t *item, binding_t *b) {
+    return strcmp(item->func, "COUNT") == 0 &&
+           !binding_has_value(b, item->variable, item->property);
+}
+
 /* Accumulate aggregation values for a binding */
 static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, binding_t *b) {
     for (int ci = 0; ci < wc->count; ci++) {
-        if (!is_aggregate_func(wc->items[ci].func)) {
+        if (!is_aggregate_func(wc->items[ci].func) || count_skips_row(&wc->items[ci], b)) {
             continue;
         }
         agg->counts[ci]++;
@@ -4780,14 +4930,18 @@ static void execute_return_star_after_with(cbm_query_t *q, binding_t *bindings, 
         cols[i] = resolve_item_alias(&wc->items[i], name_bufs[i], sizeof(name_bufs[i]));
     }
     rb_set_columns(rb, cols, col_n);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    rb_distinct_t seen = {.on = q->ret && q->ret->distinct};
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CYP_MAX_VARS];
         for (int i = 0; i < col_n; i++) {
             cbm_node_t *vn = binding_get(&bindings[bi], cols[i]);
             vals[i] = vn && vn->name ? vn->name : "";
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_count, int max_rows,
@@ -4799,11 +4953,15 @@ static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_co
     const char *vars[CBM_SZ_32];
     int vc = collect_pattern_vars(q, vars, CBM_SZ_32);
     build_star_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    rb_distinct_t seen = {.on = q->ret && q->ret->distinct};
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, max_rows)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 /* Format an aggregate value into buf based on function name */
@@ -4879,7 +5037,7 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 /* Accumulate a binding into RETURN aggregation */
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
-        if (!is_aggregate_func(ret->items[ci].func)) {
+        if (!is_aggregate_func(ret->items[ci].func) || count_skips_row(&ret->items[ci], b)) {
             continue;
         }
         entry->counts[ci]++;
@@ -5059,18 +5217,22 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+    if (ret->limit > 0 && ret->order_key_count == 0 && ret->skip <= 0) {
+        proj_cap = ret->limit; /* with DISTINCT, the cap counts distinct rows */
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
+    rb_distinct_t seen = {.on = ret->distinct};
+    for (int bi = 0; bi < bind_count; bi++) {
         const char *vals[CBM_SZ_32];
         char func_bufs[CBM_SZ_32][CBM_SZ_512];
         for (int ci = 0; ci < ret->count; ci++) {
             vals[ci] =
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
-        rb_add_row(rb, vals);
+        if (!rb_add_row_capped(rb, &seen, vals, proj_cap)) {
+            break;
+        }
     }
+    rb_distinct_free(&seen);
 }
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
@@ -5392,7 +5554,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         }
     }
 
-    if (ret->distinct) {
+    /* The simple and star projections deduplicate while projecting; only
+     * aggregate rows still need the post-pass. */
+    if (ret->distinct && has_agg) {
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
@@ -5405,13 +5569,18 @@ static bool var_is(const char *name, const char *var) {
 
 /* Does every condition in e reference only var? An unbound variable counts as
  * a match, so NOT over a condition on a later variable would drop every row
- * if the WHERE ran before that variable is bound. */
+ * if the WHERE ran before that variable is bound. An operator chain is linked
+ * along the right child (expr_chain_link), so the right child is followed in
+ * a loop and only the left operand recurses. */
 static bool expr_only_uses_var(const cbm_expr_t *e, const char *var) { // NOLINT(misc-no-recursion)
+    while (e && e->type != EXPR_CONDITION) {
+        if (e->left && !expr_only_uses_var(e->left, var)) {
+            return false;
+        }
+        e = e->right; /* NULL for NOT, whose only operand is left */
+    }
     if (!e) {
         return true;
-    }
-    if (e->type != EXPR_CONDITION) {
-        return expr_only_uses_var(e->left, var) && expr_only_uses_var(e->right, var);
     }
     const cbm_condition_t *c = &e->cond;
     if (!var_is(c->variable, var) || !var_is(c->value_variable, var)) {
@@ -5426,11 +5595,15 @@ static bool expr_only_uses_var(const cbm_expr_t *e, const char *var) { // NOLINT
 }
 
 /* Early WHERE on the first scanned node: apply each top-level AND part that
- * references only that node; the late WHERE checks the full expression. */
+ * references only that node; the late WHERE checks the full expression. The
+ * AND chain is followed along its right child in a loop. */
 static bool eval_early_where(const cbm_expr_t *e, binding_t *b, // NOLINT(misc-no-recursion)
                              const char *var) {
-    if (e && e->type == EXPR_AND) {
-        return eval_early_where(e->left, b, var) && eval_early_where(e->right, b, var);
+    while (e && e->type == EXPR_AND) {
+        if (!eval_early_where(e->left, b, var)) {
+            return false;
+        }
+        e = e->right;
     }
     return !expr_only_uses_var(e, var) || eval_expr(e, b);
 }
