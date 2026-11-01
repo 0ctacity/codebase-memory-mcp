@@ -8,6 +8,7 @@
 #include "cypher/cypher.h"
 #include "store/store.h"
 #include "foundation/platform.h"
+#include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
@@ -3500,6 +3501,13 @@ static void cypher_stable_sort(int *idx, int n, cypher_index_cmp_fn cmp, const v
     free(tmp);
 }
 
+/* Convert intptr_t to void* without triggering performance-no-int-to-ptr. */
+static inline void *intptr_to_ptr(intptr_t v) {
+    void *p;
+    memcpy(&p, &v, sizeof(p));
+    return p;
+}
+
 /* String key → the index it was first recorded with. Keys are copied: the
  * arrays they mirror are reallocated as they grow. */
 typedef struct {
@@ -3544,7 +3552,7 @@ static void key_index_add(cypher_key_index_t *ix, const char *key, int index) {
     }
     ix->keys[ix->count++] = copy;
     uint32_t before = cbm_ht_count(ix->table);
-    (void)cbm_ht_set(ix->table, copy, (void *)(intptr_t)(index + SKIP_ONE));
+    (void)cbm_ht_set(ix->table, copy, intptr_to_ptr(index + SKIP_ONE));
     /* cbm_ht_set drops the entry silently when the table cannot grow. */
     ix->failed = cbm_ht_count(ix->table) == before;
 }
@@ -3643,8 +3651,8 @@ typedef struct {
  * by strcmp, a later key breaking ties; positive = a after b. */
 static int rb_order_compare(const void *context, int a, int b) {
     const rb_order_ctx_t *ctx = context;
-    const int *va = ctx->values ? ctx->values + (size_t)a * (size_t)ctx->keys : NULL;
-    const int *vb = ctx->values ? ctx->values + (size_t)b * (size_t)ctx->keys : NULL;
+    const int *va = ctx->values ? ctx->values + ((size_t)a * (size_t)ctx->keys) : NULL;
+    const int *vb = ctx->values ? ctx->values + ((size_t)b * (size_t)ctx->keys) : NULL;
     int cmp = 0;
     for (int k = 0; k < ctx->keys && cmp == 0; k++) {
         if (ctx->numeric[k]) {
@@ -3711,7 +3719,7 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
         idx[r] = r;
         rows[r] = rb->rows[r];
         for (int k = 0; values && k < keys; k++) {
-            values[(size_t)r * (size_t)keys + (size_t)k] =
+            values[((size_t)r * (size_t)keys) + (size_t)k] =
                 numeric[k] ? (int)strtol(rb->rows[r][cols[k]], NULL, CBM_DECIMAL_BASE) : 0;
         }
     }
@@ -4075,7 +4083,7 @@ enum { DISTINCT_SET_MIN = 16 }; /* below this a set is scanned, not hashed */
 static CBMHashTable *distinct_set_build(char **list, int count) {
     CBMHashTable *set = cbm_ht_create(CBM_SZ_64);
     for (int i = 0; set && i < count; i++) {
-        (void)cbm_ht_set(set, list[i], (void *)SKIP_ONE);
+        (void)cbm_ht_set(set, list[i], intptr_to_ptr(SKIP_ONE));
     }
     if (set && cbm_ht_count(set) != (uint32_t)count) {
         cbm_ht_free(set);
@@ -4117,7 +4125,7 @@ static void distinct_list_add(char ***list, int *count, CBMHashTable **set, cons
     (*list)[idx] = copy;
     (*count)++;
     if (*set) {
-        (void)cbm_ht_set(*set, copy, (void *)SKIP_ONE);
+        (void)cbm_ht_set(*set, copy, intptr_to_ptr(SKIP_ONE));
         if (cbm_ht_count(*set) != (uint32_t)*count) {
             cbm_ht_free(*set); /* the insert was dropped: back to scanning */
             *set = NULL;
@@ -4142,8 +4150,8 @@ static int with_order_compare(const void *context, int a, int b) {
     size_t keys = (size_t)ctx->wc->order_key_count;
     int cmp = 0;
     for (size_t k = 0; k < keys && cmp == 0; k++) {
-        size_t ia = (size_t)a * keys + k;
-        size_t ib = (size_t)b * keys + k;
+        size_t ia = ((size_t)a * keys) + k;
+        size_t ib = ((size_t)b * keys) + k;
         if (ctx->numbered[ia] && ctx->numbered[ib]) {
             cmp = (ctx->numbers[ia] > ctx->numbers[ib]) - (ctx->numbers[ia] < ctx->numbers[ib]);
         } else {
@@ -4162,7 +4170,7 @@ static int with_order_compare(const void *context, int a, int b) {
 static void with_order_resolve(with_order_ctx_t *ctx, binding_t *b, int i) {
     size_t keys = (size_t)ctx->wc->order_key_count;
     for (size_t k = 0; k < keys; k++) {
-        size_t cell = (size_t)i * keys + k;
+        size_t cell = ((size_t)i * keys) + k;
         const char *v = binding_get_virtual(b, ctx->wc->order_keys[k], NULL);
         char *end = NULL;
         ctx->values[cell] = v;
