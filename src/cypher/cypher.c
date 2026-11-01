@@ -8,6 +8,8 @@
 #include "cypher/cypher.h"
 #include "store/store.h"
 #include "foundation/platform.h"
+#include "foundation/constants.h"
+#include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
 
@@ -3440,6 +3442,163 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
     }
 }
 
+/* ── Sorting and key lookup ────────────────────────────────────────
+ * ORDER BY, GROUP BY and DISTINCT used to compare every row with every other
+ * row (bubble sorts, linear group and duplicate scans). These helpers keep the
+ * same comparisons and keys in O(n log n) and O(n) (upstream 8df0639c). */
+
+/* Compare items a and b; positive means a sorts after b. */
+typedef int (*cypher_index_cmp_fn)(const void *ctx, int a, int b);
+
+/* Stable sort of idx[0..n). Both this and the bubble sorts it replaces are
+ * stable, so for any consistent ordering they give the same permutation. An
+ * item moves before an earlier one only when cmp(earlier, item) > 0, which is
+ * the bubble sorts' swap test. Without scratch memory it degrades to an
+ * insertion sort with the same test and result. The deadline is checked once
+ * per pass under `site`; past it the sort stops with idx still a permutation,
+ * and the query fails on its final deadline check. */
+static void cypher_stable_sort(int *idx, int n, cypher_index_cmp_fn cmp, const void *ctx,
+                               const char *site) {
+    if (n < PAIR_LEN) {
+        return;
+    }
+    int *tmp = malloc((size_t)n * sizeof(int));
+    if (!tmp) {
+        for (int i = SKIP_ONE; i < n; i++) {
+            if (cypher_deadline_exceeded_at(site)) {
+                return;
+            }
+            for (int j = i; j > 0 && cmp(ctx, idx[j - SKIP_ONE], idx[j]) > 0; j--) {
+                int swap = idx[j];
+                idx[j] = idx[j - SKIP_ONE];
+                idx[j - SKIP_ONE] = swap;
+            }
+        }
+        return;
+    }
+    for (int64_t width = SKIP_ONE; width < n; width *= PAIR_LEN) {
+        if (cypher_deadline_exceeded_at(site)) {
+            break;
+        }
+        for (int64_t lo = 0; lo < n; lo += PAIR_LEN * width) {
+            int64_t mid = lo + width < n ? lo + width : n;
+            int64_t hi = mid + width < n ? mid + width : n;
+            int64_t i = lo;
+            int64_t j = mid;
+            int64_t k = lo;
+            while (i < mid && j < hi) {
+                tmp[k++] = cmp(ctx, idx[i], idx[j]) > 0 ? idx[j++] : idx[i++];
+            }
+            while (i < mid) {
+                tmp[k++] = idx[i++];
+            }
+            while (j < hi) {
+                tmp[k++] = idx[j++];
+            }
+        }
+        memcpy(idx, tmp, (size_t)n * sizeof(int));
+    }
+    free(tmp);
+}
+
+/* Convert intptr_t to void* without triggering performance-no-int-to-ptr. */
+static inline void *intptr_to_ptr(intptr_t v) {
+    void *p;
+    memcpy(&p, &v, sizeof(p));
+    return p;
+}
+
+/* String key → the index it was first recorded with. Keys are copied: the
+ * arrays they mirror are reallocated as they grow. */
+typedef struct {
+    CBMHashTable *table;
+    char **keys;
+    int count;
+    int cap;
+    bool failed; /* an allocation failed: callers fall back to their scans */
+} cypher_key_index_t;
+
+/* The recorded index, CYP_FOUND_NONE, or KEY_INDEX_UNKNOWN after a failed
+ * allocation (the caller then scans, so a result never depends on memory). */
+enum { KEY_INDEX_UNKNOWN = -2 };
+
+static int key_index_find(const cypher_key_index_t *ix, const char *key) {
+    if (ix->failed) {
+        return KEY_INDEX_UNKNOWN;
+    }
+    void *value = ix->table ? cbm_ht_get(ix->table, key) : NULL;
+    return value ? (int)((intptr_t)value - SKIP_ONE) : CYP_FOUND_NONE;
+}
+
+static void key_index_add(cypher_key_index_t *ix, const char *key, int index) {
+    if (ix->failed) {
+        return;
+    }
+    if (!ix->table) {
+        ix->table = cbm_ht_create(CBM_SZ_256);
+    }
+    if (ix->table && ix->count >= ix->cap) {
+        int cap = ix->cap ? ix->cap * PAIR_LEN : CBM_SZ_256;
+        char **keys = realloc(ix->keys, (size_t)cap * sizeof(char *));
+        if (keys) {
+            ix->keys = keys;
+            ix->cap = cap;
+        }
+    }
+    char *copy = ix->table && ix->count < ix->cap ? heap_strdup(key) : NULL;
+    if (!copy) {
+        ix->failed = true;
+        return;
+    }
+    ix->keys[ix->count++] = copy;
+    uint32_t before = cbm_ht_count(ix->table);
+    (void)cbm_ht_set(ix->table, copy, intptr_to_ptr(index + SKIP_ONE));
+    /* cbm_ht_set drops the entry silently when the table cannot grow. */
+    ix->failed = cbm_ht_count(ix->table) == before;
+}
+
+static void key_index_free(cypher_key_index_t *ix) {
+    if (ix->table) {
+        cbm_ht_free(ix->table);
+    }
+    for (int i = 0; i < ix->count; i++) {
+        free(ix->keys[i]);
+    }
+    free(ix->keys);
+    memset(ix, 0, sizeof(*ix));
+}
+
+/* A row's DISTINCT identity: every value, length-prefixed so no value can run
+ * into the next — equal keys exactly when every value is equal. Built in *buf
+ * (grown as needed); NULL when out of memory. */
+static const char *row_key(const char *const *vals, int n, char **buf, size_t *cap) {
+    size_t need = SKIP_ONE;
+    for (int c = 0; c < n; c++) {
+        need += strlen(vals[c]) + CBM_SZ_32;
+    }
+    if (need > *cap) {
+        char *grown = realloc(*buf, need);
+        if (!grown) {
+            return NULL;
+        }
+        *buf = grown;
+        *cap = need;
+    }
+    size_t used = 0;
+    for (int c = 0; c < n; c++) {
+        size_t len = strlen(vals[c]);
+        int prefix_len = snprintf(*buf + used, *cap - used, "%zu:", len);
+        if (prefix_len <= 0 || (size_t)prefix_len + len >= *cap - used) {
+            return NULL; /* cannot happen: `need` reserved this */
+        }
+        used += (size_t)prefix_len;
+        memcpy(*buf + used, vals[c], len);
+        used += len;
+    }
+    (*buf)[used] = '\0';
+    return *buf;
+}
+
 /* ── Result postprocessing helpers ─────────────────────────────── */
 
 /* Find the column index for one ORDER BY key, checking both column names and
@@ -3479,6 +3638,37 @@ static bool rb_is_numeric_column(const result_builder_t *rb, int col) {
     return false;
 }
 
+typedef struct {
+    const int *cols;
+    const bool *numeric;
+    const bool *descs;
+    int keys;
+    const char ***rows; /* the rows in their pre-sort order */
+    const int *values;  /* numeric keys parsed once: values[row * keys + k], or NULL */
+} rb_order_ctx_t;
+
+/* One ORDER BY comparison: numeric columns by their (int)strtol value, others
+ * by strcmp, a later key breaking ties; positive = a after b. */
+static int rb_order_compare(const void *context, int a, int b) {
+    const rb_order_ctx_t *ctx = context;
+    const int *va = ctx->values ? ctx->values + ((size_t)a * (size_t)ctx->keys) : NULL;
+    const int *vb = ctx->values ? ctx->values + ((size_t)b * (size_t)ctx->keys) : NULL;
+    int cmp = 0;
+    for (int k = 0; k < ctx->keys && cmp == 0; k++) {
+        if (ctx->numeric[k]) {
+            int x = va ? va[k] : (int)strtol(ctx->rows[a][ctx->cols[k]], NULL, CBM_DECIMAL_BASE);
+            int y = vb ? vb[k] : (int)strtol(ctx->rows[b][ctx->cols[k]], NULL, CBM_DECIMAL_BASE);
+            cmp = (x > y) - (x < y);
+        } else {
+            cmp = strcmp(ctx->rows[a][ctx->cols[k]], ctx->rows[b][ctx->cols[k]]);
+        }
+        if (ctx->descs[k]) {
+            cmp = -cmp;
+        }
+    }
+    return cmp;
+}
+
 static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
     if (ret->order_key_count == 0) {
         return;
@@ -3500,34 +3690,48 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
         descs[keys] = ret->order_descs[k];
         keys++;
     }
-    if (keys == 0) {
+    int n = rb->row_count;
+    if (keys == 0 || n < PAIR_LEN) {
         return;
     }
-    for (int i = 0; i < rb->row_count - SKIP_ONE; i++) {
-        /* Each pass is O(rows); stop sorting once the budget is spent. */
-        if (cypher_deadline_exceeded_at("order_by")) {
-            return;
-        }
-        for (int j = 0; j < rb->row_count - i - SKIP_ONE; j++) {
-            int cmp = 0;
-            for (int k = 0; k < keys && cmp == 0; k++) {
-                if (numeric[k]) {
-                    cmp = (int)strtol(rb->rows[j][cols[k]], NULL, CBM_DECIMAL_BASE) -
-                          (int)strtol(rb->rows[j + SKIP_ONE][cols[k]], NULL, CBM_DECIMAL_BASE);
-                } else {
-                    cmp = strcmp(rb->rows[j][cols[k]], rb->rows[j + SKIP_ONE][cols[k]]);
-                }
-                if (descs[k]) {
-                    cmp = -cmp;
-                }
+    rb_order_ctx_t ctx = {.cols = cols, .numeric = numeric, .descs = descs, .keys = keys};
+    int *idx = malloc((size_t)n * sizeof(int));
+    const char ***rows = malloc((size_t)n * sizeof(const char **));
+    if (!idx || !rows) {
+        /* No scratch memory: insertion sort in place, same comparisons. */
+        free(idx);
+        free(rows);
+        ctx.rows = rb->rows;
+        for (int i = SKIP_ONE; i < n; i++) {
+            if (cypher_deadline_exceeded_at("order_by")) {
+                return;
             }
-            if (cmp > 0) {
+            for (int j = i; j > 0 && rb_order_compare(&ctx, j - SKIP_ONE, j) > 0; j--) {
                 const char **tmp = rb->rows[j];
-                rb->rows[j] = rb->rows[j + SKIP_ONE];
-                rb->rows[j + SKIP_ONE] = tmp;
+                rb->rows[j] = rb->rows[j - SKIP_ONE];
+                rb->rows[j - SKIP_ONE] = tmp;
             }
+        }
+        return;
+    }
+    int *values = malloc((size_t)n * (size_t)keys * sizeof(int));
+    for (int r = 0; r < n; r++) {
+        idx[r] = r;
+        rows[r] = rb->rows[r];
+        for (int k = 0; values && k < keys; k++) {
+            values[((size_t)r * (size_t)keys) + (size_t)k] =
+                numeric[k] ? (int)strtol(rb->rows[r][cols[k]], NULL, CBM_DECIMAL_BASE) : 0;
         }
     }
+    ctx.rows = rows;
+    ctx.values = values;
+    cypher_stable_sort(idx, n, rb_order_compare, &ctx, "order_by");
+    for (int r = 0; r < n; r++) {
+        rb->rows[r] = rows[idx[r]];
+    }
+    free(values);
+    free(rows);
+    free(idx);
 }
 
 static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
@@ -3562,25 +3766,35 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
     }
 }
 
+/* Whether row i equals one of the first `kept` rows, column by column. */
+static bool rb_row_seen_before(const result_builder_t *rb, int i, int kept) {
+    for (int j = 0; j < kept; j++) {
+        bool same = true;
+        for (int c = 0; c < rb->col_count && same; c++) {
+            same = strcmp(rb->rows[i][c], rb->rows[j][c]) == 0;
+        }
+        if (same) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void rb_apply_distinct(result_builder_t *rb) {
     if (rb->row_count <= SKIP_ONE) {
         return;
     }
-    int kept = SKIP_ONE;
-    for (int i = SKIP_ONE; i < rb->row_count; i++) {
-        bool dup = false;
-        for (int j = 0; j < kept && !dup; j++) {
-            bool same = true;
-            for (int c = 0; c < rb->col_count && same; c++) {
-                if (strcmp(rb->rows[i][c], rb->rows[j][c]) != 0) {
-                    same = false;
-                }
-            }
-            if (same) {
-                dup = true;
-            }
-        }
+    cypher_key_index_t seen = {0};
+    char *key_buf = NULL;
+    size_t key_cap = 0;
+    int kept = 0;
+    for (int i = 0; i < rb->row_count; i++) {
+        const char *key = row_key(rb->rows[i], rb->col_count, &key_buf, &key_cap);
+        seen.failed = seen.failed || !key;
+        int found = key_index_find(&seen, key);
+        bool dup = found == KEY_INDEX_UNKNOWN ? rb_row_seen_before(rb, i, kept) : found >= 0;
         if (!dup) {
+            key_index_add(&seen, key, kept);
             if (kept != i) {
                 rb->rows[kept] = rb->rows[i];
             }
@@ -3593,6 +3807,8 @@ static void rb_apply_distinct(result_builder_t *rb) {
         }
     }
     rb->row_count = kept;
+    key_index_free(&seen);
+    free(key_buf);
 }
 
 static void rb_free(result_builder_t *rb) {
@@ -3851,49 +4067,171 @@ static bool is_aggregate_func(const char *func) {
             strcmp(func, "MIN") == 0 || strcmp(func, "MAX") == 0 || strcmp(func, "COLLECT") == 0);
 }
 
-/* Append `val` to a string list only if not already present — i.e. maintain a
- * set of distinct values. Used by COUNT(DISTINCT x) (#239). */
-static void distinct_list_add(char ***list, int *count, const char *val) {
-    for (int i = 0; i < *count; i++) {
-        if (strcmp((*list)[i], val) == 0) {
-            return;
-        }
+/* Grow a string list for one more entry at `idx`: the capacity doubles at
+ * every power of two, so n appends cost O(n) copying, not O(n^2). */
+static char **string_list_reserve(char **list, int idx) {
+    if (idx > 0 && (idx & (idx - SKIP_ONE)) != 0) {
+        return list; /* capacity is the next power of two above idx */
     }
-    int idx = (*count)++;
-    *list = safe_realloc(*list, (size_t)(idx + SKIP_ONE) * sizeof(char *));
-    (*list)[idx] = heap_strdup(val);
+    return safe_realloc(list, (size_t)(idx ? idx * PAIR_LEN : SKIP_ONE) * sizeof(char *));
 }
 
-/* Sort bindings by the ORDER BY key list (virtual variables) using bubble
- * sort; later keys break ties, direction is per key (upstream 0a0ef516). */
-static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        /* Each pass is O(bindings); stop sorting once the budget is spent. */
-        if (cypher_deadline_exceeded_at("sort_bindings")) {
+enum { DISTINCT_SET_MIN = 16 }; /* below this a set is scanned, not hashed */
+
+/* Hash the first `count` list entries into a new set; NULL if it cannot be
+ * built in full (the caller then keeps scanning the list). */
+static CBMHashTable *distinct_set_build(char **list, int count) {
+    CBMHashTable *set = cbm_ht_create(CBM_SZ_64);
+    for (int i = 0; set && i < count; i++) {
+        (void)cbm_ht_set(set, list[i], intptr_to_ptr(SKIP_ONE));
+    }
+    if (set && cbm_ht_count(set) != (uint32_t)count) {
+        cbm_ht_free(set);
+        set = NULL;
+    }
+    return set;
+}
+
+/* Append `val` to a string list only if not already present — i.e. maintain a
+ * set of distinct values. Used by COUNT(DISTINCT x) (#239). Past
+ * DISTINCT_SET_MIN values the membership test goes through *set, whose keys
+ * are the list's own strings; a set that cannot be built stays a scan. */
+static void distinct_list_add(char ***list, int *count, CBMHashTable **set, const char *val) {
+    if (*set) {
+        if (cbm_ht_has(*set, val)) {
             return;
         }
-        for (int j = 0; j < count - i - SKIP_ONE; j++) {
-            int cmp = 0;
-            for (int k = 0; k < wc->order_key_count && cmp == 0; k++) {
-                const char *va = binding_get_virtual(&vbindings[j], wc->order_keys[k], NULL);
-                const char *vb2 =
-                    binding_get_virtual(&vbindings[j + SKIP_ONE], wc->order_keys[k], NULL);
-                char *ea = NULL;
-                char *eb = NULL;
-                double da = strtod(va, &ea);
-                double db = strtod(vb2, &eb);
-                cmp = (ea != va && eb != vb2) ? ((da > db) - (da < db)) : strcmp(va, vb2);
-                if (wc->order_descs[k]) {
-                    cmp = -cmp;
-                }
-            }
-            if (cmp > 0) {
-                binding_t tmp = vbindings[j];
-                vbindings[j] = vbindings[j + SKIP_ONE];
-                vbindings[j + SKIP_ONE] = tmp;
+    } else {
+        for (int i = 0; i < *count; i++) {
+            if (strcmp((*list)[i], val) == 0) {
+                return;
             }
         }
     }
+    int idx = *count;
+    *list = string_list_reserve(*list, idx);
+    char *copy = *list ? heap_strdup(val) : NULL;
+    if (!copy) {
+        /* Out of memory: keep a consistent (possibly emptied) set. */
+        if (!*list) {
+            *count = 0;
+            if (*set) {
+                cbm_ht_free(*set);
+                *set = NULL;
+            }
+        }
+        return;
+    }
+    (*list)[idx] = copy;
+    (*count)++;
+    if (*set) {
+        (void)cbm_ht_set(*set, copy, intptr_to_ptr(SKIP_ONE));
+        if (cbm_ht_count(*set) != (uint32_t)*count) {
+            cbm_ht_free(*set); /* the insert was dropped: back to scanning */
+            *set = NULL;
+        }
+    } else if (*count >= DISTINCT_SET_MIN) {
+        *set = distinct_set_build(*list, *count);
+    }
+}
+
+typedef struct {
+    const cbm_return_clause_t *wc;
+    const char **values; /* values[i * keys + k]: binding i's ORDER BY key k */
+    bool *numbered;      /* whether strtod consumed a number from that value */
+    double *numbers;
+} with_order_ctx_t;
+
+/* One WITH ORDER BY comparison: per key, numerically when both values start
+ * with a number, else by strcmp; later keys break ties, direction is per key
+ * (upstream 0a0ef516). Positive = a after b. */
+static int with_order_compare(const void *context, int a, int b) {
+    const with_order_ctx_t *ctx = context;
+    size_t keys = (size_t)ctx->wc->order_key_count;
+    int cmp = 0;
+    for (size_t k = 0; k < keys && cmp == 0; k++) {
+        size_t ia = ((size_t)a * keys) + k;
+        size_t ib = ((size_t)b * keys) + k;
+        if (ctx->numbered[ia] && ctx->numbered[ib]) {
+            cmp = (ctx->numbers[ia] > ctx->numbers[ib]) - (ctx->numbers[ia] < ctx->numbers[ib]);
+        } else {
+            cmp = strcmp(ctx->values[ia], ctx->values[ib]);
+        }
+        if (ctx->wc->order_descs[k]) {
+            cmp = -cmp;
+        }
+    }
+    return cmp;
+}
+
+/* Resolve binding i's ORDER BY keys into the context. binding_get_virtual
+ * without a property returns strings the binding owns, so the pointers stay
+ * valid while the bindings are only reordered. */
+static void with_order_resolve(with_order_ctx_t *ctx, binding_t *b, int i) {
+    size_t keys = (size_t)ctx->wc->order_key_count;
+    for (size_t k = 0; k < keys; k++) {
+        size_t cell = ((size_t)i * keys) + k;
+        const char *v = binding_get_virtual(b, ctx->wc->order_keys[k], NULL);
+        char *end = NULL;
+        ctx->values[cell] = v;
+        ctx->numbers[cell] = strtod(v, &end);
+        ctx->numbered[cell] = end != v;
+    }
+}
+
+/* Sort bindings by the ORDER BY key list (virtual variables), stably. Each
+ * binding's keys are resolved once, not twice per comparison. */
+static void sort_bindings(binding_t *vbindings, int count, const cbm_return_clause_t *wc) {
+    if (count < PAIR_LEN || wc->order_key_count <= 0) {
+        return;
+    }
+    size_t keys = (size_t)wc->order_key_count;
+    size_t cells = (size_t)count * keys;
+    with_order_ctx_t ctx = {.wc = wc,
+                            .values = malloc(cells * sizeof(const char *)),
+                            .numbered = malloc(cells * sizeof(bool)),
+                            .numbers = malloc(cells * sizeof(double))};
+    int *idx = malloc((size_t)count * sizeof(int));
+    binding_t *sorted = malloc((size_t)count * sizeof(binding_t));
+    if (ctx.values && ctx.numbered && ctx.numbers && idx && sorted) {
+        for (int i = 0; i < count; i++) {
+            idx[i] = i;
+            with_order_resolve(&ctx, &vbindings[i], i);
+        }
+        cypher_stable_sort(idx, count, with_order_compare, &ctx, "sort_bindings");
+        for (int i = 0; i < count; i++) {
+            sorted[i] = vbindings[idx[i]];
+        }
+        memcpy(vbindings, sorted, (size_t)count * sizeof(binding_t));
+    } else {
+        /* No scratch memory: insertion sort in place, same comparisons, with
+         * the two compared bindings' keys resolved into a two-cell context. */
+        const char *pair_values[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
+        bool pair_numbered[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
+        double pair_numbers[CBM_CYPHER_ORDER_KEYS_MAX * PAIR_LEN];
+        with_order_ctx_t pair = {
+            .wc = wc, .values = pair_values, .numbered = pair_numbered, .numbers = pair_numbers};
+        for (int i = SKIP_ONE; i < count; i++) {
+            if (cypher_deadline_exceeded_at("sort_bindings")) {
+                break;
+            }
+            for (int j = i; j > 0; j--) {
+                with_order_resolve(&pair, &vbindings[j - SKIP_ONE], 0);
+                with_order_resolve(&pair, &vbindings[j], SKIP_ONE);
+                if (with_order_compare(&pair, 0, SKIP_ONE) <= 0) {
+                    break;
+                }
+                binding_t tmp = vbindings[j];
+                vbindings[j] = vbindings[j - SKIP_ONE];
+                vbindings[j - SKIP_ONE] = tmp;
+            }
+        }
+    }
+    free(ctx.values);
+    free(ctx.numbered);
+    free(ctx.numbers);
+    free(idx);
+    free(sorted);
 }
 
 /* Apply skip and limit to a binding array, freeing discarded entries */
@@ -3949,9 +4287,10 @@ typedef struct {
     double *sums;
     int *counts;
     double *mins, *maxs;
-    char ***distinct_lists;  /* per-item set of seen values for COUNT(DISTINCT) */
-    int *distinct_n;         /* per-item distinct count (#239) */
-    int64_t *group_node_ids; /* per-item node id when the group var is a node (0 = not) */
+    char ***distinct_lists;       /* per-item set of seen values for COUNT(DISTINCT) */
+    int *distinct_n;              /* per-item distinct count (#239) */
+    CBMHashTable **distinct_sets; /* per-item hash over distinct_lists (lazy) */
+    int64_t *group_node_ids;      /* per-item node id when the group var is a node (0 = not) */
 } with_agg_t;
 
 /* Build a group key from non-aggregate WITH items */
@@ -3973,11 +4312,16 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
 
 /* Find or create an aggregation group. Returns index. */
 static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap,
-                                   cbm_return_clause_t *wc, binding_t *b, const char *key) {
-    for (int a = 0; a < *agg_cnt; a++) {
+                                   cypher_key_index_t *groups, cbm_return_clause_t *wc,
+                                   binding_t *b, const char *key) {
+    int existing = key_index_find(groups, key);
+    for (int a = 0; existing == KEY_INDEX_UNKNOWN && a < *agg_cnt; a++) {
         if (strcmp((*aggs)[a].group_key, key) == 0) {
-            return a;
+            existing = a;
         }
+    }
+    if (existing >= 0) {
+        return existing;
     }
     if (*agg_cnt >= *agg_cap) {
         *agg_cap *= PAIR_LEN;
@@ -3985,6 +4329,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     }
     int found = (*agg_cnt)++;
     snprintf((*aggs)[found].group_key, sizeof((*aggs)[found].group_key), "%s", key);
+    key_index_add(groups, (*aggs)[found].group_key, found);
     (*aggs)[found].group_vals = calloc(wc->count, sizeof(const char *));
     (*aggs)[found].sums = calloc(wc->count, sizeof(double));
     (*aggs)[found].counts = calloc(wc->count, sizeof(int));
@@ -3992,6 +4337,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     (*aggs)[found].maxs = calloc(wc->count, sizeof(double));
     (*aggs)[found].distinct_lists = calloc(wc->count, sizeof(char **));
     (*aggs)[found].distinct_n = calloc(wc->count, sizeof(int));
+    (*aggs)[found].distinct_sets = calloc(wc->count, sizeof(CBMHashTable *));
     (*aggs)[found].group_node_ids = calloc(wc->count, sizeof(int64_t));
     for (int ci = 0; ci < wc->count; ci++) {
         (*aggs)[found].mins[ci] = CYP_DBL_MAX;
@@ -4027,7 +4373,8 @@ static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, bindin
         agg->counts[ci]++;
         const char *raw = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
         if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
-            distinct_list_add(&agg->distinct_lists[ci], &agg->distinct_n[ci], raw);
+            distinct_list_add(&agg->distinct_lists[ci], &agg->distinct_n[ci],
+                              &agg->distinct_sets[ci], raw);
         }
         double dv = strtod(raw, NULL);
         agg->sums[ci] += dv;
@@ -4070,6 +4417,9 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
     for (int a = 0; a < agg_cnt; a++) {
         for (int ci = 0; ci < item_count; ci++) {
             safe_str_free(&aggs[a].group_vals[ci]);
+            if (aggs[a].distinct_sets && aggs[a].distinct_sets[ci]) {
+                cbm_ht_free(aggs[a].distinct_sets[ci]);
+            }
             if (aggs[a].distinct_lists && aggs[a].distinct_lists[ci]) {
                 for (int j = 0; j < aggs[a].distinct_n[ci]; j++) {
                     free(aggs[a].distinct_lists[ci][j]);
@@ -4084,6 +4434,7 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].distinct_lists);
         free(aggs[a].distinct_n);
+        free(aggs[a].distinct_sets);
         free(aggs[a].group_node_ids);
     }
     free(aggs);
@@ -4095,13 +4446,16 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
     int agg_cap = CBM_SZ_256;
     with_agg_t *aggs = calloc(agg_cap, sizeof(with_agg_t));
     int agg_cnt = 0;
+    cypher_key_index_t groups = {0};
 
     for (int bi = 0; bi < bind_count; bi++) {
         char key[CBM_SZ_1K] = "";
         with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
-        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key);
+        int found =
+            with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &groups, wc, &bindings[bi], key);
         with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
     }
+    key_index_free(&groups);
 
     *vbindings = safe_realloc(*vbindings, (agg_cnt + SKIP_ONE) * sizeof(binding_t));
     if (!*vbindings) {
@@ -4173,44 +4527,55 @@ static void filter_bindings_where(const cbm_where_clause_t *where, binding_t *vb
     *vcount = kept;
 }
 
-/* Build a key from a projected vbinding's value tuple (all WITH output items),
- * used to detect duplicate rows for WITH DISTINCT (#238). */
-static void with_proj_key(cbm_return_clause_t *wc, binding_t *b, char *key, size_t key_sz) {
-    int kl = 0;
-    key[0] = '\0';
+/* One WITH output item's value on a projected vbinding, looked up by the
+ * item's alias; used to detect duplicate rows for WITH DISTINCT (#238). */
+static const char *with_item_value(const cbm_return_clause_t *wc, binding_t *b, int ci) {
     char name_buf[CBM_SZ_256];
-    for (int ci = 0; ci < wc->count; ci++) {
-        const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
-        const char *v = binding_get_virtual(b, alias, NULL);
-        int w = snprintf(key + kl, (kl < (int)key_sz) ? key_sz - (size_t)kl : 0, "%s|", v ? v : "");
-        if (w > 0) {
-            kl += w;
+    const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
+    const char *v = binding_get_virtual(b, alias, NULL);
+    return v ? v : "";
+}
+
+/* Whether vbinding i's value tuple equals one of the first `kept` tuples. */
+static bool with_row_seen_before(const cbm_return_clause_t *wc, binding_t *vbindings, int i,
+                                 int kept) {
+    for (int j = 0; j < kept; j++) {
+        bool same = true;
+        for (int ci = 0; ci < wc->count && same; ci++) {
+            same = strcmp(with_item_value(wc, &vbindings[i], ci),
+                          with_item_value(wc, &vbindings[j], ci)) == 0;
         }
-        if (kl >= (int)key_sz) {
-            break; /* buffer full */
+        if (same) {
+            return true;
         }
     }
+    return false;
 }
 
 /* Apply WITH DISTINCT: drop projected rows whose value tuple duplicates an
  * earlier one, keeping first occurrence (#238 — previously silently ignored). */
 static void with_apply_distinct(cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
+    const char **vals = malloc((size_t)(wc->count > 0 ? wc->count : SKIP_ONE) * sizeof(char *));
+    cypher_key_index_t seen = {.failed = vals == NULL};
+    char *key_buf = NULL;
+    size_t key_cap = 0;
     int kept = 0;
     for (int i = 0; i < *vcount; i++) {
-        char key[CBM_SZ_1K];
-        with_proj_key(wc, &vbindings[i], key, sizeof(key));
-        bool dup = false;
-        for (int j = 0; j < kept; j++) {
-            char pkey[CBM_SZ_1K];
-            with_proj_key(wc, &vbindings[j], pkey, sizeof(pkey));
-            if (strcmp(key, pkey) == 0) {
-                dup = true;
-                break;
+        const char *key = NULL;
+        if (!seen.failed) {
+            for (int ci = 0; ci < wc->count; ci++) {
+                vals[ci] = with_item_value(wc, &vbindings[i], ci);
             }
+            key = row_key(vals, wc->count, &key_buf, &key_cap);
+            seen.failed = !key;
         }
+        int found = key_index_find(&seen, key);
+        bool dup = found == KEY_INDEX_UNKNOWN ? with_row_seen_before(wc, vbindings, i, kept)
+                                              : found >= 0;
         if (dup) {
             binding_free(&vbindings[i]);
         } else {
+            key_index_add(&seen, key, kept);
             if (kept != i) {
                 vbindings[kept] = vbindings[i];
             }
@@ -4218,6 +4583,9 @@ static void with_apply_distinct(cbm_return_clause_t *wc, binding_t *vbindings, i
         }
     }
     *vcount = kept;
+    key_index_free(&seen);
+    free(key_buf);
+    free(vals);
 }
 
 static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *bind_count_ptr) {
@@ -4444,6 +4812,7 @@ typedef struct {
     double *mins, *maxs;
     char ***collect_lists;
     int *collect_counts;
+    CBMHashTable **distinct_sets; /* per-item hash over collect_lists for COUNT(DISTINCT) */
 } ret_agg_entry_t;
 
 /* Initialize a new RETURN aggregation group */
@@ -4457,6 +4826,7 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
     entry->maxs = malloc(item_count * sizeof(double));
     entry->collect_lists = calloc(item_count, sizeof(char **));
     entry->collect_counts = calloc(item_count, sizeof(int));
+    entry->distinct_sets = calloc(item_count, sizeof(CBMHashTable *));
     for (int ci = 0; ci < item_count; ci++) {
         entry->mins[ci] = CYP_DBL_MAX;
         entry->maxs[ci] = -CYP_DBL_MAX;
@@ -4487,7 +4857,8 @@ static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret,
             entry->collect_lists[ci][idx] = heap_strdup(raw);
         } else if (ret->items[ci].distinct && strcmp(ret->items[ci].func, "COUNT") == 0) {
             /* COUNT(DISTINCT x): track unique values; emit the set size (#239). */
-            distinct_list_add(&entry->collect_lists[ci], &entry->collect_counts[ci], raw);
+            distinct_list_add(&entry->collect_lists[ci], &entry->collect_counts[ci],
+                              &entry->distinct_sets[ci], raw);
         }
     }
 }
@@ -4497,6 +4868,9 @@ static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
     for (int a = 0; a < agg_count; a++) {
         for (int ci = 0; ci < item_count; ci++) {
             safe_str_free(&aggs[a].group_vals[ci]);
+            if (aggs[a].distinct_sets && aggs[a].distinct_sets[ci]) {
+                cbm_ht_free(aggs[a].distinct_sets[ci]);
+            }
             for (int j = 0; j < aggs[a].collect_counts[ci]; j++) {
                 free(aggs[a].collect_lists[ci][j]);
             }
@@ -4509,6 +4883,7 @@ static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
         free(aggs[a].maxs);
         free(aggs[a].collect_lists);
         free(aggs[a].collect_counts);
+        free(aggs[a].distinct_sets);
     }
     free(aggs);
 }
@@ -4566,10 +4941,11 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
     int agg_cap = CBM_SZ_256;
     ret_agg_entry_t *aggs = calloc(agg_cap, sizeof(ret_agg_entry_t));
     int agg_count = 0;
+    cypher_key_index_t groups = {0};
 
     for (int bi = 0; bi < bind_count; bi++) {
-        /* Grouping is O(bindings x groups) — the dominant cost on a
-         * whole-graph GROUP BY. Abort if the wall-clock budget is blown. */
+        /* Grouping dominates a whole-graph GROUP BY. Abort if the
+         * wall-clock budget is blown. */
         if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
         }
@@ -4578,11 +4954,10 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         char valbufs[CBM_SZ_32][CBM_SZ_512];
         ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
 
-        int found = CYP_FOUND_NONE;
-        for (int a = 0; a < agg_count; a++) {
+        int found = key_index_find(&groups, key);
+        for (int a = 0; found == KEY_INDEX_UNKNOWN && a < agg_count; a++) {
             if (strcmp(aggs[a].group_key, key) == 0) {
                 found = a;
-                break;
             }
         }
         if (found < 0) {
@@ -4592,9 +4967,11 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
             }
             found = agg_count++;
             ret_agg_init_group(&aggs[found], key, ret->count, vals);
+            key_index_add(&groups, aggs[found].group_key, found);
         }
         ret_agg_accumulate(&aggs[found], ret, &bindings[bi]);
     }
+    key_index_free(&groups);
 
     for (int a = 0; a < agg_count; a++) {
         ret_agg_emit_row(ret, &aggs[a], rb);
