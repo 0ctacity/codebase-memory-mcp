@@ -2015,6 +2015,17 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     return !is_junk_url(norm);
 }
 
+static bool arg_is_topic(const CBMCallArg *arg) {
+    static const char *keywords[] = {"topic",    "topic_id", "topic_name", "queue", "queue_name",
+                                     "queue_id", "subject",  "channel",    NULL};
+    for (int i = 0; arg->keyword && keywords[i]; i++) {
+        if (strcmp(arg->keyword, keywords[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* File-language scope of the client-navigation heuristic (#1250): the JS/TS
  * family and the hosts that embed it. Kept explicit so changes to the
  * weak-member guard cannot broaden it. */
@@ -2037,14 +2048,17 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
+        if (arg_is_topic(ca)) {
+            continue;
+        }
         /* A slash-prefixed raw expression is not a URL string. In JS/TS this
          * is notably a regex literal (`/<table/i`); genuine string literals
          * and propagated constants are carried in `value`, while template
          * literals keep their leading backtick in `expr`. */
-        if (!ca->value && ca->expr && ca->expr[0] == '/') {
+        if (!ca->value && !ca->url_value && ca->expr && ca->expr[0] == '/') {
             continue;
         }
-        const char *url = ca->value ? ca->value : ca->expr;
+        const char *url = ca->url_value ? ca->url_value : (ca->value ? ca->value : ca->expr);
         if (!url || (url[0] != '/' && url[0] != '`')) {
             continue;
         }
