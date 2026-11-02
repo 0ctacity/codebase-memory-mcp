@@ -72,6 +72,7 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h" /* cbm_pxc_* helpers for fused cross-file LSP */
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/laravel_routing.h"
 #include "lsp/rust_cargo.h"
 #include "helpers.h" /* cbm_kind_in_set_free_cache — per-worker-thread cache teardown */
 #include "pipeline/worker_pool.h"
@@ -1171,6 +1172,7 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
      * array so the existing merge below sees them. */
     cbm_pkgmap_scan_repo(ctx->repo_path, &pkg_entries[0], ctx->excluded_dirs, ctx->excluded_count);
     ctx->pkgmap = cbm_pkgmap_build(pkg_entries, worker_count, ctx->project_name);
+    cbm_pipeline_set_pkgmap(ctx->pkgmap);
     for (int i = 0; i < worker_count; i++) {
         cbm_pkg_entries_free(&pkg_entries[i]);
     }
@@ -1918,13 +1920,18 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
 }
 
 /* Classify a resolved call by library identity and emit the appropriate edge. */
-/* Create Route node + CALLS + HANDLES edges for a route registration call. */
+/* Create Route node + CALLS + HANDLES edges for a route registration call.
+ * route_mount is the framework mount of the registering file ("/api" for a
+ * Laravel 11+ `withRouting(api: ...)` file, #1146) or "". */
 static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     const CBMCall *call, const char *route_path,
                                     const char *handler_ref, const char *module_qn,
                                     const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                    const char **ik, const char **iv, int ic) {
+                                    const char **ik, const char **iv, int ic,
+                                    const char *route_mount) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
+    char mounted[CBM_SZ_256];
+    route_path = cbm_laravel_mount_route(route_mount, route_path, mounted, sizeof(mounted));
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
@@ -1942,7 +1949,8 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
              esc_rp);
     cbm_gbuf_insert_edge(gbuf, source->id, rid, "CALLS", props);
     if (handler_ref && handler_ref[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(registry, handler_ref, module_qn, ik, iv, ic);
+        cbm_resolution_t hres =
+            cbm_registry_resolve_handler(registry, handler_ref, module_qn, ik, iv, ic, main_gbuf);
         if (hres.qualified_name && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *h = cbm_gbuf_find_by_qn(main_gbuf, hres.qualified_name);
             if (h) {
@@ -2007,9 +2015,26 @@ static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
     return !is_junk_url(norm);
 }
 
+/* File-language scope of the client-navigation heuristic (#1250): the JS/TS
+ * family and the hosts that embed it. Kept explicit so changes to the
+ * weak-member guard cannot broaden it. */
+static bool pp_client_nav_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_JAVASCRIPT ||
+           lang == CBM_LANG_VUE || lang == CBM_LANG_SVELTE || lang == CBM_LANG_HTML ||
+           lang == CBM_LANG_ASTRO;
+}
+
 /* Detect API paths in call arguments and create HTTP_CALLS edges. */
 static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                               const CBMCall *call) {
+                               const CBMCall *call, CBMLanguage lang, cbm_svc_kind_t svc) {
+    /* A resolved alias may be ASYNC even when its source spelling is unknown.
+     * Neither raw slash topics nor URL projections are HTTP evidence there. */
+    if (svc == CBM_SVC_ASYNC || cbm_service_pattern_match(call->callee_name) == CBM_SVC_ASYNC) {
+        return;
+    }
+    if (cbm_service_pattern_is_client_navigation(pp_client_nav_lang(lang), call->callee_name)) {
+        return;
+    }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         /* A slash-prefixed raw expression is not a URL string. In JS/TS this
@@ -2238,7 +2263,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                               const cbm_resolution_t *res, const char *module_qn,
                               const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
                               const char **imp_keys, const char **imp_vals, int imp_count,
-                              bool suppress_plain_calls) {
+                              bool suppress_plain_calls, CBMLanguage lang,
+                              const char *route_mount) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     const char *arg = call->first_string_arg;
 
@@ -2265,7 +2291,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         const char *route_path = find_route_path_in_args(call, &handler_ref);
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
-                                    registry, main_gbuf, imp_keys, imp_vals, imp_count);
+                                    registry, main_gbuf, imp_keys, imp_vals, imp_count,
+                                    route_mount);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
@@ -2273,9 +2300,13 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL));
     bool has_topic = (arg && arg[0] != '\0' && svc == CBM_SVC_ASYNC && strlen(arg) > PP_ESC_SPACE);
+    /* Set when this call already has its HTTP_CALLS edge from the service
+     * patterns (typed with the verb its callee names). */
+    bool http_edge_emitted = false;
 
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
         emit_http_async_service_edge(gbuf, source, call, res, svc, arg);
+        http_edge_emitted = svc == CBM_SVC_HTTP;
     } else if (svc == CBM_SVC_GRPC) {
         emit_grpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_GRAPHQL) {
@@ -2288,7 +2319,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call);
+    /* The arg-URL heuristic is for calls no service pattern knows (a local
+     * fetch wrapper). On a classified HTTP call that already has its typed
+     * edge, skip it so we do not mint a second, method-less ANY edge. */
+    if (!http_edge_emitted) {
+        detect_url_in_args(gbuf, source, call, lang, svc);
+    }
 }
 
 /* The #725 guard refuses a suffix_match binding across a language boundary,
@@ -2304,7 +2340,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                      const CBMCall *call, const char *module_qn,
                                      const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                     const char **imp_keys, const char **imp_vals, int imp_count) {
+                                     const char **imp_keys, const char **imp_vals, int imp_count,
+                                     const char *route_mount) {
     if (cbm_service_pattern_route_method(call->callee_name) == NULL) {
         return;
     }
@@ -2316,7 +2353,7 @@ static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *so
     const char *route_path = find_route_path_in_args(call, &handler_ref);
     if (route_path) {
         emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn, registry,
-                                main_gbuf, imp_keys, imp_vals, imp_count);
+                                main_gbuf, imp_keys, imp_vals, imp_count, route_mount);
     }
 }
 
@@ -2406,6 +2443,11 @@ static void lsp_idx_free_key(const char *key, void *value, void *ud) {
 static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count, CBMLanguage lang) {
+    /* Framework mount of this file's routes (Laravel 11+ withRouting, #1146). */
+    char route_mount[CBM_SZ_128];
+    cbm_laravel_file_route_mount(rc->repo_path, rel, lang, result, route_mount,
+                                 sizeof(route_mount));
+
     /* Build a per-file hash index of resolved_calls keyed by
      * "caller_qn|callee_short" for O(1) lookup. cbm_pipeline_find_lsp_
      * resolution would otherwise do an O(N) linear scan over
@@ -2614,19 +2656,54 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                             .strategy = "service_pattern"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &svc_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, false, lang, route_mount);
                 continue;
             }
         }
 
-        if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        bool unresolved = !res.qualified_name || res.qualified_name[0] == '\0';
+        if (unresolved || cbm_registry_strategy_is_weak(res.strategy)) {
+            /* A callee an import binds to an external client library
+             * (`send` under `from paho.mqtt import publish as send`):
+             * spelled through its import, then classified. The binding
+             * outranks a weak name match. MUST match pass_calls.c. */
+            char spelled[CBM_SZ_512];
+            cbm_svc_kind_t isvc = cbm_pipeline_external_import_service(
+                lang, &result->imports, imp_keys, imp_count, call, spelled, sizeof(spelled));
+            if (isvc != CBM_SVC_NONE) {
+                CBMCall through = *call;
+                through.callee_name = spelled;
+                cbm_resolution_t imp_res = {.qualified_name = spelled,
+                                            .confidence = PP_HALF_CONF,
+                                            .strategy = "import_binding"};
+                emit_http_async_service_edge(ws->local_edge_buf, source_node, &through, &imp_res,
+                                             isvc, through.first_string_arg);
+                ws->calls_resolved++;
+                continue;
+            }
+        }
+        if (unresolved) {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, false, lang, route_mount);
+            } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
+                /* Native `fetch()` (#856): only the global API once resolution
+                 * has failed to find a local/imported `fetch`. Call the low-level
+                 * emitter directly — emit_service_edge re-derives its own kind
+                 * from res->qualified_name via cbm_service_pattern_match, which
+                 * "fetch" deliberately never matches (mirrors pass_calls.c). */
+                const char *u = call->first_string_arg;
+                if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
+                    cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
+                                                 .confidence = PP_HALF_CONF,
+                                                 .strategy = "service_pattern"};
+                    emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
+                                                 CBM_SVC_HTTP, u);
+                }
             }
             continue;
         }
@@ -2649,7 +2726,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. A route registration
              * behind the refused binding still gets its Route. */
             emit_xlang_refused_route(ws->local_edge_buf, source_node, call, module_qn, rc->registry,
-                                     rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                                     rc->main_gbuf, imp_keys, imp_vals, imp_count, route_mount);
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {
@@ -2667,7 +2744,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 if (url_or_topic) {
                     emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &res, module_qn,
                                       rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                                      false);
+                                      false, lang, route_mount);
                     ws->calls_resolved++;
                 }
             }
@@ -2676,7 +2753,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,
-                          drop_plain_call);
+                          drop_plain_call, lang, route_mount);
         atomic_fetch_add_explicit(&rc->time_ns_rc_emit, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         ws->calls_resolved++;

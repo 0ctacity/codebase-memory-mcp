@@ -17,6 +17,7 @@
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "cbm.h"
+#include "service_patterns.h" /* cbm_svc_kind_t */
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
@@ -195,6 +196,47 @@ int cbm_pipeline_publish_zova_user_database_delta(
     const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
     cbm_zova_workspace_snapshot_t *before);
 
+/* Resolve a route handler reference (the registry's answer for route passes).
+ * A class-qualified "Ns\\Class::method" reference — the extractor's form for
+ * Laravel `[Class::class, 'method']` and invokable `Class::class` handlers
+ * (#1146), with the class already qualified through the file's `use` imports
+ * and namespace — is placed on a method QN only by what places the class file:
+ * the composer.json PSR-4 class file in gbuf (cbm_pipeline_psr4_member_qn).
+ * When a PSR-4 prefix covers the class, that answer is final: a covered class
+ * whose file or member is absent stays unresolved, as its `use` import does
+ * (#1186). Only a class no prefix covers falls back to the one candidate whose
+ * directories end with the class's namespace. Never by short name alone, so a
+ * vendor controller that is not in the repo gets no handler. A reference
+ * without "::" resolves exactly as cbm_registry_resolve does. */
+cbm_resolution_t cbm_registry_resolve_handler(const cbm_registry_t *r, const char *handler_ref,
+                                              const char *module_qn, const char **import_map_keys,
+                                              const char **import_map_vals, int import_map_count,
+                                              const cbm_gbuf_t *gbuf);
+
+/* Where composer's PSR-4 autoloader places a PHP class member. Tri-state, so
+ * "no prefix covers the class" (another strategy may answer) is never
+ * confused with "a prefix covers it but places nothing" (final). */
+typedef enum {
+    CBM_PSR4_MEMBER_NOT_COVERED = 0, /* no psr-4 prefix covers the class */
+    CBM_PSR4_MEMBER_RESOLVED,        /* *out_qn is the member's QN */
+    CBM_PSR4_MEMBER_UNRESOLVED,      /* covered, but no class file holds the
+                                      * class with this member: leave it
+                                      * unresolved, never guess elsewhere */
+} cbm_psr4_member_t;
+
+/* Place `member` on the PHP class `class_fqn` ("Ns\\Class", NUL-terminated)
+ * the way composer's PSR-4 autoloader places the class: the class file the
+ * import resolver picks for `use Ns\\Class;` (#1186), the class that file
+ * defines, then that class's member. *out_qn is set only on
+ * CBM_PSR4_MEMBER_RESOLVED (else NULL) and is owned by gbuf. Missing
+ * arguments or no package map give CBM_PSR4_MEMBER_NOT_COVERED. Read-only on
+ * gbuf. */
+cbm_psr4_member_t cbm_pipeline_psr4_member_qn(const cbm_gbuf_t *gbuf, const char *class_fqn,
+                                              const char *member, const char **out_qn);
+
+CBMHashTable *cbm_pipeline_get_pkgmap(void);
+void cbm_pipeline_set_pkgmap(CBMHashTable *map);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */
@@ -235,6 +277,29 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         const char *source_file_qn,
                                                         const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
+
+/* A call whose callee an import binds to an EXTERNAL library:
+ * `send(...)` under `from paho.mqtt import publish as send`,
+ * `navigate(...)` under `import { get as navigate } from 'axios'`. Spells the
+ * callee as its import makes it (paho.mqtt.publish, axios.get), runs the
+ * service patterns on that name, and returns CBM_SVC_HTTP or CBM_SVC_ASYNC
+ * (writing the spelled name to `spelled`) for an HTTP request -- the spelled
+ * name ends in a request verb, so urllib.parse.urljoin is none -- with a URL
+ * argument, or a messaging call with a URL or topic argument; CBM_SVC_NONE
+ * otherwise.
+ *
+ * Callers ask only when the registry found nothing or only a weak name match
+ * (cbm_registry_strategy_is_weak): the import binding is better evidence than
+ * a same-named symbol elsewhere in the project. A project import (its name is
+ * in imp_keys, the file's resolved import map), a relative import, a name
+ * bound by two different imports, a Python callee rebound as a parameter, and
+ * every call the route-suffix and global-fetch fallbacks own are left alone.
+ * Python and JS/TS. Both call resolvers call this, so they cannot diverge. */
+cbm_svc_kind_t cbm_pipeline_external_import_service(CBMLanguage lang,
+                                                    const CBMImportArray *imports,
+                                                    const char **imp_keys, int imp_count,
+                                                    const CBMCall *call, char *spelled,
+                                                    size_t spelled_sz);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by

@@ -959,6 +959,12 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
     } else {
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
+        if (!ctx->pkgmap) {
+            ctx->pkgmap = cbm_pkgmap_build_from_repo(ctx->repo_path, changed_files, ci,
+                                                     ctx->project_name, ctx->excluded_dirs,
+                                                     ctx->excluded_count);
+            cbm_pipeline_set_pkgmap(ctx->pkgmap);
+        }
         /* Keep extraction results, as the full sequential path does, so the
          * infra Route passes can read them. */
         CBMFileResult **cache = ci > 0 ? (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *))
@@ -1560,6 +1566,8 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
         cbm_pkgmap_free(ctx.pkgmap);
+        ctx.pkgmap = NULL;
+        cbm_pipeline_set_pkgmap(NULL);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_gbuf_free(existing);
         return extract_rc;
@@ -1586,8 +1594,9 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
     free(changed_files);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
-    cbm_pkgmap_free(ctx.pkgmap); /* built by the parallel extract, if it ran */
+    cbm_pkgmap_free(ctx.pkgmap); /* built by the parallel or sequential extract, if it ran */
     ctx.pkgmap = NULL;
+    cbm_pipeline_set_pkgmap(NULL);
 
     /* Step 7: Publish (preserves mode-skipped hash rows so the next reindex
      * can correctly classify those files instead of seeing them as
