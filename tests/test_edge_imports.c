@@ -1102,7 +1102,7 @@ static int ei_php_imports_match(const EILangFile *files, int nfiles, const char 
 TEST(ei_php_psr4_class_per_file_issue1186) {
     static const EILangFile f[] = {
         {"composer.json",
-         "{\"name\":\"acme/app\",\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\\n"},
+         "{\"name\":\"acme/app\",\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
         {"app/Models/Agency.php", EI_PHP_CLASS("App\\Models", "Agency")},
         {"app/Models/Client.php", EI_PHP_CLASS("App\\Models", "Client")},
         {"app/Models/Property.php", EI_PHP_CLASS("App\\Models", "Property")},
@@ -1123,7 +1123,7 @@ TEST(ei_php_psr4_class_per_file_issue1186) {
 /* Sub-namespaces map to subdirectories of the PSR-4 root, at any depth. */
 TEST(ei_php_psr4_nested_subnamespace_issue1186) {
     static const EILangFile f[] = {
-        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\\n"},
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
         {"app/Models/Billing/Account.php", EI_PHP_CLASS("App\\Models\\Billing", "Account")},
         {"app/Models/Billing/Invoice.php", EI_PHP_CLASS("App\\Models\\Billing", "Invoice")},
         {"app/Models/Billing/Tax/Exempt.php", EI_PHP_CLASS("App\\Models\\Billing\\Tax", "Exempt")},
@@ -1149,11 +1149,11 @@ TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186) {
     static const EILangFile f[] = {
         {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\","
                           "\"App\\\\Domain\\\\\":\"src/Domain/\"}},"
-                          "\"autoload-dev\":{\"psr-4\":{\"Tests\\\\\":\"tests/\"}}}\\n"},
+                          "\"autoload-dev\":{\"psr-4\":{\"Tests\\\\\":\"tests/\"}}}\n"},
         {"tests/Support/Assert.php", EI_PHP_CLASS("Tests\\Support", "Assert")},
         {"tests/Support/Factory.php", EI_PHP_CLASS("Tests\\Support", "Factory")},
         {"packages/billing/composer.json",
-         "{\"name\":\"acme/billing\",\"autoload\":{\"psr-4\":{\"Billing\\\\\":\"src/\"}}}\\n"},
+         "{\"name\":\"acme/billing\",\"autoload\":{\"psr-4\":{\"Billing\\\\\":\"src/\"}}}\n"},
         {"app/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
         {"src/Domain/Customer.php", EI_PHP_CLASS("App\\Domain", "Customer")},
         {"src/Domain/Order.php", EI_PHP_CLASS("App\\Domain", "Order")},
@@ -1177,7 +1177,7 @@ TEST(ei_php_psr4_multiple_roots_longest_prefix_issue1186) {
  * app/Helpers/format_money.php); they keep resolving to the declaring file. */
 TEST(ei_php_psr4_use_function_not_class_mapped_issue1186) {
     static const EILangFile f[] = {
-        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\\n"},
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
         {"app/Helpers/money.php", "<?php\nnamespace App\\Helpers;\n\n"
                                   "const CURRENCY = 'EUR';\n\n"
                                   "function format_money($x) { return $x; }\n"},
@@ -1200,7 +1200,7 @@ TEST(ei_php_psr4_use_function_not_class_mapped_issue1186) {
  * sibling import still resolves. */
 TEST(ei_php_psr4_missing_class_file_unresolved_issue1186) {
     static const EILangFile f[] = {
-        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\\n"},
+        {"composer.json", "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}\n"},
         {"app/Models/User.php", EI_PHP_CLASS("App\\Models", "User")},
         {"app/Http/Guard.php", "<?php\nnamespace App\\Http;\n\n"
                                "use App\\Models\\Ghost;\nuse App\\Models\\User;\n\n"
