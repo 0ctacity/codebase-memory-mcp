@@ -28,6 +28,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/platform.h"
 #include "foundation/sha256_backend.h"
 
