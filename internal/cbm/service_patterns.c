@@ -145,6 +145,20 @@ static const lib_pattern_t http_libraries[] = {
     {"socket.http", CBM_SVC_HTTP, NULL},
     {"resty.http", CBM_SVC_HTTP, NULL},
 
+    /* Glued-name libraries. match_qn needs an identifier boundary around an
+     * id, so a library whose own name glues a lowercase prefix/suffix onto
+     * another id ("grequests", "curlpp") is listed explicitly: no boundary
+     * rule can tell "grequests" from "myrequests". */
+    {"grequests", CBM_SVC_HTTP, NULL},  /* Python: gevent + requests */
+    {"txrequests", CBM_SVC_HTTP, NULL}, /* Python: Twisted + requests */
+    {"redaxios", CBM_SVC_HTTP, NULL},   /* JS: axios-compatible fetch client */
+    {"gaxios", CBM_SVC_HTTP, NULL},     /* JS: Google's axios-style client */
+    {"libcurl", CBM_SVC_HTTP, NULL},    /* C, node-libcurl */
+    {"curlpp", CBM_SVC_HTTP, NULL},     /* C++ libcurl wrapper */
+    {"curlcpp", CBM_SVC_HTTP, NULL},    /* C++ libcurl wrapper */
+    {"hyperlocal", CBM_SVC_HTTP, NULL}, /* Rust: hyper over unix sockets */
+    {"guzzlehttp", CBM_SVC_HTTP, NULL}, /* PHP: Guzzle's composer vendor */
+
     {NULL, CBM_SVC_NONE, NULL},
 };
 
@@ -268,6 +282,33 @@ static const lib_pattern_t async_libraries[] = {
     {"dapr.clients.grpc", CBM_SVC_ASYNC, "dapr"},
     {"DaprClient", CBM_SVC_ASYNC, "dapr"},
 
+    /* Glued-name libraries (see the note in http_libraries). */
+    {"aiokafka", CBM_SVC_ASYNC, "kafka"},
+    {"pykafka", CBM_SVC_ASYNC, "kafka"},
+    {"librdkafka", CBM_SVC_ASYNC, "kafka"},
+    {"rdkafkacpp", CBM_SVC_ASYNC, "kafka"},
+    {"rskafka", CBM_SVC_ASYNC, "kafka"},
+    {"aioamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqpstorm", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pyamqp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqprs", CBM_SVC_ASYNC, "rabbitmq"},
+    {"amqpcpp", CBM_SVC_ASYNC, "rabbitmq"},
+    {"pynats", CBM_SVC_ASYNC, "nats"},
+    {"jnats", CBM_SVC_ASYNC, "nats"},
+    {"aiomqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"amqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"hbmqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"umqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"mqttools", CBM_SVC_ASYNC, "mqtt"},
+    {"emqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"rumqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"gomqtt", CBM_SVC_ASYNC, "mqtt"},
+    {"libmosquitto", CBM_SVC_ASYNC, "mqtt"},
+    {"mosquittopp", CBM_SVC_ASYNC, "mqtt"},
+    {"pubsublite", CBM_SVC_ASYNC, "pubsub"},
+    {"gocelery", CBM_SVC_ASYNC, "celery"},
+
     {NULL, CBM_SVC_NONE, NULL},
 };
 
@@ -312,6 +353,13 @@ static const lib_pattern_t config_libraries[] = {
     /* Elixir */
     {"Application.get_env", CBM_SVC_CONFIG, NULL},
     {"Application.fetch_env", CBM_SVC_CONFIG, NULL},
+
+    /* Glued-name accessors (see the note in http_libraries). */
+    {"wgetenv", CBM_SVC_CONFIG, NULL},   /* Windows CRT: _wgetenv, _wgetenv_s */
+    {"getenvb", CBM_SVC_CONFIG, NULL},   /* Python: os.getenvb */
+    {"qgetenv", CBM_SVC_CONFIG, NULL},   /* Qt */
+    {"dotenvx", CBM_SVC_CONFIG, NULL},   /* JS: @dotenvx/dotenvx */
+    {"phpdotenv", CBM_SVC_CONFIG, NULL}, /* PHP: vlucas/phpdotenv */
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -381,6 +429,11 @@ static const lib_pattern_t route_reg_libraries[] = {
     /* Scala */
     {"akka.http.scaladsl.server", CBM_SVC_ROUTE_REG, NULL},
     {"play.api.routing", CBM_SVC_ROUTE_REG, NULL},
+
+    /* Glued-name frameworks (see the note in http_libraries). */
+    {"apiflask", CBM_SVC_ROUTE_REG, NULL},       /* Python: Flask-based */
+    {"honox", CBM_SVC_ROUTE_REG, NULL},          /* JS: Hono meta-framework */
+    {"fasthttprouter", CBM_SVC_ROUTE_REG, NULL}, /* Go: httprouter for fasthttp */
 
     {NULL, CBM_SVC_NONE, NULL},
 };
@@ -452,6 +505,11 @@ static const lib_pattern_t graphql_libraries[] = {
     /* Rust */
     {"async-graphql", CBM_SVC_GRAPHQL, NULL},
     {"juniper", CBM_SVC_GRAPHQL, NULL},
+
+    /* Glued-name libraries (see the note in http_libraries). */
+    {"gqlparser", CBM_SVC_GRAPHQL, NULL}, /* Go: vektah/gqlparser */
+    {"gqlgenc", CBM_SVC_GRAPHQL, NULL},   /* Go: gqlgen client generator */
+    {"aiogqlc", CBM_SVC_GRAPHQL, NULL},   /* Python: asyncio GraphQL client */
 
     {NULL, CBM_SVC_NONE, NULL},
 };

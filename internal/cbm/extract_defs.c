@@ -1584,7 +1584,10 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
             return true;
         }
         /* If decorator has arguments but none resolved to a '/'-prefixed path,
-         * intentionally produce no Route to prevent false root routes (e.g. @mock.patch). */
+         * intentionally produce no Route to prevent false root routes (e.g. @mock.patch).
+         * This also intentionally trades off FastAPI's common @router.get("") empty prefix
+         * and constant-path cases like @app.get(ITEMS_PATH), which previously collapsed
+         * incorrectly onto the root route "/". */
         if (ts_node_named_child_count(args) > 0) {
             return false;
         }
