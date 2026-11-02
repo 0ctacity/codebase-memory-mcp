@@ -743,6 +743,9 @@ static bool incr_keep_unless_source_in_set(const cbm_gbuf_t *gb, const cbm_gbuf_
                                            void *userdata) {
     (void)gb;
     const incr_id_set_t *set = userdata;
+    if (edge->properties_json && strstr(edge->properties_json, "\"env_access\"") != NULL) {
+        return true;
+    }
     return !bsearch(&edge->source_id, set->ids, (size_t)set->count, sizeof(*set->ids),
                     incr_cmp_id);
 }
