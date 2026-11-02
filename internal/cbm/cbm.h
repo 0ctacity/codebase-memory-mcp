@@ -290,7 +290,6 @@ typedef enum {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
-    bool is_default;         // ES default import (`import X from "Y"`), JS/TS only (#1916)
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 

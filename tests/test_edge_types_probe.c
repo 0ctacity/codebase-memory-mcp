@@ -43,6 +43,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "service_patterns.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -231,6 +232,136 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
         n++;
     }
     return et_index_files(lp, files, n);
+}
+
+/* #598: a call that resolves to a GraphQL client used to name its Route after
+ * the WHOLE operation text (minus a leading "query "/"mutation "), so an
+ * anonymous `query { ... }` became one long Route and even a named operation
+ * carried its variables and selection set in the name. GraphQL Routes are now
+ * keyed by operation name only; anonymous operations share one bounded key per
+ * operation type. The Route set is asserted exactly (QN + name). Parallel path
+ * only: GRAPHQL_CALLS is emitted by pass_parallel.c. */
+typedef struct {
+    const char *qn;
+    const char *name;
+} EtGqlRoute;
+
+static int et_graphql_routes_exact(const EtFile *files, int nfiles, const EtGqlRoute *want,
+                                   int nwant) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int ok = store != NULL;
+    int got = 0;
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    }
+    for (int ni = 0; nodes && ni < node_count; ni++) {
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *name = nodes[ni].name ? nodes[ni].name : "";
+        if (strncmp(qn, "__graphql__", 11) != 0) {
+            continue;
+        }
+        got++;
+        int matched = 0;
+        for (int wi = 0; wi < nwant; wi++) {
+            if (strcmp(qn, want[wi].qn) == 0 && strcmp(name, want[wi].name) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        /* Operation text (selection sets, variables) must never leak into a key. */
+        if (!matched || strchr(qn, '{') || strchr(name, '{') || strlen(qn) > 160) {
+            fprintf(stderr, "  [ET-GQL] unexpected Route qn='%s' name='%s'\n", qn, name);
+            ok = 0;
+        }
+    }
+    if (got != nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL graphql routes expected=%d actual=%d\n", nwant, got);
+        ok = 0;
+    }
+    int edges = store ? cbm_store_count_edges_by_type(store, lp.project, "GRAPHQL_CALLS") : -1;
+    if (edges < nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL GRAPHQL_CALLS=%d expected>=%d\n", edges, nwant);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(graphql_route_keyed_by_operation_name_issue598) {
+    static const EtFile f[] = {
+        {"graphql/client.py", "def gql(query):\n    return query\n"},
+        {"api/ops.py",
+         "from graphql.client import gql\n\n\n"
+         "def get_user():\n"
+         "    return gql('query GetUser($id: ID!) { user(id: $id) { name } }')\n\n\n"
+         "def update_user():\n"
+         "    return gql('mutation UpdateUser($id: ID!) { updateUser(id: $id) { id } }')\n\n\n"
+         "def list_users():\n"
+         "    return gql('fragment U on User { id } query ListUsers { users { ...U } }')\n\n\n"
+         "def on_event():\n"
+         "    return gql('subscription OnEvent { event { id } }')\n\n\n"
+         "def products():\n"
+         "    return gql('query { products(search: \"x\") { items { sku } } }')\n\n\n"
+         "def orders():\n"
+         "    return gql('{ orders { id total } }')\n\n\n"
+         "def logout():\n"
+         "    return gql('mutation { logout }')\n"}};
+    static const EtGqlRoute want[] = {
+        {"__graphql__GetUser", "GetUser"},
+        {"__graphql__UpdateUser", "UpdateUser"},
+        {"__graphql__ListUsers", "ListUsers"},
+        {"__graphql__OnEvent", "OnEvent"},
+        /* products + orders: `query { }` and the `{ }` shorthand are both
+         * anonymous queries and share one key. */
+        {"__graphql__query__anonymous", "(anonymous query)"},
+        {"__graphql__mutation__anonymous", "(anonymous mutation)"},
+    };
+    ASSERT_TRUE(et_graphql_routes_exact(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                        (int)(sizeof(want) / sizeof(want[0]))));
+    PASS();
+}
+
+/* #598 parser edges the end-to-end fixture cannot reach through one language's
+ * string extraction: comments/strings/interpolations that contain braces, a
+ * bare word, non-document arguments and name truncation. */
+TEST(graphql_operation_identity_parser_issue598) {
+    const char *type = NULL;
+    char name[16];
+    static const struct {
+        const char *doc;
+        int named;
+        const char *type;
+        const char *name;
+    } cases[] = {
+        {"# fetch { all }\nquery Q1 { a }", 1, "query", "Q1"},
+        {"${UserFields} query WithFrag($id: ID) { u { ...UserFields } }", 1, "query", "WithFrag"},
+        {"fragment F on T @dir(x: \"{\") { a } mutation M2 { b }", 1, "mutation", "M2"},
+        {"\"\"\"doc { brace\"\"\" subscription S3 { c }", 1, "subscription", "S3"},
+        {"  query  \n ( $x: Int ) { a }", 0, "query", ""},
+        {"  { viewer { id } }", 0, "query", ""},
+        {"query GetUserByIdentifier { a }", 1, "query", "GetUserByIdenti"}, /* bounded */
+        {"data", 0, "operation", ""}, /* a bare word is not evidence of an operation */
+        {"https://api.example.com/graphql", 0, "operation", ""},
+        {"/graphql", 0, "operation", ""},
+        {"", 0, "operation", ""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool named = cbm_service_pattern_graphql_operation(cases[i].doc, &type, name, sizeof(name));
+        if ((int)named != cases[i].named || strcmp(type, cases[i].type) != 0 ||
+            strcmp(name, cases[i].name) != 0) {
+            fprintf(stderr, "  [ET-GQL] case %zu '%s' -> named=%d type=%s name=%s\n", i,
+                    cases[i].doc, (int)named, type, name);
+            ASSERT_TRUE(0);
+        }
+    }
+    ASSERT_FALSE(cbm_service_pattern_graphql_operation(NULL, &type, name, sizeof(name)));
+    ASSERT_STR_EQ(type, "operation");
+    PASS();
 }
 
 /* #1085: count CALLS edges whose target node has `name`, indexing via the
@@ -899,131 +1030,121 @@ TEST(routes_laravel_slashless_no_junk_issue1146) {
 }
 
 /* #1146: Laravel 11+ mounts the files named in bootstrap/app.php's
- * `->withRouting(api: ...)` under `apiPrefix` (default 'api'); the `web:` file
- * stays unprefixed. The Route qualified_name is the join key for cross-repo
- * HTTP matching, so both the Route node's name and its QN must reflect the
- * composed mount. Sequential pipeline (<= MIN_FILES_FOR_PARALLEL). */
+ * `->withRouting(...)` under `apiPrefix` (default 'api' for `api:`); the `web:`
+ * file stays unprefixed. The whole path of each route registered inside a
+ * mounted file composes with that mount, so a prefix group inside the mounted
+ * file (`Route::prefix('/users')->group(...)` inside `routes/api.php`) becomes
+ * `/api/users/me`, and cross-repo HTTP matching (which joins on the Route
+ * qualified_name) never linked real callers. */
+#define ET_L11_BOOTSTRAP_HEAD                                                                      \
+    "<?php\n\nuse Illuminate\\Foundation\\Application;\n\n"                                        \
+    "return Application::configure(basePath: dirname(__DIR__))\n"                                  \
+    "    ->withRouting(\n"
+#define ET_L11_BOOTSTRAP_TAIL                                                                      \
+    "    )\n"                                                                                      \
+    "    ->withMiddleware(function ($middleware) {\n        //\n    })\n"                          \
+    "    ->create();\n"
+
+static const char ET_L11_API_ROUTES[] =
+    "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+    "Route::prefix('/users')->middleware('auth')->group(function (): void {\n"
+    "    Route::get('/me', [UserController::class, 'me']);\n"
+    "});\n"
+    "Route::post('/orders', [OrderController::class, 'store']);\n";
+
+static const char ET_L11_WEB_ROUTES[] = "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                                        "Route::get('/dashboard', [HomeController::class, 'index']);\n";
+
+/* Default convention: `api:` given, no `apiPrefix:` -> '/api'. */
 TEST(routes_laravel_withrouting_api_default_prefix_issue1146) {
-    static const char *routes[] = {"/api/users", "/api/users/{id}", NULL};
+    static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
     static const EtFile f[] = {
-        {"bootstrap/app.php",
-         "<?php\n"
-         "use Illuminate\\Foundation\\Application;\n"
-         "return Application::configure()\n"
-         "    ->withRouting(\n"
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
          "        web: __DIR__.'/../routes/web.php',\n"
          "        api: __DIR__.'/../routes/api.php',\n"
-         "    );\n"},
-        {"routes/api.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::get('/users', 'UserController@index');\n"
-         "Route::get('/users/{id}', 'UserController@show');\n"}};
-    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__GET__/api/users/{}"));
+         "        commands: __DIR__.'/../routes/console.php',\n"
+         "        health: '/up',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__GET__/api/users/me"));
     PASS();
 }
 
-/* Custom apiPrefix, multi-segment, array form of `api:`. */
+/* Explicit `apiPrefix:` (multi-segment, array form of `api:`) replaces the
+ * default for every mounted file. */
 TEST(routes_laravel_withrouting_api_custom_prefix_issue1146) {
-    static const char *routes[] = {"/v2/private/orders", NULL};
+    static const char *routes[] = {"/v1/api/users/me", "/v1/api/orders", "/v1/api/partners",
+                                   NULL};
     static const EtFile f[] = {
-        {"bootstrap/app.php",
-         "<?php\n"
-         "use Illuminate\\Foundation\\Application;\n"
-         "return Application::configure()\n"
-         "    ->withRouting(\n"
-         "        api: [__DIR__ . '/../routes/private.php'],\n"
-         "        apiPrefix: 'v2/private',\n"
-         "    );\n"},
-        {"routes/private.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::post('/orders', 'OrderController@store');\n"}};
-    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, false, "__route__POST__/v2/private/orders"));
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        api: [__DIR__.'/../routes/api.php', __DIR__.'/../routes/partner.php'],\n"
+         "        apiPrefix: 'v1/api',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES},
+        {"routes/partner.php", "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+                               "Route::get('/partners', [PartnerController::class, 'index']);\n"}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 3, routes, false, "__route__GET__/v1/api/partners"));
     PASS();
 }
 
-/* web: routes stay unprefixed even when apiPrefix is configured. */
+/* The `web:` file of the same app is NOT mounted under the api prefix. */
 TEST(routes_laravel_withrouting_web_no_prefix_issue1146) {
-    static const char *routes[] = {"/", "/login", NULL};
+    static const char *routes[] = {"/dashboard", "/api/users/me", "/api/orders", NULL};
     static const EtFile f[] = {
-        {"bootstrap/app.php",
-         "<?php\n"
-         "use Illuminate\\Foundation\\Application;\n"
-         "return Application::configure()\n"
-         "    ->withRouting(\n"
-         "        web: __DIR__ . '/../routes/web.php',\n"
-         "        api: __DIR__ . '/../routes/api.php',\n"
-         "        apiPrefix: 'api/v1',\n"
-         "    );\n"},
-        {"routes/web.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::get('/', 'HomeController@index');\n"
-         "Route::post('/login', 'AuthController@login');\n"}};
-    ASSERT_TRUE(et_routes_exact(f, 2, routes));
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        web: __DIR__.'/../routes/web.php',\n"
+         "        api: __DIR__.'/../routes/api.php',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/web.php", ET_L11_WEB_ROUTES},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact(f, 3, routes));
     PASS();
 }
 
-/* Control: Laravel <= 10 routes in routes/api.php without a bootstrap/app.php
- * withRouting call (configured via RouteServiceProvider instead, which this
- * change does not touch) stay unprefixed, as they were before this fix. */
+/* Control: the Laravel <= 10 RouteServiceProvider form (no withRouting, the
+ * prefix lives on a `->group(base_path(...))` call) is not composed today and
+ * must stay exactly as it is -- no filename-based `/api` inference. */
 TEST(routes_laravel_routeserviceprovider_control_issue1146) {
-    static const char *routes[] = {"/items", NULL};
-    static const EtFile f[] = {
-        {"app/Providers/RouteServiceProvider.php",
-         "<?php\n"
-         "class RouteServiceProvider {\n"
-         "    public function boot() {\n"
-         "        Route::prefix('api')->group(base_path('routes/api.php'));\n"
-         "    }\n"
-         "}\n"},
-        {"routes/api.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::get('/items', 'ItemController@index');\n"}};
-    ASSERT_TRUE(et_routes_exact(f, 2, routes));
-    PASS();
-}
-
-/* Non-literal apiPrefix: when the prefix cannot be known statically from the
- * bootstrap call, routes are left alone rather than prefixed with garbage. */
-TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146) {
-    static const char *routes[] = {"/ping", NULL};
+    static const char *routes[] = {"/users/me", "/orders", NULL};
     static const EtFile f[] = {
         {"bootstrap/app.php",
-         "<?php\n"
-         "use Illuminate\\Foundation\\Application;\n"
-         "return Application::configure()\n"
-         "    ->withRouting(\n"
-         "        api: __DIR__ . '/../routes/api.php',\n"
-         "        apiPrefix: config('api.prefix'),\n"
-         "    );\n"},
-        {"routes/api.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::get('/ping', 'PingController@ping');\n"}};
+         "<?php\n\n$app = new Illuminate\\Foundation\\Application(\n"
+         "    $_ENV['APP_BASE_PATH'] ?? dirname(__DIR__)\n);\n\nreturn $app;\n"},
+        {"app/Providers/RouteServiceProvider.php",
+         "<?php\nnamespace App\\Providers;\n\n"
+         "use Illuminate\\Support\\Facades\\Route;\n\n"
+         "class RouteServiceProvider extends ServiceProvider {\n"
+         "    public function boot(): void {\n"
+         "        $this->routes(function () {\n"
+         "            Route::middleware('api')->prefix('api')"
+         "->group(base_path('routes/api.php'));\n"
+         "            Route::middleware('web')->group(base_path('routes/web.php'));\n"
+         "        });\n    }\n}\n"},
+        {"routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact(f, 3, routes));
+    PASS();
+}
+
+/* A non-literal `apiPrefix:` is unknown at index time: leave the paths alone
+ * rather than guess the default. */
+TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146) {
+    static const char *routes[] = {"/users/me", "/orders", NULL};
+    static const EtFile f[] = {
+        {"bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        api: __DIR__.'/../routes/api.php',\n"
+         "        apiPrefix: config('app.api_prefix'),\n" ET_L11_BOOTSTRAP_TAIL},
+        {"routes/api.php", ET_L11_API_ROUTES}};
     ASSERT_TRUE(et_routes_exact(f, 2, routes));
     PASS();
 }
 
-/* Parallel pipeline (> MIN_FILES_FOR_PARALLEL) and a Laravel app located in a
- * monorepo subdirectory (`backend/bootstrap/app.php`). */
+/* Same contract on the PARALLEL resolver (> 50 files), with the Laravel app
+ * in a monorepo subdirectory: the nearest ancestor bootstrap/app.php owns it. */
 TEST(routes_laravel_withrouting_parallel_subdir_issue1146) {
-    static const char *routes[] = {"/api/health", NULL};
+    static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
     static const EtFile f[] = {
-        {"backend/bootstrap/app.php",
-         "<?php\n"
-         "use Illuminate\\Foundation\\Application;\n"
-         "return Application::configure()\n"
-         "    ->withRouting(\n"
-         "        api: base_path('routes/api.php'),\n"
-         "    );\n"},
-        {"backend/routes/api.php",
-         "<?php\n"
-         "use Illuminate\\Support\\Facades\\Route;\n"
-         "Route::get('/health', 'HealthController@check');\n"}};
-    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, true, "__route__GET__/api/health"));
+        {"gateway/bootstrap/app.php", ET_L11_BOOTSTRAP_HEAD
+         "        web: __DIR__.'/../routes/web.php',\n"
+         "        api: __DIR__.'/../routes/api.php',\n" ET_L11_BOOTSTRAP_TAIL},
+        {"gateway/routes/api.php", ET_L11_API_ROUTES}};
+    ASSERT_TRUE(et_routes_exact_mode(f, 2, routes, true, "__route__POST__/api/orders"));
     PASS();
 }
 
@@ -1255,6 +1376,104 @@ TEST(handles_laravel_psr4_absent_class_issue1146) {
 
 TEST(handles_laravel_psr4_absent_class_parallel_issue1146) {
     ASSERT_TRUE(et_laravel_psr4_absent(1));
+    PASS();
+}
+
+TEST(handles_laravel_psr4_absent_class_incremental_issue1146) {
+    EtFile f[ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA];
+    memcpy(f, et_laravel_class_handlers, sizeof(et_laravel_class_handlers));
+    memcpy(f + ET_LARAVEL_CLASS_FILES, et_laravel_psr4_absent_extra,
+           sizeof(et_laravel_psr4_absent_extra));
+    int total_files = ET_LARAVEL_CLASS_FILES + ET_LARAVEL_PSR4_ABSENT_EXTRA;
+
+    EtProj lp;
+    memset(&lp, 0, sizeof(lp));
+    snprintf(lp.tmpdir, sizeof(lp.tmpdir), "/tmp/cbm_et_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(lp.tmpdir) != NULL);
+    et_to_fwd_slashes(lp.tmpdir);
+
+    for (int i = 0; i < total_files; i++) {
+        char path[700];
+        snprintf(path, sizeof(path), "%s/%s", lp.tmpdir, f[i].name);
+        char *slash = strrchr(path, '/');
+        if (slash && slash > path + strlen(lp.tmpdir)) {
+            *slash = '\0';
+            cbm_mkdir_p(path, 0755);
+            *slash = '/';
+        }
+        FILE *fp = fopen(path, "wb");
+        ASSERT_NOT_NULL(fp);
+        fputs(f[i].content, fp);
+        fclose(fp);
+    }
+
+    lp.project = cbm_project_name_from_path(lp.tmpdir);
+    ASSERT_NOT_NULL(lp.project);
+    th_remove_project_workspace(lp.project);
+
+    /* Initial full index */
+    cbm_pipeline_t *p = cbm_pipeline_new(lp.tmpdir, NULL, lp.project);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    /* Touch routes/api.php and routes/blog.php to trigger small incremental run (2 files <= 50) */
+    char api_path[700];
+    snprintf(api_path, sizeof(api_path), "%s/routes/api.php", lp.tmpdir);
+    FILE *fp = fopen(api_path, "ab");
+    ASSERT_NOT_NULL(fp);
+    fputs("\n// touched\n", fp);
+    fclose(fp);
+
+    char blog_path[700];
+    snprintf(blog_path, sizeof(blog_path), "%s/routes/blog.php", lp.tmpdir);
+    fp = fopen(blog_path, "ab");
+    ASSERT_NOT_NULL(fp);
+    fputs("\n// touched\n", fp);
+    fclose(fp);
+
+    /* Second run takes sequential incremental path */
+    p = cbm_pipeline_new(lp.tmpdir, NULL, lp.project);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *store = th_open_repo_store(lp.tmpdir);
+    ASSERT_NOT_NULL(store);
+
+    /* Assert exact HANDLES count and contents match full index */
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(store, lp.project, "HANDLES", &edges, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 4);
+
+    int wanted = 0;
+    while (et_laravel_class_handles[wanted].handler_tail) wanted++;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        int have_src = cbm_store_find_node_by_id(store, edges[i].source_id, &src) == CBM_STORE_OK;
+        int have_tgt = cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK;
+        int matched = 0;
+        for (int wi = 0; have_src && have_tgt && wi < wanted; wi++) {
+            if (!found[wi] && tgt.name && strcmp(tgt.name, et_laravel_class_handles[wi].route) == 0 &&
+                et_qn_has_tail(src.qualified_name, et_laravel_class_handles[wi].handler_tail)) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (have_src) cbm_node_free_fields(&src);
+        if (have_tgt) cbm_node_free_fields(&tgt);
+        if (!matched) {
+            ok = 0;
+        }
+    }
+    if (edges) cbm_store_free_edges(edges, n);
+    et_cleanup(&lp, store);
+    ASSERT_TRUE(ok);
     PASS();
 }
 
@@ -2401,6 +2620,8 @@ TEST(routes_express_get_survives_xlang_guard_parallel) {
 
 SUITE(edge_types_probe) {
     RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
+    RUN_TEST(graphql_route_keyed_by_operation_name_issue598);
+    RUN_TEST(graphql_operation_identity_parser_issue598);
     /* HANDLES — route→handler across web frameworks (8 frameworks) */
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
@@ -2437,6 +2658,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_laravel_class_handlers_no_composer_issue1146);
     RUN_TEST(handles_laravel_psr4_absent_class_issue1146);
     RUN_TEST(handles_laravel_psr4_absent_class_parallel_issue1146);
+    RUN_TEST(handles_laravel_psr4_absent_class_incremental_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 
