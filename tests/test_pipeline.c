@@ -911,7 +911,7 @@ static const char *const AXIOS_CLIENT_V3 =
     "export default api;\n";
 
 static const char *const PLAIN_OBJECT_CLIENT =
-    "const api = { get: (x: string) => x };\n"
+    "const api: any = {};\n"
     "export default api;\n";
 
 static const char *const AXIOS_ORDERS_V1 =
