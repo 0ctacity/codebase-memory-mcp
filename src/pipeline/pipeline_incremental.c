@@ -624,8 +624,6 @@ typedef struct {
     char *target_qn;
     char *target_name;
     char *target_label;
-    char *source_file;
-    char *target_file;
     char *type;
     char *props;
 } cbm_saved_edge_t;
@@ -689,18 +687,14 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
     s->target_qn = strdup(tgt->qualified_name);
     s->target_name = strdup(tgt->name ? tgt->name : "");
     s->target_label = strdup(tgt->label ? tgt->label : "");
-    s->source_file = strdup(src->file_path ? src->file_path : "");
-    s->target_file = strdup(tgt->file_path ? tgt->file_path : "");
     s->type = strdup(edge->type);
     s->props = strdup(edge->properties_json ? edge->properties_json : "{}");
-    if (!s->source_qn || !s->target_qn || !s->target_name || !s->target_label ||
-        !s->source_file || !s->target_file || !s->type || !s->props) {
+    if (!s->source_qn || !s->target_qn || !s->target_name || !s->target_label || !s->type ||
+        !s->props) {
         free(s->source_qn);
         free(s->target_qn);
         free(s->target_name);
         free(s->target_label);
-        free(s->source_file);
-        free(s->target_file);
         free(s->type);
         free(s->props);
         return;
@@ -733,92 +727,61 @@ static const cbm_gbuf_node_t *incr_find_unique_renamed_target(const cbm_gbuf_t *
     return candidate;
 }
 
+static int incr_cmp_id(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
 typedef struct {
-    const CBMHashTable *changed_paths;
-    CBMHashTable *client_files;
-} incr_http_client_scan_t;
+    const int64_t *ids;
+    int count;
+} incr_id_set_t;
 
-static void incr_scan_http_clients(const cbm_gbuf_node_t *n, void *userdata) {
-    incr_http_client_scan_t *scan = (incr_http_client_scan_t *)userdata;
-    if (!n || !n->file_path || !n->properties_json) {
-        return;
-    }
-    if (scan->changed_paths && !cbm_ht_get(scan->changed_paths, n->file_path)) {
-        return;
-    }
-    if (strstr(n->properties_json, "\"http_client\"") != NULL) {
-        if (!cbm_ht_get(scan->client_files, n->file_path)) {
-            char *k = strdup(n->file_path);
-            if (k) {
-                cbm_ht_set(scan->client_files, k, k);
-            }
-        }
-    }
-}
-
-static void free_ht_keys_cb(const char *key, void *value, void *userdata) {
-    (void)value;
-    (void)userdata;
-    free((char *)key);
-}
-
-static void free_string_hash_table(CBMHashTable *ht) {
-    if (!ht) {
-        return;
-    }
-    cbm_ht_foreach(ht, free_ht_keys_cb, NULL);
-    cbm_ht_free(ht);
-}
-
-static bool incr_keep_unless_source_in_caller_files(const cbm_gbuf_t *gb,
-                                                    const cbm_gbuf_edge_t *edge,
-                                                    void *userdata) {
-    const CBMHashTable *caller_paths = (const CBMHashTable *)userdata;
-    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, edge->source_id);
-    if (!src || !src->file_path) {
-        return true;
-    }
-    return !cbm_ht_get(caller_paths, src->file_path);
+static bool incr_keep_unless_source_in_set(const cbm_gbuf_t *gb, const cbm_gbuf_edge_t *edge,
+                                           void *userdata) {
+    (void)gb;
+    const incr_id_set_t *set = userdata;
+    return !bsearch(&edge->source_id, set->ids, (size_t)set->count, sizeof(*set->ids),
+                    incr_cmp_id);
 }
 
 /* A path rename changes the callee's qualified name. Re-run the CALLS pass
- * for unchanged source files that previously called a purged target, or
- * imported a changed file that defined an http_client, so the normal
- * resolver recalculates strategy/confidence against the new registry instead
- * of preserving stale edge properties or stale base URLs. (#75, #1916) */
+ * for only unchanged source files that previously called a purged target, so
+ * the normal resolver recalculates strategy/confidence against the new
+ * registry instead of preserving stale edge properties. */
 static void incr_rebuild_snapshot_callers(cbm_pipeline_ctx_t *ctx, const cbm_edge_capture_t *cap,
-                                          const cbm_file_info_t *files, int file_count,
-                                          const CBMHashTable *http_client_files) {
+                                          const cbm_file_info_t *files, int file_count) {
     if (!ctx || !cap || !files || file_count <= 0) {
         return;
     }
     cbm_file_info_t *callers = calloc((size_t)cap->count, sizeof(*callers));
-    if (!callers) {
+    int64_t *source_ids = malloc((size_t)cap->count * sizeof(*source_ids));
+    if (!callers || !source_ids) {
+        free(callers);
+        free(source_ids);
         return;
     }
     int caller_count = 0;
+    int source_count = 0;
     for (int i = 0; i < cap->count; i++) {
         const cbm_saved_edge_t *saved = &cap->items[i];
-        bool is_calls_or_config = saved->type && (strcmp(saved->type, "CALLS") == 0 ||
-                                                  strcmp(saved->type, "CONFIGURES") == 0);
-        bool is_client_import = saved->type && strcmp(saved->type, "IMPORTS") == 0 &&
-                                saved->target_file && http_client_files &&
-                                cbm_ht_get(http_client_files, saved->target_file);
-        if (!is_calls_or_config && !is_client_import) {
+        /* Re-resolve unchanged sources that previously emitted either CALLS
+         * or resolver-owned CONFIGURES. CONFIGURES may be the only derived
+         * edge from a source (for example an environment accessor), so
+         * restricting this list to CALLS leaves those edges missing after a
+         * changed-file purge. */
+        if (!saved->type || (strcmp(saved->type, "CALLS") != 0 &&
+                             strcmp(saved->type, "CONFIGURES") != 0)) {
             continue;
         }
-        const char *source_path = saved->source_file;
-        if (!source_path || !source_path[0]) {
-            const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(ctx->gbuf, saved->source_qn);
-            if (source) {
-                source_path = source->file_path;
-            }
-        }
-        if (!source_path || !source_path[0]) {
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_qn(ctx->gbuf, saved->source_qn);
+        if (!source || !source->file_path) {
             continue;
         }
+        source_ids[source_count++] = source->id;
         for (int f = 0; f < file_count; f++) {
-            if (strcmp(files[f].rel_path, source_path) != 0) {
+            if (strcmp(files[f].rel_path, source->file_path) != 0) {
                 continue;
             }
             bool already_added = false;
@@ -834,45 +797,20 @@ static void incr_rebuild_snapshot_callers(cbm_pipeline_ctx_t *ctx, const cbm_edg
             break;
         }
     }
+    /* Drop these sources' CONFIGURES edges in one pass over the edge list:
+     * deleting per captured edge rescanned every edge and rebuilt the edge
+     * indexes each time, which made a one-file reindex slower than a full one. */
+    if (source_count > 0) {
+        qsort(source_ids, (size_t)source_count, sizeof(*source_ids), incr_cmp_id);
+        incr_id_set_t set = {source_ids, source_count};
+        cbm_gbuf_delete_edges_by_type_unless(ctx->gbuf, "CONFIGURES",
+                                             incr_keep_unless_source_in_set, &set);
+    }
     if (caller_count > 0) {
-        CBMHashTable *caller_paths = cbm_ht_create((uint32_t)caller_count * PAIR_LEN + CBM_SZ_16);
-        if (caller_paths) {
-            for (int i = 0; i < caller_count; i++) {
-                cbm_ht_set(caller_paths, callers[i].rel_path, (void *)1);
-            }
-            cbm_gbuf_delete_edges_by_type_unless(ctx->gbuf, "CONFIGURES",
-                                                 incr_keep_unless_source_in_caller_files,
-                                                 caller_paths);
-            cbm_gbuf_delete_edges_by_type_unless(ctx->gbuf, "HTTP_CALLS",
-                                                 incr_keep_unless_source_in_caller_files,
-                                                 caller_paths);
-            cbm_ht_free(caller_paths);
-        }
         cbm_pipeline_pass_calls(ctx, callers, caller_count);
     }
+    free(source_ids);
     free(callers);
-}
-
-/* Re-link snapshotted inbound IMPORTS edges to the freshly re-created target nodes
- * before re-resolving callers, so callers can find imported client instances. */
-static int incr_restore_inbound_imports(cbm_gbuf_t *gbuf, cbm_edge_capture_t *cap) {
-    int restored = 0;
-    for (int i = 0; i < cap->count; i++) {
-        cbm_saved_edge_t *s = &cap->items[i];
-        if (!s->type || strcmp(s->type, "IMPORTS") != 0) {
-            continue;
-        }
-        const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gbuf, s->source_qn);
-        const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gbuf, s->target_qn);
-        if (!tgt) {
-            tgt = incr_find_unique_renamed_target(gbuf, s);
-        }
-        if (src && tgt) {
-            cbm_gbuf_insert_edge(gbuf, src->id, tgt->id, s->type, s->props);
-            restored++;
-        }
-    }
-    return restored;
 }
 
 /* Re-link snapshotted inbound edges to the freshly re-created target nodes.
@@ -910,8 +848,6 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
         free(cap->items[i].target_qn);
         free(cap->items[i].target_name);
         free(cap->items[i].target_label);
-        free(cap->items[i].source_file);
-        free(cap->items[i].target_file);
         free(cap->items[i].type);
         free(cap->items[i].props);
     }
@@ -1067,6 +1003,184 @@ static int incr_expand_infra_changes(const cbm_file_info_t *files, int file_coun
             added++;
         }
     }
+    return added;
+}
+
+typedef struct {
+    const CBMHashTable *changed_paths;
+    CBMHashTable *client_files;
+} incr_client_scan_ctx_t;
+
+static void incr_find_existing_client_nodes(const cbm_gbuf_node_t *n, void *userdata) {
+    incr_client_scan_ctx_t *ctx = (incr_client_scan_ctx_t *)userdata;
+    if (!n || !n->file_path || !n->label || !n->properties_json) {
+        return;
+    }
+    if (strcmp(n->label, "Module") != 0 && strcmp(n->label, "Variable") != 0) {
+        return;
+    }
+    if (!cbm_ht_get(ctx->changed_paths, n->file_path)) {
+        return;
+    }
+    if (strstr(n->properties_json, "\"http_client\":") != NULL) {
+        if (!cbm_ht_get(ctx->client_files, n->file_path)) {
+            char *k = strdup(n->file_path);
+            if (k) {
+                cbm_ht_set(ctx->client_files, k, k);
+            }
+        }
+    }
+}
+
+static bool incr_is_client_file(const cbm_file_info_t *fi) {
+    if (!fi || !fi->path) {
+        return false;
+    }
+    if (fi->language != CBM_LANG_JAVASCRIPT && fi->language != CBM_LANG_TYPESCRIPT &&
+        fi->language != CBM_LANG_TSX) {
+        return false;
+    }
+    FILE *f = cbm_fopen(fi->path, "rb");
+    if (!f) {
+        return false;
+    }
+    (void)fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    (void)fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > cbm_max_file_bytes()) {
+        (void)fclose(f);
+        return false;
+    }
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return false;
+    }
+    size_t r = fread(buf, 1, (size_t)size, f);
+    (void)fclose(f);
+    buf[r] = '\0';
+
+    if (strstr(buf, "axios.create") == NULL) {
+        free(buf);
+        return false;
+    }
+
+    CBMFileResult *fr =
+        cbm_extract_file(buf, (int)r, fi->language, "incr_probe", fi->rel_path, 0, NULL, NULL);
+    free(buf);
+    bool has_client = false;
+    if (fr) {
+        for (int i = 0; i < fr->defs.count; i++) {
+            if (fr->defs.items[i].http_client != NULL) {
+                has_client = true;
+                break;
+            }
+        }
+        cbm_free_result(fr);
+    }
+    return has_client;
+}
+
+static void free_ht_keys_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    (void)userdata;
+    free((char *)key);
+}
+
+static void free_string_hash_table(CBMHashTable *ht) {
+    if (!ht) {
+        return;
+    }
+    cbm_ht_foreach(ht, free_ht_keys_cb, NULL);
+    cbm_ht_free(ht);
+}
+
+/* An axios client instance's baseURL is composed into the HTTP_CALLS edges of
+ * files that import it. When any file that defines an http_client changes or was
+ * deleted (before or after the edit), treat the files that import it as changed
+ * files so they go through full re-extraction. Returns files added. (#75, #1916) */
+static int incr_expand_client_importer_changes(const cbm_gbuf_t *existing,
+                                               const cbm_file_info_t *files, int file_count,
+                                               bool *is_changed, char *const *deleted,
+                                               int deleted_count) {
+    if (!existing || !files || file_count <= 0 || !is_changed) {
+        return 0;
+    }
+    CBMHashTable *changed_set = cbm_ht_create((uint32_t)(file_count + deleted_count));
+    if (!changed_set) {
+        return 0;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (is_changed[i]) {
+            cbm_ht_set(changed_set, files[i].rel_path, (void *)1);
+        }
+    }
+    for (int i = 0; i < deleted_count; i++) {
+        cbm_ht_set(changed_set, deleted[i], (void *)1);
+    }
+
+    CBMHashTable *client_files = cbm_ht_create(16);
+    if (!client_files) {
+        cbm_ht_free(changed_set);
+        return 0;
+    }
+
+    /* 1. Check existing graph for files that defined an http_client before the edit */
+    incr_client_scan_ctx_t scan_ctx = {
+        .changed_paths = changed_set,
+        .client_files = client_files,
+    };
+    cbm_gbuf_foreach_node(existing, incr_find_existing_client_nodes, &scan_ctx);
+
+    /* 2. Check changed files on disk to detect newly added client instances */
+    for (int i = 0; i < file_count; i++) {
+        if (!is_changed[i]) {
+            continue;
+        }
+        if (cbm_ht_get(client_files, files[i].rel_path)) {
+            continue;
+        }
+        if (incr_is_client_file(&files[i])) {
+            char *k = strdup(files[i].rel_path);
+            if (k) {
+                cbm_ht_set(client_files, k, k);
+            }
+        }
+    }
+    cbm_ht_free(changed_set);
+
+    if (cbm_ht_count(client_files) == 0) {
+        free_string_hash_table(client_files);
+        return 0;
+    }
+
+    /* 3. Find files in existing graph buffer that import any client file */
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int added = 0;
+    if (cbm_gbuf_find_edges_by_type(existing, "IMPORTS", &edges, &edge_count) == 0 && edges) {
+        for (int e = 0; e < edge_count; e++) {
+            const cbm_gbuf_edge_t *edge = edges[e];
+            const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(existing, edge->target_id);
+            if (!tgt || !tgt->file_path || !cbm_ht_get(client_files, tgt->file_path)) {
+                continue;
+            }
+            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(existing, edge->source_id);
+            if (!src || !src->file_path) {
+                continue;
+            }
+            for (int f = 0; f < file_count; f++) {
+                if (strcmp(files[f].rel_path, src->file_path) == 0) {
+                    if (!is_changed[f]) {
+                        is_changed[f] = true;
+                        added++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    free_string_hash_table(client_files);
     return added;
 }
 
@@ -1271,6 +1385,12 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
             incr_expand_infra_changes(files, file_count, is_changed, deleted, deleted_count);
         n_changed += infra_added;
         n_unchanged -= infra_added;
+
+        int client_added =
+            incr_expand_client_importer_changes(existing, files, file_count, is_changed, deleted,
+                                                deleted_count);
+        n_changed += client_added;
+        n_unchanged -= client_added;
     }
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",
@@ -1338,7 +1458,6 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
     /* Snapshot inbound cross-file edges into changed files BEFORE purging, so
      * the cascade delete doesn't permanently drop edges whose source lives in
      * an unchanged (never-re-parsed) file. Re-linked after re-resolution. */
-    CBMHashTable *http_client_files = cbm_ht_create(CBM_SZ_64);
     cbm_edge_capture_t edge_cap = {0};
     edge_cap.gbuf = existing;
     {
@@ -1349,11 +1468,6 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         for (int i = 0; i < deleted_count; i++) {
             cbm_ht_set(changed_paths, deleted[i], deleted[i]);
         }
-        incr_http_client_scan_t client_scan = {
-            .changed_paths = changed_paths,
-            .client_files = http_client_files,
-        };
-        cbm_gbuf_foreach_node(existing, incr_scan_http_clients, &client_scan);
         edge_cap.changed_paths = changed_paths;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         cbm_gbuf_foreach_edge(existing, incr_capture_inbound_edge, &edge_cap);
@@ -1438,7 +1552,6 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
     cbm_stem_marks_free(&stem_marks);
     if (extract_rc != 0) {
         incr_free_edge_capture(&edge_cap);
-        free_string_hash_table(http_client_files);
         free(changed_files);
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
@@ -1447,29 +1560,12 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         cbm_gbuf_free(existing);
         return extract_rc;
     }
-    /* Scan newly created nodes to capture files that now define an http_client */
-    {
-        CBMHashTable *changed_paths = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
-        for (int i = 0; i < ci; i++) {
-            cbm_ht_set(changed_paths, changed_files[i].rel_path, &changed_files[i]);
-        }
-        incr_http_client_scan_t client_scan = {
-            .changed_paths = changed_paths,
-            .client_files = http_client_files,
-        };
-        cbm_gbuf_foreach_node(existing, incr_scan_http_clients, &client_scan);
-        cbm_ht_free(changed_paths);
-    }
     /* Changed files got fresh File props above, so a stale coverage stamp
      * cannot survive; unchanged files keep theirs from the generation. */
     cbm_pipeline_stamp_coverage(p, existing);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
 
-    /* Restore inbound IMPORTS edges so callers being re-resolved can see them */
-    incr_restore_inbound_imports(existing, &edge_cap);
-
-    incr_rebuild_snapshot_callers(&ctx, &edge_cap, files, file_count, http_client_files);
-    free_string_hash_table(http_client_files);
+    incr_rebuild_snapshot_callers(&ctx, &edge_cap, files, file_count);
 
     /* Restore inbound cross-file edges before any derived pass reads the
      * mixed graph. Semantic vectors and complexity both consume CALLS

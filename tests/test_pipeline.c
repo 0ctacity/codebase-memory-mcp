@@ -852,10 +852,13 @@ typedef struct {
     int direct_http;         /* control: axios.get('/direct') */
     int fake_http;           /* look-alike factory.create: never a client */
     int provider_handles;    /* control: Express app.get stays a registration */
+    int wrapper2_http;       /* second importer: loadWrapperOrders2 -> /api/orders2 */
+    int wrapper2_http_v3;    /* ... and after wrapper moves to /v3: -> /v3/orders2 */
+    int env_configures;      /* unchanged caller keeps env_access CONFIGURES */
+    int env_http;            /* unchanged caller keeps arg_url HTTP_CALLS */
 } AxiosWrapperObs;
 
-static AxiosWrapperObs observe_axios_wrapper(const char *repo, const char *db) {
-    (void)db;
+static AxiosWrapperObs observe_axios_wrapper(const char *repo) {
     AxiosWrapperObs o;
     memset(&o, 0xff, sizeof(o)); /* -1 everywhere: "not observed" */
     cbm_pipeline_t *p = cbm_pipeline_new(repo, NULL, CBM_MODE_FULL);
@@ -883,6 +886,12 @@ static AxiosWrapperObs observe_axios_wrapper(const char *repo, const char *db) {
         o.direct_http = named_edge_count(s, proj, "HTTP_CALLS", "loadDirectOrders", "/direct");
         o.fake_http = named_edge_count(s, proj, "HTTP_CALLS", "loadFake", "/api/fake");
         o.provider_handles = named_edge_count(s, proj, "HANDLES", "provideOrders", "/api/orders");
+        o.wrapper2_http =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders2", "/api/orders2");
+        o.wrapper2_http_v3 =
+            named_edge_count(s, proj, "HTTP_CALLS", "loadWrapperOrders2", "/v3/orders2");
+        o.env_configures = named_edge_count(s, proj, "CONFIGURES", "loadEnv", "MY_VAR");
+        o.env_http = named_edge_count(s, proj, "HTTP_CALLS", "loadEnv", "/direct_env");
     }
     if (s) {
         cbm_store_close(s);
@@ -901,6 +910,10 @@ static const char *const AXIOS_CLIENT_V3 =
     "const api = axios.create({ baseURL: '/v3' });\n"
     "export default api;\n";
 
+static const char *const PLAIN_OBJECT_CLIENT =
+    "const api = { get: (x: string) => x };\n"
+    "export default api;\n";
+
 static const char *const AXIOS_ORDERS_V1 =
     "import api from './client';\n"
     "import axios from 'axios';\n"
@@ -913,10 +926,25 @@ static const char *const AXIOS_ORDERS_V2 =
     "export function loadWrapperOrders(): unknown { return api.get('/invoices'); }\n"
     "export function loadDirectOrders(): unknown { return axios.get('/direct'); }\n";
 
+static const char *const AXIOS_ORDERS2 =
+    "import api from './client';\n"
+    "export function loadWrapperOrders2(): unknown { return api.get('/orders2'); }\n";
+
+static const char *const ENV_CALLER =
+    "import { wrapperPad00 } from './wrapper_pad_00';\n"
+    "declare function someFetch(url: string): unknown;\n"
+    "export function loadEnv(): unknown {\n"
+    "  wrapperPad00();\n"
+    "  const v = process.env.MY_VAR;\n"
+    "  return someFetch('/direct_env');\n"
+    "}\n";
+
 static void populate_axios_wrapper_repo(const char *dir, const char *client_code,
                                         const char *orders_code) {
     write_temp_file(dir, "src/client.ts", client_code);
     write_temp_file(dir, "src/orders.ts", orders_code);
+    write_temp_file(dir, "src/orders2.ts", AXIOS_ORDERS2);
+    write_temp_file(dir, "src/env_caller.ts", ENV_CALLER);
     write_temp_file(dir, "src/named-client.ts",
                     "import axios from 'axios';\n"
                     "export const http = axios.create({ baseURL: '/v2/' });\n");
@@ -983,63 +1011,85 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
         th_rmtree(tmp_fresh);
         FAIL("tmpdir");
     }
+    char tmp_add[256];
+    snprintf(tmp_add, sizeof(tmp_add), "/tmp/cbm_axios_add_XXXXXX");
+    if (!cbm_mkdtemp(tmp_add)) {
+        th_rmtree(tmp);
+        th_rmtree(tmp_fresh);
+        th_rmtree(tmp_fresh2);
+        FAIL("tmpdir");
+    }
 
     populate_axios_wrapper_repo(tmp, AXIOS_CLIENT_V1, AXIOS_ORDERS_V1);
 
     char *old_workers = getenv("CBM_WORKERS");
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
-    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
-    char *saved_single = old_single ? strdup(old_single) : NULL;
 
     char *project = cbm_project_name_from_path(tmp);
     th_remove_project_workspace(project);
 
-    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    AxiosWrapperObs seq = observe_axios_wrapper(tmp, NULL);
-    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "1", 1);
+    AxiosWrapperObs seq = observe_axios_wrapper(tmp);
 
     /* Clear workspace so parallel run starts fresh and builds the base generation */
     th_remove_project_workspace(project);
     free(project);
 
     cbm_setenv("CBM_WORKERS", "4", 1);
-    AxiosWrapperObs par = observe_axios_wrapper(tmp, NULL);
+    AxiosWrapperObs par = observe_axios_wrapper(tmp);
 
     /* Only the wrapper changes; the importing caller is untouched.
      * Keep workspace so this reindex exercises the incremental route. */
     write_temp_file(tmp, "src/client.ts", AXIOS_CLIENT_V3);
-    AxiosWrapperObs incr = observe_axios_wrapper(tmp, NULL);
+    AxiosWrapperObs incr = observe_axios_wrapper(tmp);
 
     /* Fresh full index of the mutated tree in tmp_fresh for comparison. */
     populate_axios_wrapper_repo(tmp_fresh, AXIOS_CLIENT_V3, AXIOS_ORDERS_V1);
     char *project_fresh = cbm_project_name_from_path(tmp_fresh);
     th_remove_project_workspace(project_fresh);
     free(project_fresh);
-    AxiosWrapperObs fresh = observe_axios_wrapper(tmp_fresh, NULL);
+    AxiosWrapperObs fresh = observe_axios_wrapper(tmp_fresh);
 
     /* Then only the caller changes; the (unchanged) wrapper's base must
      * still be found when the caller alone is re-resolved. */
     write_temp_file(tmp, "src/orders.ts", AXIOS_ORDERS_V2);
-    AxiosWrapperObs incr2 = observe_axios_wrapper(tmp, NULL);
+    AxiosWrapperObs incr2 = observe_axios_wrapper(tmp);
 
     /* Fresh full index of the second mutation in tmp_fresh2 for comparison. */
     populate_axios_wrapper_repo(tmp_fresh2, AXIOS_CLIENT_V3, AXIOS_ORDERS_V2);
     char *project_fresh2 = cbm_project_name_from_path(tmp_fresh2);
     th_remove_project_workspace(project_fresh2);
     free(project_fresh2);
-    AxiosWrapperObs fresh2 = observe_axios_wrapper(tmp_fresh2, NULL);
+    AxiosWrapperObs fresh2 = observe_axios_wrapper(tmp_fresh2);
+
+    /* An unchanged caller of a changed file keeps its env_access CONFIGURES
+     * and its arg_url HTTP_CALLS edges. */
+    write_temp_file(tmp, "src/wrapper_pad_00.ts",
+                    "export function wrapperPad00(): number { return 999; }\n");
+    AxiosWrapperObs incr_pad = observe_axios_wrapper(tmp);
+
+    /* Client added and client removed test on tmp_add:
+     * Starts as a plain non-client object (api.get falls through to route_reg),
+     * then is edited to an axios client (route_reg replaced by HTTP_CALLS),
+     * and finally reverted back to non-client. */
+    populate_axios_wrapper_repo(tmp_add, PLAIN_OBJECT_CLIENT, AXIOS_ORDERS_V1);
+    char *project_add = cbm_project_name_from_path(tmp_add);
+    th_remove_project_workspace(project_add);
+    AxiosWrapperObs add_pre = observe_axios_wrapper(tmp_add);
+
+    /* 1. Client added: wrapper_route_reg drops to 0, wrapper_http becomes 1 */
+    write_temp_file(tmp_add, "src/client.ts", AXIOS_CLIENT_V1);
+    AxiosWrapperObs add_incr = observe_axios_wrapper(tmp_add);
+
+    /* 2. Client removed: wrapper_http drops to 0, wrapper_route_reg returns */
+    write_temp_file(tmp_add, "src/client.ts", PLAIN_OBJECT_CLIENT);
+    AxiosWrapperObs rem_incr = observe_axios_wrapper(tmp_add);
 
     if (saved_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
         free(saved_workers);
     } else {
         cbm_unsetenv("CBM_WORKERS");
-    }
-    if (saved_single) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
-        free(saved_single);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     }
 
     char *p_clean = cbm_project_name_from_path(tmp);
@@ -1051,10 +1101,13 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     char *pf2_clean = cbm_project_name_from_path(tmp_fresh2);
     th_remove_project_workspace(pf2_clean);
     free(pf2_clean);
+    th_remove_project_workspace(project_add);
+    free(project_add);
 
     th_rmtree(tmp);
     th_rmtree(tmp_fresh);
     th_rmtree(tmp_fresh2);
+    th_rmtree(tmp_add);
 
     ASSERT_EQ(seq.run_rc, 0);
     ASSERT_EQ(par.run_rc, 0);
@@ -1073,20 +1126,46 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     ASSERT_EQ(seq.local_raw_http, 0);
     ASSERT_EQ(seq.dynamic_http, 1);
     ASSERT_EQ(seq.dynamic_route_reg, 0);
+    ASSERT_EQ(seq.wrapper2_http, 1);
+    ASSERT_EQ(seq.env_configures, 1);
+    ASSERT_EQ(seq.env_http, 1);
 
     /* Sequential and parallel resolvers agree edge for edge. */
     ASSERT_MEM_EQ(&seq, &par, sizeof(seq));
 
-    /* Reindex after the base moved converges with a fresh index. */
+    /* Reindex after the base moved converges with a fresh index for both importers. */
     ASSERT_EQ(fresh.run_rc, 0);
     ASSERT_EQ(fresh.wrapper_http_v3, 1);
+    ASSERT_EQ(fresh.wrapper2_http_v3, 1);
     ASSERT_EQ(fresh.wrapper_http, 0);
+    ASSERT_EQ(fresh.wrapper2_http, 0);
     ASSERT_EQ(incr.run_rc, 0);
     ASSERT_MEM_EQ(&incr, &fresh, sizeof(fresh));
+
+    /* Reindex after caller changed converges with fresh index. */
     ASSERT_EQ(fresh2.run_rc, 0);
     ASSERT_EQ(fresh2.wrapper_http_v3_inv, 1);
     ASSERT_EQ(fresh2.wrapper_http_v3, 0);
     ASSERT_MEM_EQ(&incr2, &fresh2, sizeof(fresh2));
+
+    /* Unchanged caller re-resolved via changed callee keeps env_access and arg_url edges. */
+    ASSERT_EQ(incr_pad.run_rc, 0);
+    ASSERT_EQ(incr_pad.env_configures, 1);
+    ASSERT_EQ(incr_pad.env_http, 1);
+
+    /* Client added: phantom route_reg drops to 0, HTTP_CALLS emitted */
+    ASSERT_EQ(add_pre.wrapper_http, 0);
+    ASSERT_EQ(add_pre.wrapper_route_reg, 1);
+    ASSERT_EQ(add_incr.run_rc, 0);
+    ASSERT_EQ(add_incr.wrapper_http, 1);
+    ASSERT_EQ(add_incr.wrapper_route_reg, 0);
+
+    /* Client removed: HTTP_CALLS drops to 0, fallback route_reg returns */
+    ASSERT_EQ(rem_incr.run_rc, 0);
+    ASSERT_EQ(rem_incr.wrapper_http, 0);
+    ASSERT_EQ(rem_incr.wrapper_route_reg, 1);
+    ASSERT_MEM_EQ(&rem_incr, &add_pre, sizeof(add_pre));
+
     PASS();
 }
 
