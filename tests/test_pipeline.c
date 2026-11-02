@@ -1129,6 +1129,8 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     ASSERT_EQ(seq.wrapper2_http, 1);
     ASSERT_EQ(seq.env_configures, 1);
     ASSERT_EQ(seq.env_http, 1);
+    ASSERT_EQ(par.env_configures, 1);
+    ASSERT_EQ(par.env_http, 1);
 
     /* Sequential and parallel resolvers agree edge for edge. */
     ASSERT_MEM_EQ(&seq, &par, sizeof(seq));
