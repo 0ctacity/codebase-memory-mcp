@@ -5750,7 +5750,8 @@ TEST(extract_ts_folded_config_url_and_exclusions) {
                 "export function config() { return http({url: API_ENDPOINTS.USER}); }\n"
                 "export function format() { return axios.getUri({url: API_ENDPOINTS.USER}); }\n"
                 "export function register() { app.route({url: API_ENDPOINTS.USER, handler}); }\n"
-                "export function relative() { return fetch(`${REL}/users/me`); }\n",
+                "export function relative() { return fetch(`${REL}/users/me`); }\n"
+                "export function clientConfig() { return axios({url: `${process.env.API}/orders`}); }\n",
                 CBM_LANG_TYPESCRIPT, "t", "config.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
@@ -5761,6 +5762,9 @@ TEST(extract_ts_folded_config_url_and_exclusions) {
     ASSERT_STR_EQ(c->args[0].value, "api/users/me");
     ASSERT_NOT_NULL(c->args[0].url_value);
     ASSERT_STR_EQ(c->args[0].url_value, "/api/users/me");
+    c = find_call_in_func(r, "axios", "clientConfig");
+    ASSERT_NOT_NULL(c);
+    ASSERT_STR_EQ(c->first_string_arg, "/orders");
     const char *callees[] = {"axios.getUri", "app.route"};
     const char *functions[] = {"format", "register"};
     for (size_t i = 0; i < sizeof(callees) / sizeof(callees[0]); i++) {

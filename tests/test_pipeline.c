@@ -2189,8 +2189,6 @@ TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
         snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
         write_temp_file(tmp, name, body);
     }
-    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
-    char *saved_single = old_single ? strdup(old_single) : NULL;
     const char *old_workers = getenv("CBM_WORKERS");
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
     int run_rc[2] = {-1, -1};
@@ -2210,9 +2208,8 @@ TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
             free(proj_name);
         }
         if (mode == 0) {
-            cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+            cbm_setenv("CBM_WORKERS", "1", 1);
         } else {
-            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
             cbm_setenv("CBM_WORKERS", "4", 1);
         }
         cbm_pipeline_t *p = cbm_pipeline_new(tmp, NULL, CBM_MODE_FULL);
@@ -2237,12 +2234,6 @@ TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
             cbm_store_close(s);
         }
         cbm_pipeline_free(p);
-    }
-    if (saved_single) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
-        free(saved_single);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     }
     if (saved_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
@@ -2284,11 +2275,8 @@ TEST(pipeline_relative_folded_wrapper_url_candidates) {
         snprintf(body, sizeof(body), "export function padding%d() { return %d; }\n", i, i);
         write_temp_file(tmp, name, body);
     }
-    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
-    char *saved_single = old_single ? strdup(old_single) : NULL;
     const char *old_workers = getenv("CBM_WORKERS");
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
-    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
     cbm_setenv("CBM_WORKERS", "4", 1);
     char *proj_name = cbm_project_name_from_path(tmp);
     if (proj_name) {
@@ -2310,12 +2298,6 @@ TEST(pipeline_relative_folded_wrapper_url_candidates) {
         cbm_store_close(s);
     }
     cbm_pipeline_free(p);
-    if (saved_single) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
-        free(saved_single);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    }
     if (saved_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
         free(saved_workers);
