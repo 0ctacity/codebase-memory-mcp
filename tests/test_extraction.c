@@ -3682,6 +3682,77 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
+/* Distilled from PR #1245 (Andrew Hundt): unittest.mock's `@patch("x")` is a
+ * bare decorator whose name collides with the HTTP verb, and its only argument
+ * is a dotted target, not a path. The "/" fallback then minted a Route handler
+ * PATCH "/" for every mocked test function. Rule: a decorator call WITH
+ * arguments but no path-shaped one is not a route. */
+TEST(extract_python_mock_patch_is_not_route) {
+    CBMFileResult *r = extract("from unittest.mock import patch\n\n"
+                               "@patch(\"subprocess.run\")\n"
+                               "def test_cmd(mock_run):\n"
+                               "    pass\n\n"
+                               "@app.patch(\"/items/{id}\")\n"
+                               "def update_item():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "test_routes.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *mocked = find_def_by_name(r, "test_cmd");
+    ASSERT_NOT_NULL(mocked);
+    ASSERT_NULL(mocked->route_path);
+    ASSERT_NULL(mocked->route_method);
+
+    const CBMDefinition *route = find_def_by_name(r, "update_item");
+    ASSERT_NOT_NULL(route);
+    ASSERT_STR_EQ(route->route_path, "/items/{id}");
+    ASSERT_STR_EQ(route->route_method, "PATCH");
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Companion to the mock-patch case: the narrowing must not cost real routes.
+ * A receiver-less framework decorator with a path-shaped argument (Litestar /
+ * BlackSheep `@get("/x")`) stays a route, `@mock.patch("x")` (receiver, but
+ * no path) is not one, and a zero-argument `@app.route()` keeps the "/"
+ * default main emits today. */
+TEST(extract_python_bare_decorator_route_rules) {
+    CBMFileResult *r = extract("from litestar import get\n"
+                               "from unittest import mock\n\n"
+                               "@get(\"/health\")\n"
+                               "def health():\n"
+                               "    pass\n\n"
+                               "@mock.patch(\"os.getcwd\")\n"
+                               "def test_cwd(mock_cwd):\n"
+                               "    pass\n\n"
+                               "@app.route()\n"
+                               "def index():\n"
+                               "    pass\n",
+                               CBM_LANG_PYTHON, "t", "routes.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const CBMDefinition *health = find_def_by_name(r, "health");
+    ASSERT_NOT_NULL(health);
+    ASSERT_STR_EQ(health->route_path, "/health");
+    ASSERT_STR_EQ(health->route_method, "GET");
+
+    const CBMDefinition *mocked = find_def_by_name(r, "test_cwd");
+    ASSERT_NOT_NULL(mocked);
+    ASSERT_NULL(mocked->route_path);
+    ASSERT_NULL(mocked->route_method);
+
+    const CBMDefinition *index = find_def_by_name(r, "index");
+    ASSERT_NOT_NULL(index);
+    ASSERT_STR_EQ(index->route_path, "/");
+    ASSERT_STR_EQ(index->route_method, "ANY");
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Find an in-body call by its raw callee text; returns the call or NULL. */
 static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -5164,6 +5235,113 @@ TEST(extract_ts_template_string_url_issue1006) {
     PASS();
 }
 
+/* Issue #1428: NestJS routes are TypeScript decorators — the class-level
+ * @Controller('users') prefix composes with the method-level @Get(':id')
+ * verb + path. Nest paths carry no leading slash, and the decorator's call is
+ * a `call_expression` (not Python's `call`), so no Route was ever formed. */
+TEST(extract_ts_nestjs_controller_routes_issue1428) {
+    CBMFileResult *r =
+        extract("import { Controller, Get, Post, Patch, Delete, Param } from '@nestjs/common';\n"
+                "@Controller({ path: 'users', version: '1' })\n"
+                "export class UsersController {\n"
+                "  @Get() findAll() { return []; }\n"
+                "  @Get(':id') findOne(@Param('id') id: string) { return id; }\n"
+                "  @Post() create() { return 1; }\n"
+                "  @Patch(':id') update(@Param('id') id: string) { return id; }\n"
+                "  @Delete('/:id') remove(@Param('id') id: string) { return id; }\n"
+                "  helper() { return 0; }\n"
+                "}\n"
+                "@Controller('health')\n"
+                "export class HealthController {\n"
+                "  @Get() check() { return { status: 'ok' }; }\n"
+                "}\n"
+                "@Controller()\n"
+                "export class RootController {\n"
+                "  @Get('ping') ping() { return 'pong'; }\n"
+                "}\n",
+                CBM_LANG_TYPESCRIPT, "t", "src/users/users.controller.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const struct {
+        const char *name;
+        const char *method;
+        const char *path;
+    } want[] = {
+        {"findAll", "GET", "/users"},       {"findOne", "GET", "/users/:id"},
+        {"create", "POST", "/users"},       {"update", "PATCH", "/users/:id"},
+        {"remove", "DELETE", "/users/:id"}, {"check", "GET", "/health"},
+        {"ping", "GET", "/ping"},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const CBMDefinition *d = find_def_by_name(r, want[i].name);
+        ASSERT_NOT_NULL(d);
+        ASSERT_NOT_NULL(d->route_path);
+        ASSERT_STR_EQ(d->route_path, want[i].path);
+        ASSERT_STR_EQ(d->route_method, want[i].method);
+    }
+    const CBMDefinition *helper = find_def_by_name(r, "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_NULL(helper->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #2235: a request-config object argument carries the URL in its `url`
+ * property (Orval/axios style: `http({url: `/x/${id}`, method: 'GET'})`).
+ * The property's template literal flattens to the canonical "{}" form both on
+ * the argument (read by the arg-url heuristic for local helpers) and as the
+ * call's URL (read by HTTP-client classification, e.g. `axios({url})`). Other
+ * keys never stand in for the URL, and a route registration keeps its own
+ * (object-free) handling. */
+TEST(extract_ts_config_object_url_issue2235) {
+    CBMFileResult *r =
+        extract("export const get1 = (id: string) => {\n"
+                "  return http<Customer>({url: `/api/customers/${id}`, method: 'GET'});\n"
+                "};\n"
+                "export const load = () => axios({method: 'POST', 'url': '/api/orders'});\n"
+                "export const other = () => http({path: '/api/ignored/x'});\n"
+                "export const reg = () => fastify.route({url: '/srv/x', handler: h});\n"
+                "export const u = () => axiosInstance.getUri({url: `/pets`});\n",
+                CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = NULL;
+    const CBMCall *o = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *k = &r->calls.items[i];
+        if (k->callee_name && strcmp(k->callee_name, "http") == 0 && k->arg_count > 0) {
+            if (k->args[0].expr && strstr(k->args[0].expr, "customers")) {
+                c = k;
+            } else {
+                o = k;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->args[0].value);
+    ASSERT_STR_EQ(c->args[0].value, "/api/customers/{}");
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/customers/{}");
+    const CBMCall *a = find_call_by_callee(r, "axios");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(a->first_string_arg);
+    ASSERT_STR_EQ(a->first_string_arg, "/api/orders");
+    ASSERT_NOT_NULL(o);
+    ASSERT_NULL(o->args[0].value);
+    ASSERT_NULL(o->first_string_arg);
+    const CBMCall *g = find_call_by_callee(r, "fastify.route");
+    ASSERT_NOT_NULL(g);
+    ASSERT_NULL(g->first_string_arg);
+    ASSERT(g->arg_count == 0 || g->args[0].value == NULL);
+    /* getUri only formats the URL; it sends no request. */
+    const CBMCall *gu = find_call_by_callee(r, "axiosInstance.getUri");
+    ASSERT_NOT_NULL(gu);
+    ASSERT_NULL(gu->first_string_arg);
+    ASSERT(gu->arg_count == 0 || gu->args[0].value == NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1005: JAX-RS splits a route across two annotations (@GET carries the
  * verb, a sibling @Path carries the path). Returning on the first mapping
  * annotation dropped every method-level @Path, and the class-level @Path
@@ -6475,6 +6653,8 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(extract_python_mock_patch_is_not_route);
+    RUN_TEST(extract_python_bare_decorator_route_rules);
     RUN_TEST(extract_ts_url_builder_issue1009);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
@@ -6512,6 +6692,8 @@ SUITE(extraction) {
 
     cbm_shutdown();
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
+    RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_java_jaxrs_relative_path_templates);
     RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);

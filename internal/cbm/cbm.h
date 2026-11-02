@@ -290,6 +290,8 @@ typedef enum {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    const char *member;      // ES named import: the exported name the local binds (`get` in
+                             // `import { get as navigate } from "axios"`); NULL otherwise
     CBMImportKind kind;      // CBM_IMPORT_KIND_DEFAULT unless the syntax names a member kind
 } CBMImport;
 
