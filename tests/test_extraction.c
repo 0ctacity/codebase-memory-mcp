@@ -10,6 +10,15 @@
 #include "foundation/constants.h"     /* CBM_SZ_* */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include <time.h>
+#include "helpers.h"    /* cbm_count_branching, walker stack test seam */
+#include "lang_specs.h" /* cbm_lang_spec, cbm_ts_language */
+/* Deep-nesting probes: extraction on a worker-sized stack, crash-isolated. */
+#include "pipeline/worker_pool.h"     /* CBM_WORKER_STACK_SIZE */
+#include "foundation/compat_thread.h" /* cbm_thread_create */
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid */
+#include <unistd.h>   /* fork, _exit */
+#endif
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -4628,6 +4637,362 @@ TEST(walk_defs_no_truncation_over_4096_issue668) {
     PASS();
 }
 
+/* ── Walker stacks must never cap graph content (#52) ────────────────
+ *
+ * The definitions walk had a frame ceiling (env CBM_WALK_DEFS_MAX) and, when
+ * its realloc failed, emptied the whole pending stack without flagging the
+ * file. The complexity walkers and the body-token sampler used fixed-size
+ * pending stacks (4096 / 512 nodes) and silently stopped pushing children once
+ * full. Children are pushed last-to-first, so a wide body lost its FIRST
+ * statements: a function with 5000 top-level branches under-reported its
+ * cyclomatic count, and the token sampler started mid-body. */
+enum { WIDE_DEFS = 1000, WIDE_STMTS = 5000, WIDE_CALLS = 600, BODY_TOKEN_PREFIX = 16 };
+
+static char *build_wide_c_defs(int n) {
+    size_t cap = (size_t)n * 32 + 64;
+    char *src = malloc(cap);
+    if (!src) {
+        return NULL;
+    }
+    size_t pos = 0;
+    src[0] = '\0';
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "int wd%d(void) { return %d; }\n", i, i);
+    }
+    return src;
+}
+
+/* 1000 top-level C functions outgrow the walk's 256-frame first allocation,
+ * so every growth step is exercised. With the test seam failing the first
+ * growth, the frames already pending are still walked and the file is
+ * reported as an extract error instead of silently losing the rest. */
+TEST(walk_defs_stack_alloc_failure_flags_file_and_keeps_pending) {
+    char *src = build_wide_c_defs(WIDE_DEFS);
+    ASSERT_NOT_NULL(src);
+
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_defs.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < WIDE_DEFS; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "wd%d", i);
+        ASSERT_NOT_NULL(find_def(r, name));
+    }
+    cbm_free_result(r);
+
+    /* First allocation (256 frames) succeeds, the first growth fails. */
+    cbm_walk_test_fail_alloc_after(1);
+    r = extract(src, CBM_LANG_C, "t", "wide_defs.c");
+    cbm_walk_test_fail_alloc_after(-1);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->has_error);
+    ASSERT_NOT_NULL(r->error_msg);
+    ASSERT_NOT_NULL(strstr(r->error_msg, "stack allocation failed"));
+    /* Pushed last-to-first: the last definitions were pending and survive. */
+    ASSERT_NOT_NULL(find_def(r, "wd999"));
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* C function `wide` whose body holds `n` top-level statements alternating
+ * `if (x) g();` and `while (x) g();`. Caller frees. */
+static char *build_wide_branch_fn(int n) {
+    size_t cap = (size_t)n * 24 + 64;
+    char *src = malloc(cap);
+    if (!src) {
+        return NULL;
+    }
+    size_t pos = (size_t)snprintf(src, cap, "void g(void);\nvoid wide(int x) {\n");
+    for (int i = 0; i < n; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, "%s",
+                                (i % 2 == 0) ? "if (x) g();\n" : "while (x) g();\n");
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    return src;
+}
+
+TEST(complexity_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide");
+    ASSERT_NOT_NULL(d);
+    /* every if/while is one branching node at nesting depth 0 */
+    ASSERT_EQ(d->complexity, WIDE_STMTS);
+    ASSERT_EQ(d->cognitive, WIDE_STMTS);
+    ASSERT_EQ(d->loop_count, WIDE_STMTS / 2);
+    ASSERT_EQ(d->loop_depth, 1);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(count_branching_wide_body_exceeds_old_stack_cap) {
+    char *src = build_wide_branch_fn(WIDE_STMTS);
+    ASSERT_NOT_NULL(src);
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ASSERT_TRUE(ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_C)));
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+    int n = cbm_count_branching(ts_tree_root_node(tree),
+                                cbm_lang_spec(CBM_LANG_C)->branching_node_types);
+    ASSERT_EQ(n, WIDE_STMTS);
+
+    /* A failed growth reports the sentinel, never an undercount. */
+    cbm_walk_test_fail_alloc_after(0);
+    n = cbm_count_branching(ts_tree_root_node(tree),
+                            cbm_lang_spec(CBM_LANG_C)->branching_node_types);
+    cbm_walk_test_fail_alloc_after(-1);
+    ASSERT_EQ(n, CBM_WALK_METRIC_UNAVAILABLE);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    free(src);
+    PASS();
+}
+
+/* The body-token sampler's contract is "the first BT_MAX_IDENTS unique
+ * identifiers in source order". A body with 600 distinct calls must sample
+ * from f0 on, not a window starting mid-body. Only the source-order prefix
+ * f0..f15 is asserted: the sampler's dedupe key (hash | 1) also merges
+ * identifiers whose hashes differ only in bit 0, which drops a few later names
+ * (f16, f18, ...) -- a separate dedupe property this test does not pin. */
+TEST(body_tokens_wide_body_samples_from_the_start) {
+    /* The sampler runs only for bodies that also get a MinHash fingerprint,
+     * which needs enough distinct structure: cycle the call through several
+     * statement shapes. `fN` stays the only identifier. */
+    static const char *const shapes[] = {
+        "f%d();\n",           "f%d(1);\n",         "f%d(\"s\", 2);\n",       "if (1) f%d();\n",
+        "while (0) f%d();\n", "for (;;) f%d();\n", "do f%d(); while (0);\n", "{ f%d(); }\n",
+        "(void)f%d();\n",     "-f%d();\n",         "f%d() + 1;\n",           "f%d() ? 1 : 2;\n",
+    };
+    enum { SHAPES = sizeof(shapes) / sizeof(shapes[0]) };
+    size_t cap = (size_t)WIDE_CALLS * 32 + 64;
+    char *src = malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t pos = (size_t)snprintf(src, cap, "void wide_calls(void) {\n");
+    for (int i = 0; i < WIDE_CALLS; i++) {
+        pos += (size_t)snprintf(src + pos, cap - pos, shapes[i % SHAPES], i);
+    }
+    snprintf(src + pos, cap - pos, "}\n");
+    char expect[BODY_TOKEN_PREFIX * 8];
+    size_t ep = 0;
+    for (int i = 0; i < BODY_TOKEN_PREFIX; i++) {
+        ep += (size_t)snprintf(expect + ep, sizeof(expect) - ep, "f%d ", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_C, "t", "wide_calls.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "wide_calls");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->body_tokens);
+    ASSERT_GTE(strlen(d->body_tokens), ep);
+    ASSERT_MEM_EQ(d->body_tokens, expect, ep);
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* ── Deep nesting: the syntax-tree walkers must not spend stack per level ──
+ *
+ * Extraction runs on pipeline worker threads whose stack is
+ * CBM_WORKER_STACK_SIZE (src/pipeline/worker_pool.h), not on the test runner's
+ * main thread. Each probe runs cbm_extract_file on a thread of exactly that
+ * size, so a walker that recurses once per nesting level runs out of stack at
+ * the depth it would in the pipeline. On POSIX the thread lives in a forked
+ * child and an overflow surfaces as the child's killing signal instead of
+ * taking the runner with it; Windows runs it in-process. A probe returns 0
+ * when every expectation held and prints what did not. */
+enum { DEEP_NEST_LEVELS = 200000 };
+
+typedef int (*deep_probe_fn)(void);
+
+typedef struct {
+    deep_probe_fn fn;
+    int rc;
+} deep_probe_job_t;
+
+static void *deep_probe_thread_main(void *arg) {
+    deep_probe_job_t *job = (deep_probe_job_t *)arg;
+    job->rc = job->fn();
+    return NULL;
+}
+
+/* 0 when the probe passed, its own code otherwise, 2 if no thread came up. */
+static int deep_probe_on_stack(deep_probe_fn fn, size_t stack_size) {
+    deep_probe_job_t job = {fn, 3};
+    cbm_thread_t thread;
+    int create_rc = cbm_thread_create(&thread, stack_size, deep_probe_thread_main, &job);
+    if (create_rc != 0) {
+        printf("    deep probe: thread of %zu bytes not created (rc=%d)\n", stack_size, create_rc);
+        return 2;
+    }
+    (void)cbm_thread_join(&thread);
+    return job.rc;
+}
+
+/* 1 when the probe passed; otherwise `why` says what happened. */
+static int deep_probe_passed(deep_probe_fn fn, size_t stack_size, char *why, size_t why_len) {
+#if defined(_WIN32)
+    int rc = deep_probe_on_stack(fn, stack_size);
+    if (rc != 0) {
+        snprintf(why, why_len, "probe returned %d", rc);
+    }
+    return rc == 0;
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) {
+        snprintf(why, why_len, "fork failed");
+        return 0;
+    }
+    if (pid == 0) {
+        int rc = deep_probe_on_stack(fn, stack_size);
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        snprintf(why, why_len,
+                 "extraction killed by signal %d on a %zu-byte stack: a walker recursed once "
+                 "per nesting level",
+                 WTERMSIG(status), stack_size);
+        return 0;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        snprintf(why, why_len, "probe returned %d", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+        return 0;
+    }
+    return 1;
+#endif
+}
+
+/* One invalid token at the bottom of DEEP_NEST_LEVELS parentheses. Every
+ * enclosing parenthesized_expression then carries ts_node_has_error without
+ * being an ERROR node, which is the chain cbm_collect_error_regions (cbm.c)
+ * descends. The nest is a call argument, not an assignment, so no definition
+ * starts on its line and the region is not subtracted as recovered.
+ * Expected: one region, on the line of the nest only, with the neighbouring
+ * definition intact. */
+static int deep_error_regions_probe(void) {
+    const char *head = "def ok():\n    return 1\nprint(";
+    const char *core = "1 2";
+    const char *tail = ")\ny = ok()\n";
+    size_t hl = strlen(head);
+    size_t cl = strlen(core);
+    size_t tl = strlen(tail);
+    char *src = malloc(hl + cl + tl + 2 * (size_t)DEEP_NEST_LEVELS + 1);
+    if (!src) {
+        return 4;
+    }
+    char *w = src;
+    memcpy(w, head, hl);
+    w += hl;
+    memset(w, '(', DEEP_NEST_LEVELS);
+    w += DEEP_NEST_LEVELS;
+    memcpy(w, core, cl);
+    w += cl;
+    memset(w, ')', DEEP_NEST_LEVELS);
+    w += DEEP_NEST_LEVELS;
+    memcpy(w, tail, tl + 1);
+
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "deep_error.py");
+    int rc = 0;
+    if (!r) {
+        printf("    deep error regions: extraction failed\n");
+        rc = 1;
+    } else {
+        if (!r->parse_incomplete || r->error_region_count != 1 || !r->error_ranges ||
+            strcmp(r->error_ranges, "3-3") != 0) {
+            printf("    deep error regions: incomplete=%d count=%d ranges=%s, expected one "
+                   "region 3-3\n",
+                   r->parse_incomplete ? 1 : 0, r->error_region_count,
+                   r->error_ranges ? r->error_ranges : "(none)");
+            rc = 1;
+        }
+        if (!has_def(r, "Function", "ok")) {
+            printf("    deep error regions: the definition next to the nest was lost\n");
+            rc = 1;
+        }
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_error_regions_complete) {
+    char why[160];
+    if (!deep_probe_passed(deep_error_regions_probe, CBM_WORKER_STACK_SIZE, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
+/* `main = f a a ... a`: a curried Haskell application nests one apply node per
+ * argument in its function head. extract_fp_callee walks down those heads to
+ * the leftmost callee; it used to recurse once per argument. Every nested
+ * apply is itself a call site, so extraction is quadratic in the number of
+ * arguments and a worker-stack-sized depth would take minutes. The probe
+ * scales both down instead: DEEP_CURRY_ARGS arguments on a DEEP_CURRY_STACK
+ * thread, which the recursive form overflows. The stack also holds the
+ * thread's static TLS block (about 0.8 MB in the test runner), so it cannot
+ * shrink much further. Expected: the call to `f` is found. */
+enum { DEEP_CURRY_ARGS = 20000, DEEP_CURRY_STACK = 2 * CBM_SZ_1K * CBM_SZ_1K };
+
+static int deep_curried_callee_probe(void) {
+    const char *head = "main = f";
+    const char *tail = "\n";
+    size_t hl = strlen(head);
+    char *src = malloc(hl + 2 * (size_t)DEEP_CURRY_ARGS + strlen(tail) + 1);
+    if (!src) {
+        return 4;
+    }
+    char *w = src;
+    memcpy(w, head, hl);
+    w += hl;
+    for (int i = 0; i < DEEP_CURRY_ARGS; i++) {
+        *w++ = ' ';
+        *w++ = 'a';
+    }
+    memcpy(w, tail, strlen(tail) + 1);
+
+    CBMFileResult *r = extract(src, CBM_LANG_HASKELL, "t", "Deep.hs");
+    int rc = 0;
+    if (!r || r->has_error) {
+        printf("    deep curried callee: extraction failed\n");
+        rc = 1;
+    } else {
+        int found = 0;
+        for (int i = 0; i < r->calls.count; i++) {
+            if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "f") == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found) {
+            printf("    deep curried callee: no call to f among %d calls\n", r->calls.count);
+            rc = 1;
+        }
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+    free(src);
+    return rc;
+}
+
+TEST(extract_deep_curried_callee_completes) {
+    char why[160];
+    if (!deep_probe_passed(deep_curried_callee_probe, DEEP_CURRY_STACK, why, sizeof(why))) {
+        FAIL(why);
+    }
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
@@ -6570,6 +6935,12 @@ SUITE(extraction) {
     RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
+    RUN_TEST(walk_defs_stack_alloc_failure_flags_file_and_keeps_pending);
+    RUN_TEST(complexity_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(count_branching_wide_body_exceeds_old_stack_cap);
+    RUN_TEST(body_tokens_wide_body_samples_from_the_start);
+    RUN_TEST(extract_deep_error_regions_complete);
+    RUN_TEST(extract_deep_curried_callee_completes);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
 
     cbm_shutdown();

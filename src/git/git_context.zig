@@ -51,7 +51,7 @@ fn gitCapture(repo_path: [*:0]const u8, git_args: []const u8, out: *[*c]u8) c_in
         std.mem.span(repo_path), git_args, null_dev,
     }, 0) catch return c.CBM_NOT_FOUND;
 
-    const fp = c.cbm_popen(cmd_z.ptr, "r");
+    const fp = c.cbm_popen_git(cmd_z.ptr);
     if (fp == null) return c.CBM_NOT_FOUND;
 
     var buf: [GIT_OUTPUT_MAX]u8 = undefined;
@@ -66,6 +66,56 @@ fn gitCapture(repo_path: [*:0]const u8, git_args: []const u8, out: *[*c]u8) c_in
 
     out.* = dupBytes(line) orelse return c.CBM_NOT_FOUND;
     return 0;
+}
+
+/// `git -C <repo_path> ls-files -z`: every path git tracks below repo_path,
+/// relative to it and NUL-separated, in one malloc'd buffer the caller frees.
+/// One extra NUL follows the output; *length excludes it. NULL when the path
+/// is rejected, git fails, or memory runs out.
+pub export fn cbm_git_ls_files(repo_path_c: ?[*:0]const u8, length_c: ?*usize) ?[*:0]u8 {
+    const length = length_c orelse return null;
+    length.* = 0;
+    const repo_path = repo_path_c orelse return null;
+    if (!gitValidateRepoPath(repo_path)) return null;
+
+    const null_dev = if (is_windows) "NUL" else "/dev/null";
+    // core.fsmonitor=false: a configured fsmonitor hook must not run for a
+    // read-only listing.
+    var cmd: [GIT_CMD_MAX]u8 = undefined;
+    const cmd_z = std.mem.printSentinel(&cmd, "git -C \"{s}\" -c core.fsmonitor=false ls-files -z 2>{s}", .{
+        std.mem.span(repo_path), null_dev,
+    }, 0) catch return null;
+
+    const fp = c.cbm_popen_git(cmd_z.ptr);
+    if (fp == null) return null;
+
+    var cap: usize = GIT_OUTPUT_MAX;
+    var buf: [*]u8 = @ptrCast(c.malloc(cap + 1) orelse {
+        _ = c.cbm_pclose(fp);
+        return null;
+    });
+    var len: usize = 0;
+    while (true) {
+        if (len == cap) {
+            const grown = c.realloc(buf, cap * 2 + 1) orelse {
+                c.free(buf);
+                _ = c.cbm_pclose(fp);
+                return null;
+            };
+            buf = @ptrCast(grown);
+            cap *= 2;
+        }
+        const n = c.fread(buf + len, 1, cap - len, fp);
+        if (n == 0) break;
+        len += n;
+    }
+    if (c.cbm_pclose(fp) != 0) {
+        c.free(buf);
+        return null;
+    }
+    buf[len] = 0;
+    length.* = len;
+    return @ptrCast(buf);
 }
 
 fn pathIsAbsolute(path: []const u8) bool {

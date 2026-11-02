@@ -543,6 +543,7 @@ const native_sources = [_][]const u8{
     "src/foundation/dump_verify.c",
     "src/foundation/limits.c",
     "src/foundation/subprocess.c",
+    "src/foundation/git_env.c",
     "src/foundation/sha256.c",
     "src/store/store.c",
     "src/zova/cbm_zova.c",

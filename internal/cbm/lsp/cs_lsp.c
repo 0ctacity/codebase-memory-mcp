@@ -42,6 +42,7 @@
 #include "cs_lsp.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
+#include "../cbm.h" // cbm_parse_source
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3001,8 +3002,9 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         TSParser *parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_c_sharp());
-        tree = ts_parser_parse_string(parser, NULL, source,
-                                       source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source));
+        tree = cbm_parse_source(parser, source,
+                                source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source),
+                                (TSParseOptions){0});
         ts_parser_delete(parser);
         owns = true;
     }
@@ -3039,8 +3041,9 @@ void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
         TSParser *parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_c_sharp());
-        tree = ts_parser_parse_string(parser, NULL, source,
-                                       source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source));
+        tree = cbm_parse_source(parser, source,
+                                source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source),
+                                (TSParseOptions){0});
         ts_parser_delete(parser);
         owns = true;
     }
