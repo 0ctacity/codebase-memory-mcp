@@ -9433,34 +9433,6 @@ TEST(pipeline_swift_http_call_makes_route_issue1892) {
     PASS();
 }
 
-/* Count only edges of `edge_type` between the exact named source/target nodes. */
-static int named_edge_count(cbm_store_t *s, const char *project, const char *edge_type,
-                            const char *source_name, const char *target_name) {
-    cbm_edge_t *edges = NULL;
-    int edge_count = 0;
-    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
-        return -1;
-    }
-
-    int matches = 0;
-    for (int i = 0; i < edge_count; i++) {
-        cbm_node_t source = {0};
-        cbm_node_t target = {0};
-        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
-        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
-        if (source_ok && target_ok && source.name && target.name &&
-            strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0) {
-            matches++;
-        }
-        cbm_node_free_fields(&source);
-        cbm_node_free_fields(&target);
-    }
-    if (edges) {
-        cbm_store_free_edges(edges, edge_count);
-    }
-    return matches;
-}
-
 /* #2235: an Orval-style generated client passes its URL inside a request
  * config object to a LOCAL helper -- `http({url: `/api/customers/${id}`,
  * method: 'GET'})`. The template literal itself already canonicalizes to
