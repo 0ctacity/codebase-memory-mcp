@@ -543,6 +543,20 @@ TEST(gbuf_duplicate_edge_ids_counts_reused_ids) {
     PASS();
 }
 
+TEST(gbuf_duplicate_node_ids_counts_reused_ids) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/");
+    int64_t next = cbm_gbuf_next_id(gb);
+    cbm_gbuf_upsert_node(gb, "Function", "a", "proj.a", "f.go", 1, 2, "{}");
+    cbm_gbuf_upsert_node(gb, "Function", "b", "proj.b", "f.go", 3, 4, "{}");
+    ASSERT_EQ(cbm_gbuf_duplicate_node_ids(gb), 0);
+    /* Lowering the counter hands the same id out again. */
+    cbm_gbuf_set_next_id(gb, next);
+    cbm_gbuf_upsert_node(gb, "Function", "c", "proj.c", "f.go", 5, 6, "{}");
+    ASSERT_EQ(cbm_gbuf_duplicate_node_ids(gb), 1);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* #50: edge ids in the main buffer stay unique through the parallel phases.
  * Merged worker nodes keep their shared ids, and merged edges take fresh ids
  * from the main counter after the highest of them, so the main counter can
@@ -648,6 +662,7 @@ static bool id_env_open(id_env_t *env) {
 
 static void id_env_close(id_env_t *env) {
     cbm_pipeline_set_id_sync_hook_for_tests(NULL, NULL);
+    cbm_pipeline_set_share_ids_hook_for_tests(NULL, NULL);
     cbm_pipeline_set_before_dump_hook_for_tests(NULL, NULL);
     id_env_restore("CBM_CACHE_DIR", env->saved_cache);
     id_env_restore("CBM_WORKERS", env->saved_workers);
@@ -719,6 +734,118 @@ TEST(parallel_incremental_keeps_edge_ids_unique) {
     ASSERT_EQ(syncs.syncs, 2);
     ASSERT_EQ(probe.dumps, 1);
     ASSERT_GT(probe.edges, ID_FILES);
+    ASSERT_EQ(probe.duplicates, 0);
+    PASS();
+}
+
+/* #88: node ids in the main buffer stay unique through parallel resolve.
+ * The registry build runs between extract and resolve and can create nodes on
+ * the main buffer (Channel) from the main counter; resolve workers then
+ * allocated from the older shared counter and their nodes (here the synthetic
+ * Decorator for an unresolved `@cacheN`) reused those ids. Whether the
+ * fixture's registry build makes any such node depends on channel detection,
+ * so the seam pins it: right before the raise the hook starts the shared
+ * counter where the main one is, then takes ID_SHARE_NODES node ids from the
+ * main buffer, more than the workers allocate. */
+enum { ID_SHARE_NODES = 4096 };
+
+static void id_share_hook(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids, void *ctx) {
+    int *shares = ctx;
+    (*shares)++;
+    atomic_store(shared_ids, cbm_gbuf_next_id(gb));
+    char name[64];
+    char qn[96];
+    for (int i = 0; i < ID_SHARE_NODES; i++) {
+        snprintf(name, sizeof(name), "id_share_probe_%d", i);
+        snprintf(qn, sizeof(qn), "__channel__test__%s", name);
+        cbm_gbuf_upsert_node(gb, "Channel", name, qn, "", 0, 0, "{\"transport\":\"test\"}");
+    }
+}
+
+typedef struct {
+    int dumps;
+    int decorators;
+    int duplicates;
+} node_id_probe_t;
+
+static void probe_node_ids(const cbm_gbuf_t *gb, void *ctx) {
+    node_id_probe_t *probe = ctx;
+    probe->dumps++;
+    const cbm_gbuf_node_t **decs = NULL;
+    if (cbm_gbuf_find_by_label(gb, "Decorator", &decs, &probe->decorators) != 0) {
+        probe->decorators = 0;
+    }
+    probe->duplicates = cbm_gbuf_duplicate_node_ids(gb);
+}
+
+/* `count` Python files, each with a function under an unresolved decorator.
+ * `bump` changes every file so a second run sees all files as changed, and
+ * renames the decorator: the incremental route loads the stored graph, so an
+ * unchanged name would find the stored Decorator instead of creating one. */
+static bool write_decorator_fixture(const char *repo, int count, int bump) {
+    char path[512];
+    char source[256];
+    for (int i = 0; i < count; i++) {
+        snprintf(path, sizeof(path), "%s/m%02d.py", repo, i);
+        snprintf(source, sizeof(source), "@cache%d\ndef f%02d():\n    return %d\n", bump, i,
+                 1 + bump);
+        if (th_write_file(path, source) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+TEST(parallel_full_index_keeps_node_ids_unique) {
+    id_env_t env;
+    ASSERT_TRUE(id_env_open(&env));
+    if (!write_decorator_fixture(env.repo, ID_FILES, 0)) {
+        id_env_close(&env);
+        FAIL("failed to write the node-id fixture");
+    }
+    int shares = 0;
+    node_id_probe_t probe = {0};
+    cbm_pipeline_set_share_ids_hook_for_tests(id_share_hook, &shares);
+    cbm_pipeline_set_before_dump_hook_for_tests(probe_node_ids, &probe);
+    cbm_pipeline_route_t route = CBM_PIPELINE_ROUTE_UNKNOWN;
+    int rc = id_run_pipeline(env.repo, &route);
+    id_env_close(&env);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(route, CBM_PIPELINE_ROUTE_FULL);
+    ASSERT_EQ(shares, 1);
+    ASSERT_EQ(probe.dumps, 1);
+    ASSERT_GT(probe.decorators, 0);
+    ASSERT_EQ(probe.duplicates, 0);
+    PASS();
+}
+
+TEST(parallel_incremental_keeps_node_ids_unique) {
+    id_env_t env;
+    ASSERT_TRUE(id_env_open(&env));
+    if (!write_decorator_fixture(env.repo, ID_FILES, 0)) {
+        id_env_close(&env);
+        FAIL("failed to write the node-id fixture");
+    }
+    int first_rc = id_run_pipeline(env.repo, NULL);
+    /* Every file changes, more than MIN_FILES_FOR_PARALLEL_INCR (50): the
+     * parallel incremental route. */
+    bool rewritten = write_decorator_fixture(env.repo, ID_FILES, 1);
+    int shares = 0;
+    node_id_probe_t probe = {0};
+    cbm_pipeline_set_share_ids_hook_for_tests(id_share_hook, &shares);
+    cbm_pipeline_set_before_dump_hook_for_tests(probe_node_ids, &probe);
+    cbm_pipeline_route_t route = CBM_PIPELINE_ROUTE_UNKNOWN;
+    int second_rc = id_run_pipeline(env.repo, &route);
+    id_env_close(&env);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(rewritten);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_EQ(route, CBM_PIPELINE_ROUTE_INCREMENTAL);
+    ASSERT_EQ(shares, 1);
+    ASSERT_EQ(probe.dumps, 1);
+    ASSERT_GT(probe.decorators, 0);
     ASSERT_EQ(probe.duplicates, 0);
     PASS();
 }
@@ -1487,8 +1614,11 @@ SUITE(parallel) {
     RUN_TEST(gbuf_next_id_accessors);
     RUN_TEST(gbuf_raise_next_id_never_lowers);
     RUN_TEST(gbuf_duplicate_edge_ids_counts_reused_ids);
+    RUN_TEST(gbuf_duplicate_node_ids_counts_reused_ids);
     RUN_TEST(parallel_full_index_keeps_edge_ids_unique);
     RUN_TEST(parallel_incremental_keeps_edge_ids_unique);
+    RUN_TEST(parallel_full_index_keeps_node_ids_unique);
+    RUN_TEST(parallel_incremental_keeps_node_ids_unique);
 
     /* Parallel pipeline parity tests */
     RUN_TEST(parallel_node_count);

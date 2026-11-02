@@ -425,6 +425,30 @@ void cbm_pipeline_sync_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids) {
     cbm_gbuf_raise_next_id(gb, atomic_load(shared_ids));
 }
 
+/* ── Shared id counter raise before parallel resolve (#88) ───────── */
+
+static CBM_TLS void (*g_share_ids_hook)(cbm_gbuf_t *, _Atomic int64_t *, void *);
+static CBM_TLS void *g_share_ids_hook_ctx;
+
+void cbm_pipeline_set_share_ids_hook_for_tests(void (*hook)(cbm_gbuf_t *, _Atomic int64_t *,
+                                                            void *),
+                                               void *ctx) {
+    g_share_ids_hook = hook;
+    g_share_ids_hook_ctx = ctx;
+}
+
+void cbm_pipeline_share_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids) {
+    if (g_share_ids_hook) {
+        g_share_ids_hook(gb, shared_ids, g_share_ids_hook_ctx);
+    }
+    /* No worker runs here, so a plain load and store is enough. Raise only:
+     * the shared counter may already be above the main one. */
+    int64_t main_next = cbm_gbuf_next_id(gb);
+    if (main_next > atomic_load(shared_ids)) {
+        atomic_store(shared_ids, main_next);
+    }
+}
+
 bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p) {
     return p && p->format_migration;
 }
@@ -1099,6 +1123,8 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
+    /* Resolve workers must not reuse ids of nodes the registry build made. */
+    cbm_pipeline_share_next_id(p->gbuf, &shared_ids);
     /* Cross-file LSP precondition: build a project-wide CBMLSPDef[]
      * once. The fused resolve_worker invokes cbm_pxc_run_one(_ts) per
      * file using these defs + the file's IMPORTS map, so cross-file

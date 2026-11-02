@@ -714,6 +714,17 @@ static int gbuf_id_cmp(const void *a, const void *b) {
     return (x > y) - (x < y);
 }
 
+/* Sorts ids, counts each id an earlier entry already carries, frees ids. */
+static int count_duplicate_ids(int64_t *ids, int n) {
+    qsort(ids, (size_t)n, sizeof(*ids), gbuf_id_cmp);
+    int dups = 0;
+    for (int i = 1; i < n; i++) {
+        dups += ids[i] == ids[i - SKIP_ONE];
+    }
+    free(ids);
+    return dups;
+}
+
 int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
     if (!gb || gb->edges.count < 2) {
         return 0;
@@ -726,13 +737,22 @@ int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb) {
     for (int i = 0; i < n; i++) {
         ids[i] = gb->edges.items[i]->id;
     }
-    qsort(ids, (size_t)n, sizeof(*ids), gbuf_id_cmp);
-    int dups = 0;
-    for (int i = 1; i < n; i++) {
-        dups += ids[i] == ids[i - SKIP_ONE];
+    return count_duplicate_ids(ids, n);
+}
+
+int cbm_gbuf_duplicate_node_ids(const cbm_gbuf_t *gb) {
+    if (!gb || gb->nodes.count < 2) {
+        return 0;
     }
-    free(ids);
-    return dups;
+    int n = gb->nodes.count;
+    int64_t *ids = calloc((size_t)n, sizeof(*ids));
+    if (!ids) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < n; i++) {
+        ids[i] = gb->nodes.items[i]->id;
+    }
+    return count_duplicate_ids(ids, n);
 }
 
 /* ── Node operations ─────────────────────────────────────────────── */
