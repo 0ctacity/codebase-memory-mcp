@@ -73,13 +73,25 @@ a path wins. For directories:
 2. **Repo `.gitignore`** — `<repo>/.gitignore` merged with
    `<git-common-dir>/info/exclude` (worktree-aware); later patterns win on
    conflict. Honored even when the indexed directory is not a git repo root.
+   When the indexed directory is a subfolder of a repository (no `.git` of
+   its own), the enclosing repository's `info/exclude` and the `.gitignore`
+   of every directory from its root down to the indexed directory apply too,
+   each anchored to its own directory.
 3. **Nested `.gitignore` files** — picked up during the walk and matched
-   relative to their own directory.
+   relative to their own directory. Every `.gitignore` on a path applies;
+   as in git, the deepest file that matches a path decides, so a deeper
+   `!pattern` re-includes what a shallower file ignores.
 4. **`.cbmignore`** — a positive match skips the path; a negated match can
    only rescue paths from layer 5.
 5. **Git global excludes** — `core.excludesFile` from `~/.gitconfig` or the
    XDG git config (default `$XDG_CONFIG_HOME/git/ignore`); consulted only
-   when the project is a git repo with a config.
+   when the project is in a git repo with a config.
+
+As in git, layers 2, 3 and 5 apply to untracked paths only: a file that
+`git ls-files` lists is indexed even when one of them matches it or a
+directory above it. Untracked files inside such a directory stay ignored.
+Without a repository, or when `git` cannot run, the layers apply to every
+path.
 
 For files, built-in suffix filters (`.png`, `.o`, `.db`, …; fast modes add
 archives, media, lockfiles, `.min.js`, …) and fast-mode filename/substring

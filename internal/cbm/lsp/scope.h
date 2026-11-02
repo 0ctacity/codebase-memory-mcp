@@ -18,10 +18,28 @@ typedef struct CBMScopeChunk {
     struct CBMScopeChunk* next;
 } CBMScopeChunk;
 
+/* Name index for one frame. A frame that outgrows one chunk (a module scope
+ * binding thousands of classes and functions) is looked up through an
+ * open-addressing table of binding pointers instead of a linear chunk scan;
+ * the scan made every identifier lookup O(frame size) and a whole file
+ * O(n^2). Bindings never move (chunks are arena-allocated and only
+ * prepended) and a name is bound at most once per frame (rebinding updates
+ * in place), so the table maps each name to exactly the binding the linear
+ * scan would have found. The table is an accelerator only: when it cannot be
+ * allocated or grown the frame drops it and every lookup falls back to the
+ * scan, which is always correct. */
+typedef struct {
+    CBMVarBinding **slots; // arena-owned; NULL = empty
+    int cap;               // power of two, or 0 = no index (linear scan)
+    int count;
+} CBMScopeIndex;
+
 typedef struct CBMScope {
     struct CBMScope* parent;
     CBMScopeChunk* chunks;
     CBMArena* arena;        // owning arena, propagated to children at push time
+    int binding_count;      // bindings recorded in THIS frame
+    CBMScopeIndex index;    // built once binding_count exceeds one chunk
 } CBMScope;
 
 // Bail-to-UNKNOWN depth for type-lookup chains: alias resolution, MRO walks,
@@ -57,6 +75,9 @@ CBMScope* cbm_scope_push(CBMArena* a, CBMScope* current);
 CBMScope* cbm_scope_pop(CBMScope* scope);
 void cbm_scope_bind(CBMScope* scope, const char* name, const CBMType* type);
 const CBMType* cbm_scope_lookup(const CBMScope* scope, const char* name);
+// The binding of name in THIS frame only (no parent walk), or NULL. Hashed once
+// the frame outgrows one chunk.
+const CBMVarBinding* cbm_scope_lookup_local(const CBMScope* scope, const char* name);
 // True when `name` is bound in `scope` or an enclosing scope other than the
 // outermost (module) scope, whatever its type: a local or parameter that
 // shadows a module-level symbol of the same name.

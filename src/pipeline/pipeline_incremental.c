@@ -22,6 +22,8 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "zova/cbm_zova_repository.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
+#include "arena.h"
+#include "helpers.h" /* cbm_fqn_module, cbm_fqn_folder */
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
@@ -390,6 +392,7 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count) {
  * Folder must exist before a directory-based Module definition arrives, or
  * the Module wins the shared qualified-name slot and the graph diverges. */
 static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *project,
+                                            const cbm_stem_marks_t *marks,
                                             const cbm_file_info_t *file) {
     if (!gbuf || !project || !file || !file->rel_path) {
         return;
@@ -426,10 +429,16 @@ static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *projec
     } else {
         dir[0] = '\0';
     }
-    char *file_parent_qn = dir[0] ? cbm_pipeline_fqn_folder(project, dir) : NULL;
+    char file_parent_buf[CBM_SZ_8K];
+    const char *file_parent_qn =
+        dir[0] ? cbm_stem_marks_folder_qn(marks, project, dir, file_parent_buf,
+                                          sizeof(file_parent_buf))
+               : NULL;
 
     for (char *walk = dir; walk[0];) {
-        char *folder_qn = cbm_pipeline_fqn_folder(project, walk);
+        char folder_buf[CBM_SZ_8K];
+        const char *folder_qn =
+            cbm_stem_marks_folder_qn(marks, project, walk, folder_buf, sizeof(folder_buf));
         if (!folder_qn) {
             break;
         }
@@ -439,7 +448,6 @@ static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *projec
 
         char *parent_dir = strdup(walk);
         if (!parent_dir) {
-            free(folder_qn);
             break;
         }
         char *parent_slash = strrchr(parent_dir, '/');
@@ -448,16 +456,17 @@ static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *projec
         } else {
             parent_dir[0] = '\0';
         }
-        char *parent_qn_heap = parent_dir[0] ? cbm_pipeline_fqn_folder(project, parent_dir) : NULL;
-        const char *parent_qn = parent_qn_heap ? parent_qn_heap : branch_qn;
+        char parent_buf[CBM_SZ_8K];
+        const char *parent_qn = parent_dir[0]
+                                    ? cbm_stem_marks_folder_qn(marks, project, parent_dir,
+                                                               parent_buf, sizeof(parent_buf))
+                                    : branch_qn;
         const cbm_gbuf_node_t *folder = cbm_gbuf_find_by_qn(gbuf, folder_qn);
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(gbuf, parent_qn);
         if (folder && parent) {
             cbm_gbuf_insert_edge(gbuf, parent->id, folder->id, "CONTAINS_FOLDER", "{}");
         }
-        free(parent_qn_heap);
         free(parent_dir);
-        free(folder_qn);
 
         char *up = strrchr(walk, '/');
         if (up) {
@@ -473,9 +482,115 @@ static void incr_add_changed_file_structure(cbm_gbuf_t *gbuf, const char *projec
     if (file_node && parent) {
         cbm_gbuf_insert_edge(gbuf, parent->id, file_node->id, "CONTAINS_FILE", "{}");
     }
-    free(file_parent_qn);
     free(dir);
     free(file_qn);
+}
+
+/* True when the stem QN or a directory QN of rel yields on a different side
+ * (CBM_STEM_*) in the two file sets. */
+static bool incr_stem_side_differs(const cbm_stem_marks_t *now, const cbm_stem_marks_t *before,
+                                   CBMArena *a, const char *project, const char *rel) {
+    char *stem = cbm_fqn_module(a, project, rel);
+    if (stem && cbm_stem_marks_side(now, stem) != cbm_stem_marks_side(before, stem)) {
+        return true;
+    }
+    for (const char *s = strchr(rel, '/'); s; s = strchr(s + SKIP_ONE, '/')) {
+        char *dir = cbm_arena_strndup(a, rel, (size_t)(s - rel));
+        char *fqn = dir ? cbm_fqn_folder(a, project, dir) : NULL;
+        if (fqn && cbm_stem_marks_side(now, fqn) != cbm_stem_marks_side(before, fqn)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The file set of the stored generation: the discovered files it already
+ * held, plus the deleted ones, which take the language their name gives.
+ * Counts the discovered files it did not hold in *added. */
+static cbm_file_info_t *incr_previous_files(const cbm_file_info_t *files, int file_count,
+                                            CBMHashTable *stored_paths, char **deleted,
+                                            int deleted_count, int *out_count, int *added) {
+    cbm_file_info_t *before =
+        calloc((size_t)file_count + (size_t)deleted_count + SKIP_ONE, sizeof(*before));
+    int n = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (files[i].rel_path && cbm_ht_get(stored_paths, files[i].rel_path)) {
+            if (before) {
+                before[n++] = files[i];
+            }
+        } else {
+            (*added)++;
+        }
+    }
+    for (int i = 0; before && i < deleted_count; i++) {
+        const char *base = strrchr(deleted[i], '/');
+        before[n++] = (cbm_file_info_t){
+            .rel_path = deleted[i],
+            .language = cbm_language_for_filename(base ? base + SKIP_ONE : deleted[i]),
+        };
+    }
+    *out_count = n;
+    return before;
+}
+
+/* Whether an added or deleted file yields on a different side of a stem
+ * collision in `now` than in `prev`. */
+static bool incr_stem_sides_moved(const char *project, const cbm_file_info_t *files, int file_count,
+                                  CBMHashTable *stored_paths, const cbm_stem_marks_t *now,
+                                  const cbm_stem_marks_t *prev, char **deleted, int deleted_count) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    bool moved = false;
+    for (int i = 0; !moved && i < file_count; i++) {
+        if (files[i].rel_path && !cbm_ht_get(stored_paths, files[i].rel_path)) {
+            moved = incr_stem_side_differs(now, prev, &a, project, files[i].rel_path);
+        }
+    }
+    for (int i = 0; !moved && i < deleted_count; i++) {
+        moved = incr_stem_side_differs(now, prev, &a, project, deleted[i]);
+    }
+    cbm_arena_destroy(&a);
+    return moved;
+}
+
+/* Whether the added and deleted files change a stem collision
+ * (cbm_stem_marks_t): one appears or disappears, or the yielding side flips
+ * because a Java/Go package gains its first or loses its last file. The
+ * unchanged files keep the spelling of the stored generation, so only a full
+ * index re-spells them. `now` holds the discovered files; the previous set is
+ * the stored paths, where a deleted file takes the language its name gives.
+ * A changed file can only move the sides of its own stem QN and of the
+ * directories above it, so only those are compared. */
+static bool incr_stem_marks_changed(const char *project, const cbm_file_info_t *files,
+                                    int file_count, const cbm_stem_marks_t *now,
+                                    cbm_file_hash_t *stored, int stored_count, char **deleted,
+                                    int deleted_count) {
+    CBMHashTable *stored_paths =
+        cbm_ht_create(stored_count > 0 ? (size_t)stored_count * PAIR_LEN : CBM_SZ_64);
+    for (int i = 0; i < stored_count; i++) {
+        if (stored[i].rel_path) {
+            cbm_ht_set(stored_paths, stored[i].rel_path, &stored[i]);
+        }
+    }
+    int before_count = 0;
+    int added = 0;
+    cbm_file_info_t *before = incr_previous_files(files, file_count, stored_paths, deleted,
+                                                  deleted_count, &before_count, &added);
+    bool changed = false;
+    if (added > 0 || deleted_count > 0) {
+        /* Without the previous set the comparison cannot be made: rebuild. */
+        changed = true;
+        if (before) {
+            cbm_stem_marks_t prev;
+            cbm_stem_marks_init(&prev, project, before, before_count);
+            changed = incr_stem_sides_moved(project, files, file_count, stored_paths, now, &prev,
+                                            deleted, deleted_count);
+            cbm_stem_marks_free(&prev);
+        }
+    }
+    free(before);
+    cbm_ht_free(stored_paths);
+    return changed;
 }
 
 /* ── Inbound cross-file edge preservation (incremental correctness) ──
@@ -1176,6 +1291,25 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         return 0;
     }
 
+    /* Module and Folder spellings follow the stem collisions of the whole
+     * discovered set, as in a full run. */
+    cbm_stem_marks_t stem_marks;
+    cbm_stem_marks_init(&stem_marks, project, files, file_count);
+    if (incr_stem_marks_changed(project, files, file_count, &stem_marks, stored, stored_count,
+                                deleted, deleted_count)) {
+        cbm_log_info("incremental.declined", "reason", "stem_collision_changed");
+        cbm_stem_marks_free(&stem_marks);
+        free(is_changed);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_gbuf_free(existing);
+        return CBM_PIPELINE_INCREMENTAL_DECLINED;
+    }
+
     cbm_store_free_file_hashes(stored, stored_count);
 
     /* Build list of changed files */
@@ -1292,13 +1426,16 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
+        .stem_marks = &stem_marks,
     };
 
     for (int i = 0; i < ci; i++) {
-        incr_add_changed_file_structure(existing, project, &changed_files[i]);
+        incr_add_changed_file_structure(existing, project, &stem_marks, &changed_files[i]);
     }
 
     int extract_rc = run_extract_resolve(&ctx, changed_files, ci);
+    ctx.stem_marks = NULL;
+    cbm_stem_marks_free(&stem_marks);
     if (extract_rc != 0) {
         incr_free_edge_capture(&edge_cap);
         free_string_hash_table(http_client_files);

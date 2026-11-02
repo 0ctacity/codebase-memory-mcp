@@ -50,6 +50,41 @@ static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *nod
            (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
 }
 
+/* A file and the directory beside it share a stem (`pkg/foo.sh` beside
+ * `pkg/foo/`): the file's Module QN equals the directory's Folder QN, and the
+ * graph buffer keeps only the Folder. One side yields:
+ * - the Folder, spelled `proj.pkg.foo/` (cbm_stem_marks_folder_qn);
+ * - but a Java/Go package directory keeps its plain QN -- it IS their module,
+ *   and their imports resolve to it -- so there the file's Module yields,
+ *   spelled `proj.pkg.foo#sh` (cbm_stem_marks_module_qn).
+ * Symbol QNs never change. Built from the discovered files once per run,
+ * read-only while extraction workers consult it. */
+typedef struct {
+    CBMArena arena;               /* owns the QN keys of all three tables */
+    CBMHashTable *module_qns;     /* Module QNs of files outside Java/Go */
+    CBMHashTable *dir_module_qns; /* Module QNs of Java/Go files: their package dirs */
+    CBMHashTable *folder_qns;     /* plain Folder QNs of every directory holding a file */
+} cbm_stem_marks_t;
+
+/* Which side of a stem collision yields (cbm_stem_marks_side). */
+enum { CBM_STEM_NONE = 0, CBM_STEM_FOLDER_YIELDS = 1, CBM_STEM_MODULE_YIELDS = 2 };
+
+void cbm_stem_marks_init(cbm_stem_marks_t *m, const char *project, const cbm_file_info_t *files,
+                         int file_count);
+void cbm_stem_marks_free(cbm_stem_marks_t *m);
+/* rel_dir's Folder QN, marked when it must yield, written into buf; NULL
+ * when it does not fit. */
+const char *cbm_stem_marks_folder_qn(const cbm_stem_marks_t *m, const char *project,
+                                     const char *rel_dir, char *buf, size_t buf_size);
+/* The QN a file's Module definition takes: `qn#ext` when it must yield,
+ * written into buf; qn itself otherwise (and when m is NULL). */
+const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
+                                     const char *rel_path, CBMLanguage lang, char *buf,
+                                     size_t buf_size);
+/* CBM_STEM_* for a plain QN: whether a Folder and a Module share it in this
+ * file set, and which of them yields. */
+int cbm_stem_marks_side(const cbm_stem_marks_t *m, const char *qn);
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL
@@ -113,6 +148,10 @@ typedef struct {
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
     int excluded_count;
+
+    /* Stem collisions of the discovered files: which Module definitions take
+     * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
+    const cbm_stem_marks_t *stem_marks;
 
     /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
      * shared per-language registries here; resolved_calls entries may BORROW
@@ -533,6 +572,12 @@ void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *
                                                  void *ctx);
 void cbm_pipeline_run_before_dump_hook(const cbm_gbuf_t *gb);
 
+/* Test seam: the sequential CALLS pass's args formatter (pass_calls.c), so a
+ * test can hand it an argument longer than its formatting buffer and read the
+ * props it leaves behind. `props` is a NUL-terminated JSON object of `cap`
+ * bytes; the formatter appends its "args" array in place. */
+void cbm_pipeline_calls_append_args_for_tests(char *props, size_t cap, const CBMCall *call);
+
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */
@@ -709,7 +754,10 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 
 /* Run incremental re-index against the committed cbm.zova generation.
  * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, publishes a delta generation. Returns 0 on success. */
+ * files, publishes a delta generation. Returns 0 on success, or
+ * CBM_PIPELINE_INCREMENTAL_DECLINED before any change when only a full index
+ * gives the right graph (the caller then runs one). */
+enum { CBM_PIPELINE_INCREMENTAL_DECLINED = -6 };
 int cbm_pipeline_run_incremental_zova(cbm_pipeline_t *p, const char *zova_path,
                                       cbm_file_info_t *files, int file_count,
                                       cbm_zova_workspace_snapshot_t *snapshot,

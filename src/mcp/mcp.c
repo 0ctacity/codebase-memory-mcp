@@ -7464,7 +7464,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
              root_path, base_branch, root_path, root_path);
 #endif
 
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (!fp) {
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg),
@@ -8074,7 +8074,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     }
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_popen_git(cmd);
     if (fp) {
         char line[CBM_SZ_64];
         if (fgets(line, sizeof(line), fp)) {

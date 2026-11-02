@@ -14,6 +14,7 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 #include "../src/store/store.h"
 #include "../src/zova/cbm_zova.h"
 #include "../src/zova/cbm_zova_route.h"
@@ -332,6 +333,21 @@ done:
     free(edges);
     cbm_project_free_fields(&row);
     return rc;
+}
+
+/* ── Inherited git repository environment (#56) ─────────────── */
+
+/* Git exports repository-local variables into hooks (GIT_DIR, GIT_INDEX_FILE,
+ * ...), and they take precedence over `git -C <dir>`. A test runner started
+ * from a hook, or any shell with GIT_DIR set, would point every fixture's git
+ * command at the caller's real repository: commits, branches and worktrees get
+ * created there and fixture assertions fail. Runners clear the list once at
+ * startup so every spawned git, and every re-executed child, scopes to its
+ * fixture. */
+static inline void th_clear_git_repo_env(void) {
+    for (size_t i = 0U; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        (void)cbm_unsetenv(cbm_git_repo_env_vars[i]);
+    }
 }
 
 #endif /* TEST_HELPERS_H */

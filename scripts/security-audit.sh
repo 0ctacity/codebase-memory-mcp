@@ -31,7 +31,7 @@ echo "--- Scanning for dangerous function calls ---"
 
 # For each file:function pair on the allow-list, the file is allowed to contain
 # that function. Any file:function NOT on the list causes failure.
-FUNC_LIST="system popen cbm_popen execl fork"
+FUNC_LIST="system popen cbm_popen cbm_popen_git execl fork"
 
 while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
@@ -41,6 +41,7 @@ while IFS= read -r file; do
         # 'popen(' must NOT match 'cbm_popen(' — use [^a-z] negative class
         case "$func" in
             cbm_popen) pattern="cbm_popen(" ;;
+            cbm_popen_git) pattern="cbm_popen_git(" ;;
             popen)     pattern="[^a-z]popen(" ;;
             system)    pattern="[^a-z_]system(" ;;
             fork)      pattern="[^a-z_]fork(" ;;
@@ -196,7 +197,7 @@ while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
 
     # Extract line numbers of dangerous calls
-    DANGER_LINES=$(grep -n 'system(\|popen(\|cbm_popen(\|connect(\|execl(' "$file" 2>/dev/null \
+    DANGER_LINES=$(grep -n 'system(\|popen(\|cbm_popen(\|cbm_popen_git(\|connect(\|execl(' "$file" 2>/dev/null \
         | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v '#define' \
         | cut -d: -f1 || true)
 

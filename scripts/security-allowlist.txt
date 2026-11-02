@@ -7,6 +7,7 @@
 # ── Foundation: platform abstraction (defines cbm_popen wrapper + shell-free exec) ──
 src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
 src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
+src/foundation/compat_fs.c:cbm_popen_git:cbm_popen_git function definition (git children with the repository-local git environment removed)
 src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
 src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang-isolating index worker (supervisor primitive; child execs immediately, no code runs in the forked image)
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
@@ -17,23 +18,20 @@ src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
-src/watcher/watcher.zig:cbm_popen:git rev-parse/status/submodule/ls-files polling (popenGit)
-src/watcher/watcher.zig:popen:via cbm_popen wrapper call
+src/watcher/watcher.zig:cbm_popen_git:git rev-parse/status/submodule/ls-files polling (popenGit)
 
 # ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──
-src/git/git_context.zig:cbm_popen:git rev-parse/symbolic-ref/merge-base metadata lookup
-src/git/git_context.zig:popen:via cbm_popen wrapper call
+src/git/git_context.zig:cbm_popen_git:git rev-parse/symbolic-ref/merge-base metadata lookup and ls-files
 
 # ── MCP server: search and change detection ────────────────────────────────
 src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)
-src/mcp/mcp.c:cbm_popen:detect_changes via git diff (args validated)
-src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validated)
+src/mcp/mcp.c:cbm_popen_git:detect_changes via git diff (args validated)
+src/mcp/mcp.c:cbm_popen_git:git ls-files count for auto-index (session_root validated)
 src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
 # ── Pipeline: git history parsing (git log) ────────────────────────────────
-src/pipeline/pass_githistory.c:cbm_popen:git log for file history (path validated)
-src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
+src/pipeline/pass_githistory.c:cbm_popen_git:git log for file history (path validated)
 
 # ── Allowed URLs ───────────────────────────────────────────────────────────
 # Format: URL:justification

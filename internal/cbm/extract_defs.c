@@ -3,16 +3,16 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
-#include "foundation/platform.h" // safe_realloc (frees old on failure)
 #include "foundation/hash_table.h"
-#include "foundation/log.h"      // cbm_log_warn
+#include "foundation/log.h" // cbm_log_error
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include <limits.h>          // INT_MAX
+#include <stdint.h>          // uint32_t, SIZE_MAX
 #include <stdio.h>           // snprintf
-#include <stdlib.h>          // getenv, atoi
+#include <stdlib.h>          // realloc/free -- walk_defs stack
 #include <string.h>
 #include <ctype.h>
 
@@ -82,10 +82,18 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
 }
 
 /* Walk AST body, collect unique identifier text as space-separated string.
- * Returns arena-allocated string or NULL. */
+ * Contract: the first BT_MAX_IDENTS unique identifiers in pre-order (source
+ * order), bounded by BT_BUF bytes. The ident/byte caps are the sampling
+ * contract; the pending stack is not. BT_STACK is only the on-stack first
+ * chunk and spills to the heap, because a full fixed stack dropped a wide
+ * body's first children and sampled a mid-body window instead.
+ * Returns arena-allocated string, or NULL when there are no identifiers or the
+ * stack could not be grown (logged; no truncated sample is ever returned). */
 static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
     enum { BT_STACK = 512, BT_BUF = 512, BT_MAX_IDENTS = 40, BT_SEEN = 128, BT_SEEN_MASK = 127 };
-    TSNode bt_stack[BT_STACK];
+    TSNode bt_inline[BT_STACK];
+    TSNode *bt_stack = bt_inline;
+    int bt_cap = BT_STACK;
     int bt_top = 0;
     bt_stack[bt_top++] = body;
     char bt_buf[BT_BUF];
@@ -109,11 +117,17 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
                 }
             }
         } else {
-            for (int i = (int)nc - SKIP_ONE; i >= 0 && bt_top < BT_STACK; i--) {
+            if (!cbm_walk_stack_reserve((void **)&bt_stack, &bt_cap, bt_top + (int)nc,
+                                        sizeof(TSNode), bt_inline, "body_ident_tokens")) {
+                bt_pos = 0; /* sentinel: no sample rather than a truncated one */
+                break;
+            }
+            for (int i = (int)nc - SKIP_ONE; i >= 0; i--) {
                 bt_stack[bt_top++] = ts_node_child(nd, (uint32_t)i);
             }
         }
     }
+    cbm_walk_stack_release(bt_stack, bt_inline);
     if (bt_pos > 0) {
         bt_buf[bt_pos] = '\0';
         return cbm_arena_strdup(ctx->arena, bt_buf);
@@ -6363,58 +6377,60 @@ typedef struct {
  * single ~160 KB C-stack frame. That overflowed small thread stacks (the
  * pre-2026-03 Windows 1 MB main thread) on the definitions pass, and its
  * `top < 4096` push guards SILENTLY DROPPED every top-level definition past
- * 4096. Use a growable heap stack instead: a tiny initial footprint that doubles
- * on demand, bounded by a generous, env-configurable ceiling that WARNs (once)
- * rather than dropping — so a file with thousands of top-level defs is fully
- * extracted, and a pathological one degrades to a warned, bounded skip instead
- * of an OOM or a stack overflow. */
+ * 4096. It became a growable stack bounded by an 8M-frame ceiling
+ * (env CBM_WALK_DEFS_MAX) that still stopped pushing once reached, and since
+ * children are pushed last-to-first, a file wider than the ceiling lost its
+ * first definitions. No work cap may decide graph content, so there is no
+ * ceiling: the stack doubles on demand, and only an allocation failure stops
+ * it growing. That failure is logged at error level and reported as a
+ * per-file extract error (result->has_error), never a silent partial file. */
 typedef struct {
     walk_defs_frame_t *data;
     int top;
     int cap;
-    const char *path; // for the WARN when the ceiling is hit (may be NULL)
-    bool warned;
+    const char *path; // for the error log on allocation failure (may be NULL)
+    bool failed;      // growth failed: further pushes are refused
 } wd_stack_t;
 
-// Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
-// Realistic files never approach this; it only bounds a pathological/adversarial
-// file so extraction degrades to a warned skip rather than unbounded memory.
-static int wd_stack_max(void) {
-    const char *e = getenv("CBM_WALK_DEFS_MAX");
-    if (e) {
-        int v = atoi(e);
-        if (v > 0) {
-            return v;
-        }
+enum { WD_STACK_INITIAL = 256, WD_STACK_GROWTH = 2 };
+
+/* Double `s` (or give it its first WD_STACK_INITIAL frames). Returns false,
+ * after logging, when the doubled size is not representable or cannot be
+ * allocated; the old buffer is left intact, so the frames already pending are
+ * still walked and released. */
+static bool wd_grow(wd_stack_t *s) {
+    walk_defs_frame_t *nd = NULL;
+    int ncap = WD_STACK_INITIAL;
+    bool fits = true;
+    if (s->cap > 0) {
+        fits = s->cap <= INT_MAX / WD_STACK_GROWTH;
+        ncap = fits ? s->cap * WD_STACK_GROWTH : s->cap;
     }
-    return 8 * 1024 * 1024; // 8M frames (~320 MB) default
+    fits = fits && (size_t)ncap <= SIZE_MAX / sizeof(walk_defs_frame_t);
+    if (fits && cbm_walk_alloc_allowed()) {
+        nd = realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+    }
+    if (!nd) {
+        char pending[CBM_SZ_32];
+        (void)snprintf(pending, sizeof(pending), "%d", s->top);
+        cbm_log_error("extract.walk_stack_alloc_failed", "walker", "walk_defs", "pending", pending,
+                      "path", s->path ? s->path : "");
+        return false;
+    }
+    s->data = nd;
+    s->cap = ncap;
+    return true;
 }
 
 static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
-    if (s->top >= s->cap) {
-        int ncap = s->cap ? s->cap * 2 : 256;
-        if (ncap > wd_stack_max()) {
-            if (!s->warned) {
-                char lim[24];
-                snprintf(lim, sizeof(lim), "%d", wd_stack_max());
-                cbm_log_warn("extract.walk_defs_capped", "limit", lim, "path",
-                             s->path ? s->path : "");
-                s->warned = true;
-            }
-            return; // bounded: stop growing (warned, not silent)
-        }
-        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
-        if (!nd) {
-            /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
-             * pending frames so the walk_defs loop drains and exits without a NULL
-             * deref; extraction keeps whatever was already emitted. */
-            s->data = NULL;
-            s->cap = 0;
-            s->top = 0;
-            return;
-        }
-        s->data = nd;
-        s->cap = ncap;
+    if (s->failed) {
+        return;
+    }
+    if (s->top >= s->cap && !wd_grow(s)) {
+        /* Refuse this and every later push; the frames already pending are
+         * still walked, and walk_defs marks the file as an extract error. */
+        s->failed = true;
+        return;
     }
     s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
 }
@@ -7407,6 +7423,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
     free(s.data);
+    if (s.failed) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg =
+            cbm_arena_strdup(ctx->arena, "definitions walk: stack allocation failed");
+    }
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

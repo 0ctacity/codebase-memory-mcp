@@ -208,10 +208,15 @@ typedef struct {
                    * "parse timeout", "read failed"). For the partial phases
                    * this is the 1-based line-range list ("12-40,88-90"). */
     char *phase;  /* "read" | "extract" | "oversized" | "crash" | "hang" |
-                   * "parse_partial" | "parse_unusable". Neither is a skip: the
-                   * file was indexed but has unrecovered parse-error regions
+                   * "parse_partial" | "parse_unusable" | "lsp_incomplete".
+                   * The partial phases are not skips: the file was indexed
+                   * but has unrecovered parse-error regions
                    * ("parse_unusable": one range covers most of the file); the
-                   * MCP layer reports them apart from skipped[]. "cross_lsp" is a RESERVED
+                   * MCP layer reports them apart from skipped[].
+                   * "lsp_incomplete": the file was indexed, but its
+                   * cross-file C/C++ or Python walk hit the depth or memo
+                   * limit and kept only the calls resolved before it; it is
+                   * listed with the skips. "cross_lsp" is a RESERVED
                    * phase string for Track C's crash-attribution signal and is
                    * intentionally NOT emitted today (the cross-LSP passes are
                    * best-effort/void with no genuine per-file failure). */
@@ -255,8 +260,12 @@ void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **ou
  *     macro-prefixed functions are nodes; a bodyless `struct X` is no node.
  * 3 = Zig node identities: declarations inside a named container are
  *     `<container>.<name>` (methods, nested structs/enums/unions, and alias
- *     Variables such as `pub const Db = impl.Database;`). */
-#define CBM_INDEX_FORMAT_VERSION_STR "3"
+ *     Variables such as `pub const Db = impl.Database;`).
+ * 4 = A file and the directory beside it with one stem (`pkg/foo.sh`,
+ *     `pkg/foo/`) no longer share a QN (cbm_stem_marks_t): the Folder is
+ *     `proj.pkg.foo/`, or, where the directory is a Java/Go package, the
+ *     file's Module is `proj.pkg.foo#sh`. */
+#define CBM_INDEX_FORMAT_VERSION_STR "4"
 
 /* Runs share no process-global state, so several may run in one process.
  * Same-workspace exclusion is the workspace lease
