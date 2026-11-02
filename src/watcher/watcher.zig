@@ -168,7 +168,7 @@ fn trimLineEnd(buf: []u8) []u8 {
 
 fn popenGit(cmd: *[CMD_MAX]u8, comptime fmt: []const u8, args: anytype) ?*c.FILE {
     const cmd_z = std.mem.printSentinel(cmd, fmt, args, 0) catch return null;
-    return c.cbm_popen(cmd_z.ptr, "r");
+    return c.cbm_popen_git(cmd_z.ptr);
 }
 
 // ── Adaptive interval ──────────────────────────────────────────────

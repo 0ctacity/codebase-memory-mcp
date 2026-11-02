@@ -408,6 +408,18 @@ typedef struct {
     int cap;
 } CBMResolvedCallArray;
 
+/* Outcome of a type-aware resolver (LSP) walk. The failures stop the walk,
+ * which then drops its own output; output produced before it is kept. */
+typedef enum {
+    CBM_LSP_COMPLETE = 0,
+    CBM_LSP_MEMO_FAILED,
+    CBM_LSP_DEPTH_EXCEEDED,
+} CBMLSPStatus;
+
+// Walk kinds for the cbm_*_lsp_test_fail_walks test hooks: the per-file walks
+// run during extraction, and the cross-file walks run by the pipeline.
+enum { CBM_LSP_TEST_FILE_WALKS = 1, CBM_LSP_TEST_CROSS_WALKS = 2 };
+
 // Growable arrays used during extraction.
 typedef struct {
     CBMDefinition *items;
@@ -640,6 +652,13 @@ const char *cbm_index_quarantine_phase(const char *rel_path);
 // is attributed to the RIGHT file instead of a stale extraction marker.
 void cbm_index_mark_start(const char *rel_path);
 void cbm_index_mark_done(const char *rel_path);
+
+// Parse `source` as if its last line ended with "\n" (#53). The virtual newline
+// is edited back out of the returned tree, so every node range covers only the
+// real `source_len` bytes. Empty sources and sources already ending in "\n"
+// parse unchanged. Returns NULL when the parse fails or times out.
+TSTree *cbm_parse_source(TSParser *parser, const char *source, uint32_t source_len,
+                         TSParseOptions opts);
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.

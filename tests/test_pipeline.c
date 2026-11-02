@@ -10,6 +10,8 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
 #include "git/git_context.h"
@@ -22,6 +24,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if !defined(_WIN32)
+#include <sys/wait.h> /* fork/waitpid: isolate a copy that runs past a local buffer */
+#endif
 #include "graph_buffer/graph_buffer.h"
 #include "zova/cbm_zova.h"
 #include "zova/cbm_zova_route.h"
@@ -2768,6 +2773,138 @@ static void teardown_usages_repo(void) {
     if (g_usages_tmpdir[0])
         rm_rf(g_usages_tmpdir);
     g_usages_tmpdir[0] = '\0';
+}
+
+/* #54: a C/C++ or Python LSP walk that stops on its depth or memo limit is
+ * reported on the pipeline's per-file error list, by both drivers. A failed
+ * per-file walk surfaces through extraction (phase "extract"); a failed
+ * cross-file walk as phase "lsp_incomplete". The failure is forced with the
+ * process-wide test hook so that it also reaches the parallel workers. */
+static int pipeline_lsp_failure_case(bool parallel, bool cross, bool python, bool depth) {
+    const char *src = python ? "class S:\n    def m(self):\n        return 1\n"
+                               "def run():\n    s = S()\n    s.m()\n"
+                             : "struct S { int m() { return 1; } };\n"
+                               "void run() { S s; s.m(); }\n";
+    const char *filename = python ? "walk.py" : "walk.cpp";
+    const char *extra_name = NULL;
+    const char *extra_src = NULL;
+    /* The cross walk needs a call the per-file walk cannot resolve. */
+    if (cross) {
+        src = python ? "from walk_def import S\ndef run():\n    s = S()\n    s.m()\n"
+                     : "void run() { S s; s.m(); }\n";
+        extra_name = python ? "walk_def.py" : "walk_def.cpp";
+        extra_src = python ? "class S:\n    def m(self):\n        return 1\n"
+                           : "struct S { int m() { return 1; } };\n";
+    }
+    if (setup_usages_repo(filename, src, extra_name, extra_src) != 0)
+        FAIL("failed to create LSP failure fixture");
+    char path[512];
+    if (parallel) {
+        /* The parallel driver runs above MIN_FILES_FOR_PARALLEL files. */
+        for (int i = 0; i < 51; i++) {
+            snprintf(path, sizeof(path), "%s/walk_pad_%02d.%s", g_usages_tmpdir, i,
+                     python ? "py" : "cpp");
+            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
+                                           : "// inert parallel routing fixture\n") != 0) {
+                teardown_usages_repo();
+                FAIL("failed to create parallel routing fixture");
+            }
+        }
+    }
+    const char *old = getenv("CBM_WORKERS");
+    char *saved = old ? strdup(old) : NULL;
+    if (old && !saved) {
+        teardown_usages_repo();
+        FAIL("failed to save CBM_WORKERS");
+    }
+    int set_rc = cbm_setenv("CBM_WORKERS", parallel ? "4" : "1", 1);
+    CBMLSPStatus status = depth ? CBM_LSP_DEPTH_EXCEEDED : CBM_LSP_MEMO_FAILED;
+    int kinds = cross ? CBM_LSP_TEST_CROSS_WALKS : CBM_LSP_TEST_FILE_WALKS;
+    if (python)
+        cbm_py_lsp_test_fail_walks(status, kinds);
+    else
+        cbm_c_lsp_test_fail_walks(status, kinds);
+    snprintf(path, sizeof(path), "%s/walk.db", g_usages_tmpdir);
+    cbm_pipeline_t *p = set_rc == 0 ? cbm_pipeline_new(g_usages_tmpdir, path, CBM_MODE_FULL) : NULL;
+    int run_rc = p ? cbm_pipeline_run(p) : -1;
+    cbm_py_lsp_test_fail_walks(CBM_LSP_COMPLETE, 0);
+    cbm_c_lsp_test_fail_walks(CBM_LSP_COMPLETE, 0);
+    cbm_file_error_t *errors = NULL;
+    int error_count = 0;
+    if (p)
+        cbm_pipeline_get_file_errors(p, &errors, &error_count);
+    const char *expected_reason = depth ? (python ? CBM_PY_LSP_DEPTH_ERROR : CBM_C_LSP_DEPTH_ERROR)
+                                        : (python ? CBM_PY_LSP_MEMO_ERROR : CBM_C_LSP_MEMO_ERROR);
+    const char *expected_phase = cross ? "lsp_incomplete" : "extract";
+    int walk_errors = 0;
+    bool precise = true;
+    for (int i = 0; i < error_count; i++) {
+        if (errors[i].path && strcmp(errors[i].path, filename) == 0) {
+            walk_errors++;
+            precise = precise && errors[i].phase && strcmp(errors[i].phase, expected_phase) == 0 &&
+                      errors[i].reason && strcmp(errors[i].reason, expected_reason) == 0;
+        }
+    }
+    if (p)
+        cbm_pipeline_free(p);
+    int restore_rc = saved ? cbm_setenv("CBM_WORKERS", saved, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved);
+    teardown_usages_repo();
+    ASSERT_EQ(set_rc, 0);
+    ASSERT_EQ(restore_rc, 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(walk_errors, 1);
+    ASSERT_TRUE(precise);
+    PASS();
+}
+
+TEST(pipeline_issue54_c_file_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, false, false);
+}
+TEST(pipeline_issue54_c_file_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, false, false);
+}
+TEST(pipeline_issue54_c_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, false, false);
+}
+TEST(pipeline_issue54_c_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, false, false);
+}
+TEST(pipeline_issue54_c_file_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, false, true);
+}
+TEST(pipeline_issue54_c_file_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, false, true);
+}
+TEST(pipeline_issue54_c_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, false, true);
+}
+TEST(pipeline_issue54_c_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, false, true);
+}
+TEST(pipeline_issue54_python_file_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, true, false);
+}
+TEST(pipeline_issue54_python_file_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, true, false);
+}
+TEST(pipeline_issue54_python_cross_memo_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, true, false);
+}
+TEST(pipeline_issue54_python_cross_memo_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, true, false);
+}
+TEST(pipeline_issue54_python_file_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, false, true, true);
+}
+TEST(pipeline_issue54_python_file_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, false, true, true);
+}
+TEST(pipeline_issue54_python_cross_depth_failure_sequential) {
+    return pipeline_lsp_failure_case(false, true, true, true);
+}
+TEST(pipeline_issue54_python_cross_depth_failure_parallel) {
+    return pipeline_lsp_failure_case(true, true, true, true);
 }
 
 TEST(usages_creates_edges) {
@@ -7859,6 +7996,266 @@ TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full) {
 }
 
 #if CBM_WITH_ZOVA
+/* Re-index g_incr_tmpdir over its existing graph and require `route`, then
+ * compare with a fresh full index. 0 when both hold. */
+static int stem_reindex_matches_full(const char *project, cbm_pipeline_route_t route) {
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, NULL, CBM_MODE_FULL);
+    if (!p || cbm_pipeline_run(p) != 0 || cbm_pipeline_get_last_route(p) != route) {
+        printf("    route %d, want %d\n", p ? (int)cbm_pipeline_get_last_route(p) : -1, (int)route);
+        cbm_pipeline_free(p);
+        return -1;
+    }
+    cbm_pipeline_free(p);
+    pipeline_zova_project_info_t after;
+    pipeline_zova_project_info_t full;
+    if (pipeline_zova_project_info(project, &after) != 0 ||
+        pipeline_zova_fresh_full_info(project, &full) != 0) {
+        return -2;
+    }
+    return pipeline_zova_project_info_equal(&after, &full) ? 0 : 1;
+}
+
+/* 1 when the node `<project>.<suffix>` has this label and file path. */
+static int stem_incr_node(const char *project, const char *suffix, const char *label,
+                          const char *file_path) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, suffix);
+    bool exists = false;
+    return pipeline_zova_trace_node_exists(project, label, file_path, qn, &exists) == 0 && exists;
+}
+#endif
+
+/* Which side of a stem collision yields depends on the whole file set, so an
+ * incremental run that adds or deletes a file on either side must fall back to
+ * a full index (#51). Edits that keep the file set must stay incremental, and
+ * every result must equal a fresh full index. */
+TEST(pipeline_incremental_stem_collision_matches_fresh_full) {
+#if !CBM_WITH_ZOVA
+    PASS();
+#else
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    const char *dir = g_incr_tmpdir;
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    th_write_file(TH_PATH(dir, "genproto/one.sh"), "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    th_write_file(TH_PATH(dir, "goapi/api.sh"), "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    th_write_file(TH_PATH(dir, "goapi/api/server.go"), "package api\n\nfunc Serve() {}\n");
+    th_write_file(TH_PATH(dir, "goapi/api/run.sh"), "#!/bin/sh\nrun() {\n  echo run\n}\n");
+    th_write_file(TH_PATH(dir, "misc/other.sh"), "#!/bin/sh\nother() {\n  echo other\n}\n");
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(dir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(initial);
+    ASSERT_TRUE(stem_incr_node(project, "genproto/", "Folder", "genproto"));
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api#sh", "Module", "goapi/api.sh"));
+
+    /* Same file set: incremental, same spelling as a full index. */
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all2\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto", "Module", "genproto.sh"));
+    ASSERT_EQ(remove(TH_PATH(dir, "misc/other.sh")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+
+    /* Deleting or re-adding the file side flips the Folder's spelling. */
+    ASSERT_EQ(remove(TH_PATH(dir, "genproto.sh")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto", "Folder", "genproto"));
+    th_write_file(TH_PATH(dir, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "genproto/", "Folder", "genproto"));
+
+    /* The directory stops being a Go package: the Module takes the plain QN
+     * back and the Folder yields instead. */
+    ASSERT_EQ(remove(TH_PATH(dir, "goapi/api/server.go")), 0);
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_FULL), 0);
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api", "Module", "goapi/api.sh"));
+    ASSERT_TRUE(stem_incr_node(project, "goapi.api/", "Folder", "goapi/api"));
+
+    /* A new file inside an already-marked directory changes no side. */
+    th_write_file(TH_PATH(dir, "genproto/two.sh"), "#!/bin/sh\ngen_two() {\n  echo two\n}\n");
+    ASSERT_EQ(stem_reindex_matches_full(project, CBM_PIPELINE_ROUTE_INCREMENTAL), 0);
+
+    free(project);
+    cleanup_incremental_repo();
+    PASS();
+#endif
+}
+
+/* 1 when the node `<project>.<suffix>` exists with this label and, when
+ * file_path is set, this file path. */
+static int stem_node(cbm_store_t *s, const char *project, const char *suffix, const char *label,
+                     const char *file_path) {
+    char qn[512];
+    snprintf(qn, sizeof(qn), "%s.%s", project, suffix);
+    cbm_node_t node = {0};
+    int found = cbm_store_find_node_by_qn(s, project, qn, &node) == CBM_STORE_OK &&
+                strcmp(node.label, label) == 0 &&
+                (!file_path || (node.file_path && strcmp(node.file_path, file_path) == 0));
+    cbm_node_free_fields(&node);
+    return found;
+}
+
+/* Edges of `type` into the node with QN `target` whose source has this label
+ * and file path. */
+static int stem_edges_into(cbm_store_t *s, const char *project, const char *type,
+                           const char *target, const char *src_label, const char *src_file) {
+    cbm_node_t node = {0};
+    int n = 0;
+    if (cbm_store_find_node_by_qn(s, project, target, &node) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int count = 0;
+        cbm_store_find_edges_by_target_type(s, node.id, type, &edges, &count);
+        for (int i = 0; i < count; i++) {
+            cbm_node_t src = {0};
+            if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+                strcmp(src.label, src_label) == 0 && src.file_path &&
+                strcmp(src.file_path, src_file) == 0) {
+                n++;
+            }
+            cbm_node_free_fields(&src);
+        }
+        cbm_store_free_edges(edges, count);
+    }
+    cbm_node_free_fields(&node);
+    return n;
+}
+
+/* Folder nodes whose QN is also a Module node's QN. */
+static int stem_shared_qns(cbm_store_t *s, const char *project) {
+    cbm_node_t *folders = NULL;
+    cbm_node_t *modules = NULL;
+    int nf = 0;
+    int nm = 0;
+    cbm_store_find_nodes_by_label(s, project, "Folder", &folders, &nf);
+    cbm_store_find_nodes_by_label(s, project, "Module", &modules, &nm);
+    int shared = 0;
+    for (int f = 0; f < nf; f++) {
+        for (int m = 0; m < nm; m++) {
+            shared += strcmp(folders[f].qualified_name, modules[m].qualified_name) == 0;
+        }
+    }
+    cbm_store_free_nodes(folders, nf);
+    cbm_store_free_nodes(modules, nm);
+    return shared;
+}
+
+/* Every collision shape of cbm_stem_marks_t, plus `fillers` plain scripts. */
+static void stem_repo(const char *tmp, int fillers) {
+    th_write_file(TH_PATH(tmp, "genproto.sh"), "#!/bin/sh\ngen_all() {\n  echo all\n}\n");
+    th_write_file(TH_PATH(tmp, "genproto/one.sh"), "#!/bin/sh\ngen_one() {\n  echo one\n}\n");
+    th_write_file(TH_PATH(tmp, "rs/foo.rs"), "pub mod bar;\npub fn top() {}\n");
+    th_write_file(TH_PATH(tmp, "rs/foo/bar.rs"), "pub fn inner() {}\n");
+    th_write_file(TH_PATH(tmp, "c/foo.h"), "int foo_add(int a, int b);\n");
+    th_write_file(TH_PATH(tmp, "c/foo.c"),
+                  "#include \"foo.h\"\nint foo_add(int a, int b) { return a + b; }\n");
+    th_write_file(TH_PATH(tmp, "c/foo/x.c"), "int foo_x(void) { return 1; }\n");
+    th_write_file(TH_PATH(tmp, "go.mod"), "module example.com/stem\n\ngo 1.21\n");
+    th_write_file(TH_PATH(tmp, "goapi/api.sh"), "#!/bin/sh\nrun_api() {\n  echo api\n}\n");
+    th_write_file(TH_PATH(tmp, "goapi/api/server.go"), "package api\n\nfunc Serve() {}\n");
+    th_write_file(TH_PATH(tmp, "goapi/main/main.go"),
+                  "package main\n\nimport \"example.com/stem/goapi/api\"\n\n"
+                  "func main() { api.Serve() }\n");
+    for (int i = 0; i < fillers; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "fill/f%02d.sh", i);
+        snprintf(body, sizeof(body), "#!/bin/sh\nfill_%02d() {\n  echo %d\n}\n", i, i);
+        th_write_file(TH_PATH(tmp, name), body);
+    }
+}
+
+/* A file and the directory beside it with one stem (genproto.sh, genproto/)
+ * shared a QN, and the graph buffer kept only the Folder: the file's Module
+ * was lost (#51). Now one side yields (cbm_stem_marks_t). The Folder is
+ * spelled `genproto/` -- unless the directory is a Go package: it IS that
+ * package's module and Go imports land on it, so the file's Module yields as
+ * `goapi.api#sh`. Rust's foo.rs beside foo/ keeps its symbol QNs, and C's
+ * foo.h/foo.c stem pair still shares one Module. Run small (sequential
+ * extraction) and past MIN_FILES_FOR_PARALLEL (parallel workers), which
+ * insert Modules on separate paths. */
+static int check_stem_collision(int fillers) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_stem_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    stem_repo(tmp, fillers);
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    if (fillers > 0) {
+        cbm_setenv("CBM_WORKERS", "4", 1);
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, NULL, CBM_MODE_FULL);
+    int rc = p ? cbm_pipeline_run(p) : -1;
+    const char *project = p ? cbm_pipeline_project_name(p) : NULL;
+    cbm_store_t *s = rc == 0 ? th_open_repo_store(tmp) : NULL;
+    enum { STEM_CHECKS = 15 };
+    int got[STEM_CHECKS] = {0};
+    int shared = -1;
+    if (s) {
+        char qn[512];
+        got[0] = stem_node(s, project, "genproto", "Module", "genproto.sh");
+        got[1] = stem_node(s, project, "genproto/", "Folder", "genproto");
+        char *one_qn = cbm_pipeline_fqn_compute(project, "genproto/one.sh", "__file__");
+        got[2] =
+            one_qn ? stem_edges_into(s, project, "CONTAINS_FILE", one_qn, "Folder", "genproto") : 0;
+        free(one_qn);
+        snprintf(qn, sizeof(qn), "%s.genproto", project);
+        got[3] = stem_edges_into(s, project, "DEFINES", qn, "File", "genproto.sh");
+        got[4] = stem_node(s, project, "genproto.gen_all", "Function", "genproto.sh");
+        got[5] = stem_node(s, project, "rs.foo", "Module", "rs/foo.rs");
+        got[6] = stem_node(s, project, "rs.foo.top", "Function", "rs/foo.rs");
+        got[7] = stem_node(s, project, "rs.foo.bar", "Module", "rs/foo/bar.rs");
+        got[8] = stem_node(s, project, "rs.foo/", "Folder", "rs/foo");
+        got[9] = stem_node(s, project, "c.foo", "Module", NULL);
+        got[10] = stem_node(s, project, "c.foo/", "Folder", "c/foo");
+        got[11] = stem_node(s, project, "goapi.api", "Folder", "goapi/api");
+        got[12] = stem_node(s, project, "goapi.api#sh", "Module", "goapi/api.sh");
+        snprintf(qn, sizeof(qn), "%s.goapi.api#sh", project);
+        got[13] = stem_edges_into(s, project, "DEFINES", qn, "File", "goapi/api.sh");
+        snprintf(qn, sizeof(qn), "%s.goapi.api", project);
+        got[14] = stem_edges_into(s, project, "IMPORTS", qn, "File", "goapi/main/main.go") > 0;
+        shared = stem_shared_qns(s, project);
+        cbm_store_close(s);
+    }
+    if (p) {
+        cbm_pipeline_free(p);
+    }
+    if (fillers > 0) {
+        if (saved) {
+            cbm_setenv("CBM_WORKERS", saved, 1);
+        } else {
+            cbm_unsetenv("CBM_WORKERS");
+        }
+    }
+    free(saved);
+    th_rmtree(tmp);
+    printf("    fillers=%d checks:", fillers);
+    for (int c = 0; c < STEM_CHECKS; c++) {
+        printf(" %d", got[c]);
+    }
+    printf(" shared=%d\n", shared);
+    ASSERT_EQ(rc, 0);
+    for (int c = 0; c < STEM_CHECKS; c++) {
+        ASSERT_EQ(got[c], 1);
+    }
+    ASSERT_EQ(shared, 0);
+    PASS();
+}
+
+TEST(pipeline_stem_folder_collision_keeps_both_nodes) {
+    int rc = check_stem_collision(0);
+    if (rc != 0) {
+        return rc;
+    }
+    return check_stem_collision(60);
+}
+
+#if CBM_WITH_ZOVA
 /* Index g_incr_tmpdir fully, apply `edit`, re-index on the incremental route,
  * and compare the result with a fresh full index of the edited tree. */
 static int pipeline_incremental_edit_matches_full(void (*edit)(void), char **out_project) {
@@ -10924,7 +11321,98 @@ TEST(pipeline_cpp_overloads_are_listed_as_variants_c1) {
     PASS();
 }
 
+/* ── calls_append_args: an argument longer than its formatting buffer (#52) ──
+ *
+ * The sequential CALLS pass formats each argument into a 512-byte local before
+ * copying it into the props buffer (calls_append_args, pass_calls.c). snprintf
+ * reports the untruncated length, so an argument the local cannot hold must end
+ * the array exactly like one the props buffer cannot take; copying that length
+ * out of the local reads past it and plants the local's terminator inside the
+ * props text. Two 250-byte strings make the formatted argument about 520
+ * bytes, and the props buffer is large enough to take it, so only the local's
+ * own bound can stop the copy. 0 when the props came out right, 1 otherwise. */
+static int calls_args_overlong_probe(void) {
+    enum { CAP = 4 * CBM_SZ_1K, LONG_LEN = 250, SENTINEL = 0x7f };
+    static char expr[LONG_LEN + 1];
+    static char value[LONG_LEN + 1];
+    static char props[CAP];
+    memset(expr, 'a', LONG_LEN);
+    expr[LONG_LEN] = '\0';
+    memset(value, 'b', LONG_LEN);
+    value[LONG_LEN] = '\0';
+    CBMCall call = {0};
+    call.callee_name = "sink";
+    call.args[0] = (CBMCallArg){"x", NULL, NULL, 0};
+    call.args[1] = (CBMCallArg){expr, value, NULL, 1};
+    call.arg_count = 2;
+
+    const char *base = "{\"line\":7}";
+    memset(props, SENTINEL, CAP); /* a byte the formatter never writes */
+    memcpy(props, base, strlen(base) + 1);
+    cbm_pipeline_calls_append_args_for_tests(props, CAP, &call);
+
+    /* The short argument is kept; the overlong one ends the array cleanly. */
+    const char *expected = "{\"line\":7,\"args\":[{\"i\":0,\"e\":\"x\"}]}";
+    size_t expected_len = strlen(expected);
+    if (strncmp(props, expected, expected_len + 1) != 0) {
+        printf("    props: %.80s\n    expected: %s\n", props, expected);
+        return 1;
+    }
+    for (size_t i = expected_len + 1; i < CAP; i++) {
+        if ((unsigned char)props[i] != SENTINEL) {
+            printf("    byte %zu past the terminator was written\n", i);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(pipeline_calls_args_overlong_argument_stops_cleanly) {
+#if defined(_WIN32)
+    ASSERT_EQ(calls_args_overlong_probe(), 0);
+#else
+    /* A forked child, so a copy that runs past the local surfaces as the
+     * child's killing signal (the sanitizer build aborts on it) rather than
+     * taking the runner down. */
+    fflush(NULL);
+    pid_t pid = fork();
+    ASSERT_TRUE(pid >= 0);
+    if (pid == 0) {
+        int rc = calls_args_overlong_probe();
+        fflush(NULL);
+        _exit(rc);
+    }
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFSIGNALED(status)) {
+        char m[96];
+        snprintf(m, sizeof(m), "formatter killed by signal %d: a copy ran past its local buffer",
+                 WTERMSIG(status));
+        FAIL(m);
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+#endif
+    PASS();
+}
+
 SUITE(pipeline) {
+    RUN_TEST(pipeline_issue54_c_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_memo_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_depth_failure_parallel);
+    RUN_TEST(pipeline_issue54_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_depth_failure_parallel);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_null_repo);
@@ -10947,6 +11435,7 @@ SUITE(pipeline) {
     /* File persistence */
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_stem_folder_collision_keeps_both_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
@@ -11162,6 +11651,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_single_file_preserves_and_removes_exact_project_summary);
     RUN_TEST(pipeline_incremental_delete_direct_zova_matches_fresh_full);
     RUN_TEST(pipeline_incremental_rename_direct_zova_matches_fresh_full);
+    RUN_TEST(pipeline_incremental_stem_collision_matches_fresh_full);
     RUN_TEST(pipeline_incremental_infra_route_change_matches_fresh_full);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
@@ -11244,4 +11734,5 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_c_enum_inside_struct_reference_resolves_c1);
     RUN_TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1);
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
+    RUN_TEST(pipeline_calls_args_overlong_argument_stops_cleanly);
 }
