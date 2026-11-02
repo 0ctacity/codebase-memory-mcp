@@ -1412,7 +1412,7 @@ TEST(handles_laravel_psr4_absent_class_incremental_issue1146) {
     th_remove_project_workspace(lp.project);
 
     /* Initial full index */
-    cbm_pipeline_t *p = cbm_pipeline_new(lp.tmpdir, NULL, lp.project);
+    cbm_pipeline_t *p = cbm_pipeline_new(lp.tmpdir, NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
@@ -1433,7 +1433,7 @@ TEST(handles_laravel_psr4_absent_class_incremental_issue1146) {
     fclose(fp);
 
     /* Second run takes sequential incremental path */
-    p = cbm_pipeline_new(lp.tmpdir, NULL, lp.project);
+    p = cbm_pipeline_new(lp.tmpdir, NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
