@@ -1,6 +1,7 @@
 #include "go_lsp.h"
 #include "lsp_node_iter.h"
 #include "../helpers.h"
+#include "../cbm.h" // cbm_parse_source
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2604,7 +2605,7 @@ void cbm_run_go_lsp_cross(
         parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return; }
     }
@@ -2942,7 +2943,7 @@ void cbm_run_go_lsp_cross_with_registry(
         parser = ts_parser_new();
         if (!parser) return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) { ts_parser_delete(parser); return; }
     }

@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 #include "../src/foundation/subprocess.h"
 
 #include <stdlib.h>
@@ -547,6 +548,88 @@ TEST(subprocess_deleted_self_spawn_path_follows_platform_ruling) {
 #endif
 }
 
+/* ── Git child environment (#56) ──────────────────────────────────────────────
+ * cbm_popen_git drops every variable of `git rev-parse --local-env-vars` from
+ * the child only: the parent keeps its environment, other variables pass
+ * through, and cbm_pclose reports the raw wait status like pclose(). The test
+ * sets the variables itself (the runner clears them at startup) and restores
+ * them before asserting. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} gitenv_snapshot_t;
+
+static void gitenv_enter(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+}
+
+static void gitenv_leave(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+    }
+    unsetenv("CBM_GITENV_KEEP");
+}
+
+/* exit 0: no repository-local git variable is set and CBM_GITENV_KEEP=kept;
+ * exit 3: a git variable leaked; exit 4: the unrelated variable was lost. */
+static void gitenv_probe_script(char *buf, size_t cap) {
+    size_t n = (size_t)snprintf(buf, cap, "[ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    if (n < cap) {
+        (void)snprintf(buf + n, cap - n, " exit 0");
+    }
+}
+#endif
+
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd), "echo probe; %s", script);
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    FILE *fp = cbm_popen_git(cmd);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *inherited = cbm_popen(script, "r");
+    int inherited_status = inherited ? cbm_pclose(inherited) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0); /* git vars gone, CBM_GITENV_KEEP passed */
+    ASSERT_TRUE(inherited_status >= 0 && WIFEXITED(inherited_status));
+    ASSERT_EQ(WEXITSTATUS(inherited_status), 3); /* cbm_popen still inherits */
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(parent_kept);               /* the parent environment is unchanged */
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -569,4 +652,5 @@ SUITE(subprocess) {
     RUN_TEST(win_cmdline_overflow_leaves_empty_string);
     RUN_TEST(subprocess_resolves_bare_binary_path_from_path);
     RUN_TEST(subprocess_deleted_self_spawn_path_follows_platform_ruling);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
 }

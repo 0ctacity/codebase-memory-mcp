@@ -27,6 +27,7 @@ int tf_skip_count = 0;
 
 #include "test_framework.h"
 #include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
+#include "test_helpers.h"      /* th_clear_git_repo_env */
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
@@ -117,6 +118,8 @@ int main(void) {
      * supervisor gate already ignores unmarked hosts; pin the kill switch too.
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    /* #56: fixture git commands must never reach the caller's repository. */
+    th_clear_git_repo_env();
 
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the

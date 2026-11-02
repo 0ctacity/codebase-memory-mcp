@@ -7,6 +7,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_fs_internal.h"
+#include "foundation/git_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,8 +192,10 @@ static wchar_t *cbm_resolve_comspec(void) {
 }
 
 /* On failure returns NULL with *stage naming the failing step and *gle the
- * GetLastError value captured at that step (0 when errno is the signal). */
-static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle) {
+ * GetLastError value captured at that step (0 when errno is the signal).
+ * env: a CREATE_UNICODE_ENVIRONMENT block for the child, or NULL to inherit. */
+static FILE *cbm_popen_isolated(const char *cmd, const wchar_t *env, const char **stage,
+                                DWORD *gle) {
     *stage = "";
     *gle = 0;
     InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
@@ -271,8 +274,12 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
         *stage = "cmdline";
         *gle = ERROR_NOT_ENOUGH_MEMORY;
     } else {
-        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                 NULL, NULL, &si.StartupInfo, &pi);
+        DWORD flags = EXTENDED_STARTUPINFO_PRESENT;
+        if (env) {
+            flags |= CREATE_UNICODE_ENVIRONMENT;
+        }
+        created = CreateProcessW(app, wcmdline, NULL, NULL, TRUE, flags, (LPVOID)env, NULL,
+                                 &si.StartupInfo, &pi);
         if (!created) {
             *stage = "spawn";
             *gle = GetLastError();
@@ -327,27 +334,44 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
     return NULL;
 }
 
+static FILE *cbm_popen_read_isolated(const char *cmd, const wchar_t *env) {
+    const char *stage = "";
+    DWORD gle = 0;
+    FILE *fp = cbm_popen_isolated(cmd, env, &stage, &gle);
+    g_popen_last_isolated = (fp != NULL);
+    if (!fp) {
+        char glebuf[CBM_SZ_16];
+        char errnobuf[CBM_SZ_16];
+        snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
+        snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
+        cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno",
+                     errnobuf);
+    }
+    return fp;
+}
+
 FILE *cbm_popen(const char *cmd, const char *mode) {
     /* Our git shell-outs are all read-mode; they MUST use the isolated
      * spawn. On failure, log and fail the call — never fall back to
      * _popen, whose full handle inheritance re-arms the UI hang (#798). */
     if (mode && mode[0] == 'r' && mode[1] == '\0') {
-        const char *stage = "";
-        DWORD gle = 0;
-        FILE *fp = cbm_popen_isolated(cmd, &stage, &gle);
-        g_popen_last_isolated = (fp != NULL);
-        if (!fp) {
-            char glebuf[CBM_SZ_16];
-            char errnobuf[CBM_SZ_16];
-            snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
-            snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
-            cbm_log_warn("compat.popen_isolated_failed", "stage", stage, "gle", glebuf, "errno",
-                         errnobuf);
-        }
-        return fp;
+        return cbm_popen_read_isolated(cmd, NULL);
     }
     g_popen_last_isolated = 0;
     return _popen(cmd, mode);
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    /* Fail closed: without the scrubbed block the child would inherit a
+     * caller's GIT_DIR and read the wrong repository (#56). */
+    wchar_t *env = cbm_git_child_env_block();
+    if (!env) {
+        cbm_log_warn("compat.popen_git_env_failed", "stage", "env_block");
+        return NULL;
+    }
+    FILE *fp = cbm_popen_read_isolated(cmd, env);
+    cbm_git_child_env_free(env); /* CreateProcessW copied the block into the child */
+    return fp;
 }
 
 int cbm_pclose(FILE *f) {
@@ -584,9 +608,12 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "foundation/compat_thread.h"
 
 struct cbm_dir {
     DIR *dir;
@@ -648,8 +675,126 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
     return popen(cmd, mode);
 }
 
+/* Streams opened by cbm_popen_git: popen() cannot take an environment, so
+ * those children are spawned here and reaped by cbm_pclose via this list. */
+typedef struct cbm_popen_git_entry {
+    FILE *fp;
+    pid_t pid;
+    struct cbm_popen_git_entry *next;
+} cbm_popen_git_entry_t;
+
+static cbm_popen_git_entry_t *g_popen_git_list = NULL;
+static cbm_mutex_t g_popen_git_lock;
+static cbm_once_t g_popen_git_once = CBM_ONCE_INIT;
+
+static void cbm_popen_git_lock_init(void) {
+    cbm_mutex_init(&g_popen_git_lock);
+}
+
+enum { POPEN_PIPE_READ = 0, POPEN_PIPE_WRITE = 1, POPEN_PIPE_ENDS = 2 };
+
+static bool cbm_fd_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+/* `/bin/sh -c cmd` with stdout on a pipe, stdin on /dev/null (never the MCP
+ * transport), stderr inherited like popen(), and `envp` as the environment. */
+static pid_t cbm_popen_spawn_sh(const char *cmd, char **envp, int *read_fd) {
+    int fds[POPEN_PIPE_ENDS];
+    if (pipe(fds) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    int rd = fds[POPEN_PIPE_READ];
+    int wr = fds[POPEN_PIPE_WRITE];
+    posix_spawn_file_actions_t actions;
+    if (!cbm_fd_set_cloexec(rd) || !cbm_fd_set_cloexec(wr) ||
+        posix_spawn_file_actions_init(&actions) != 0) {
+        (void)close(rd);
+        (void)close(wr);
+        return CBM_NOT_FOUND;
+    }
+    /* dup2 clears close-on-exec on the child's stdout; both pipe ends
+     * themselves stay close-on-exec, so no other child ever holds them. */
+    bool configured =
+        posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
+        posix_spawn_file_actions_adddup2(&actions, wr, STDOUT_FILENO) == 0;
+    char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
+    pid_t pid = CBM_NOT_FOUND;
+    int rc = configured ? posix_spawn(&pid, "/bin/sh", &actions, NULL, argv, envp) : CBM_NOT_FOUND;
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)close(wr);
+    if (rc != 0 || pid <= 0) {
+        (void)close(rd);
+        return CBM_NOT_FOUND;
+    }
+    *read_fd = rd;
+    return pid;
+}
+
+static int cbm_popen_git_wait(pid_t pid) {
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    return status;
+}
+
+FILE *cbm_popen_git(const char *cmd) {
+    if (!cmd) {
+        return NULL;
+    }
+    /* Fail closed: without the scrubbed environment the child would inherit
+     * a caller's GIT_DIR and read the wrong repository (#56). */
+    char **envp = cbm_git_child_envp();
+    if (!envp) {
+        return NULL;
+    }
+    int read_fd = CBM_NOT_FOUND;
+    pid_t pid = cbm_popen_spawn_sh(cmd, envp, &read_fd);
+    cbm_git_child_env_free(envp); /* posix_spawn copied it into the child */
+    if (pid < 0) {
+        return NULL;
+    }
+    cbm_popen_git_entry_t *entry = (cbm_popen_git_entry_t *)malloc(sizeof(*entry));
+    FILE *fp = entry ? fdopen(read_fd, "r") : NULL;
+    if (!fp) {
+        free(entry);
+        (void)close(read_fd);
+        (void)cbm_popen_git_wait(pid);
+        return NULL;
+    }
+    entry->fp = fp;
+    entry->pid = pid;
+    cbm_once(&g_popen_git_once, cbm_popen_git_lock_init);
+    cbm_mutex_lock(&g_popen_git_lock);
+    entry->next = g_popen_git_list;
+    g_popen_git_list = entry;
+    cbm_mutex_unlock(&g_popen_git_lock);
+    return fp;
+}
+
 int cbm_pclose(FILE *f) {
-    return pclose(f);
+    cbm_popen_git_entry_t *found = NULL;
+    cbm_once(&g_popen_git_once, cbm_popen_git_lock_init);
+    cbm_mutex_lock(&g_popen_git_lock);
+    for (cbm_popen_git_entry_t **link = &g_popen_git_list; *link; link = &(*link)->next) {
+        if ((*link)->fp == f) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    cbm_mutex_unlock(&g_popen_git_lock);
+    if (!found) {
+        return pclose(f); /* opened by popen() */
+    }
+    pid_t pid = found->pid;
+    free(found);
+    (void)fclose(f);
+    return cbm_popen_git_wait(pid); /* the raw wait status, as pclose() */
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {

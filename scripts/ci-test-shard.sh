@@ -72,4 +72,11 @@ case "$SHARD" in
 esac
 
 echo "CI TEST SHARD: $SHARD (${#suites[@]} suites)" >&2
-exec "$ROOT/scripts/zova-run-tests.sh" "${suites[@]}"
+"$ROOT/scripts/zova-run-tests.sh" "${suites[@]}"
+
+# The pipeline shard owns git_context: run it again with an inherited git
+# repository environment (#56).
+if [[ "$SHARD" == "pipeline" ]]; then
+  bash "$ROOT/tests/test_git_env_isolation_contract.sh" \
+    "${CBM_ZOVA_REAL_TEST_RUNNER:-$ROOT/build/c/test-runner}"
+fi
