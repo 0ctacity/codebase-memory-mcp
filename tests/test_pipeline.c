@@ -10947,8 +10947,8 @@ static int calls_args_overlong_probe(void) {
     value[LONG_LEN] = '\0';
     CBMCall call = {0};
     call.callee_name = "sink";
-    call.args[0] = (CBMCallArg){"x", NULL, NULL, 0};
-    call.args[1] = (CBMCallArg){expr, value, NULL, 1};
+    call.args[0] = (CBMCallArg){"x", NULL, NULL, 0, NULL};
+    call.args[1] = (CBMCallArg){expr, value, NULL, 1, NULL};
     call.arg_count = 2;
 
     const char *base = "{\"line\":7}";
