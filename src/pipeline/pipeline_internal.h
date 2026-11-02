@@ -622,6 +622,17 @@ void cbm_pipeline_set_before_dump_hook_for_tests(void (*hook)(const cbm_gbuf_t *
                                                  void *ctx);
 void cbm_pipeline_run_before_dump_hook(const cbm_gbuf_t *gb);
 
+/* Raise the shared worker counter to the main buffer's next id before
+ * parallel resolve. The registry build runs serially between extract and
+ * resolve and can create nodes on the main buffer from the main counter
+ * (Channel); resolve workers starting from the older shared value reused
+ * their ids. Raises only, never lowers (#88). */
+void cbm_pipeline_share_next_id(cbm_gbuf_t *gb, _Atomic int64_t *shared_ids);
+/* Test seam: runs right before each such raise. */
+void cbm_pipeline_set_share_ids_hook_for_tests(void (*hook)(cbm_gbuf_t *, _Atomic int64_t *,
+                                                            void *),
+                                               void *ctx);
+
 /* Test seam: the sequential CALLS pass's args formatter (pass_calls.c), so a
  * test can hand it an argument longer than its formatting buffer and read the
  * props it leaves behind. `props` is a NUL-terminated JSON object of `cap`

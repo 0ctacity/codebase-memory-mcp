@@ -119,6 +119,10 @@ void cbm_gbuf_raise_next_id(cbm_gbuf_t *gb, int64_t next_id);
  * CBM_NOT_FOUND on allocation failure). */
 int cbm_gbuf_duplicate_edge_ids(const cbm_gbuf_t *gb);
 
+/* Number of nodes whose id an earlier node already carries (0 = ids unique,
+ * CBM_NOT_FOUND on allocation failure). */
+int cbm_gbuf_duplicate_node_ids(const cbm_gbuf_t *gb);
+
 /* Delete all nodes with a label. Cascade-deletes referencing edges. */
 int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
 

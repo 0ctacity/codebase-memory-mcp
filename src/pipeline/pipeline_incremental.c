@@ -927,6 +927,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
 
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
             cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
+            cbm_pipeline_share_next_id(ctx->gbuf, &shared_ids);
             cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t)));
 
