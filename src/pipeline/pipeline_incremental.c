@@ -28,6 +28,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/platform.h"
 #include "foundation/sha256_backend.h"
 
@@ -742,6 +743,9 @@ static bool incr_keep_unless_source_in_set(const cbm_gbuf_t *gb, const cbm_gbuf_
                                            void *userdata) {
     (void)gb;
     const incr_id_set_t *set = userdata;
+    if (edge->properties_json && strstr(edge->properties_json, "\"env_access\"") != NULL) {
+        return true;
+    }
     return !bsearch(&edge->source_id, set->ids, (size_t)set->count, sizeof(*set->ids),
                     incr_cmp_id);
 }
@@ -1013,6 +1017,184 @@ static int incr_expand_infra_changes(const cbm_file_info_t *files, int file_coun
     return added;
 }
 
+typedef struct {
+    const CBMHashTable *changed_paths;
+    CBMHashTable *client_files;
+} incr_client_scan_ctx_t;
+
+static void incr_find_existing_client_nodes(const cbm_gbuf_node_t *n, void *userdata) {
+    incr_client_scan_ctx_t *ctx = (incr_client_scan_ctx_t *)userdata;
+    if (!n || !n->file_path || !n->label || !n->properties_json) {
+        return;
+    }
+    if (strcmp(n->label, "Module") != 0 && strcmp(n->label, "Variable") != 0) {
+        return;
+    }
+    if (!cbm_ht_get(ctx->changed_paths, n->file_path)) {
+        return;
+    }
+    if (strstr(n->properties_json, "\"http_client\":") != NULL) {
+        if (!cbm_ht_get(ctx->client_files, n->file_path)) {
+            char *k = strdup(n->file_path);
+            if (k) {
+                cbm_ht_set(ctx->client_files, k, k);
+            }
+        }
+    }
+}
+
+static bool incr_is_client_file(const cbm_file_info_t *fi) {
+    if (!fi || !fi->path) {
+        return false;
+    }
+    if (fi->language != CBM_LANG_JAVASCRIPT && fi->language != CBM_LANG_TYPESCRIPT &&
+        fi->language != CBM_LANG_TSX) {
+        return false;
+    }
+    FILE *f = cbm_fopen(fi->path, "rb");
+    if (!f) {
+        return false;
+    }
+    (void)fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    (void)fseek(f, 0, SEEK_SET);
+    if (size <= 0 || size > cbm_max_file_bytes()) {
+        (void)fclose(f);
+        return false;
+    }
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        (void)fclose(f);
+        return false;
+    }
+    size_t r = fread(buf, 1, (size_t)size, f);
+    (void)fclose(f);
+    buf[r] = '\0';
+
+    if (strstr(buf, "axios.create") == NULL) {
+        free(buf);
+        return false;
+    }
+
+    CBMFileResult *fr =
+        cbm_extract_file(buf, (int)r, fi->language, "incr_probe", fi->rel_path, 0, NULL, NULL);
+    free(buf);
+    bool has_client = false;
+    if (fr) {
+        for (int i = 0; i < fr->defs.count; i++) {
+            if (fr->defs.items[i].http_client != NULL) {
+                has_client = true;
+                break;
+            }
+        }
+        cbm_free_result(fr);
+    }
+    return has_client;
+}
+
+static void free_ht_keys_cb(const char *key, void *value, void *userdata) {
+    (void)value;
+    (void)userdata;
+    free((char *)key);
+}
+
+static void free_string_hash_table(CBMHashTable *ht) {
+    if (!ht) {
+        return;
+    }
+    cbm_ht_foreach(ht, free_ht_keys_cb, NULL);
+    cbm_ht_free(ht);
+}
+
+/* An axios client instance's baseURL is composed into the HTTP_CALLS edges of
+ * files that import it. When any file that defines an http_client changes or was
+ * deleted (before or after the edit), treat the files that import it as changed
+ * files so they go through full re-extraction. Returns files added. (#75, #1916) */
+static int incr_expand_client_importer_changes(const cbm_gbuf_t *existing,
+                                               const cbm_file_info_t *files, int file_count,
+                                               bool *is_changed, char *const *deleted,
+                                               int deleted_count) {
+    if (!existing || !files || file_count <= 0 || !is_changed) {
+        return 0;
+    }
+    CBMHashTable *changed_set = cbm_ht_create((uint32_t)(file_count + deleted_count));
+    if (!changed_set) {
+        return 0;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (is_changed[i]) {
+            cbm_ht_set(changed_set, files[i].rel_path, (void *)1);
+        }
+    }
+    for (int i = 0; i < deleted_count; i++) {
+        cbm_ht_set(changed_set, deleted[i], (void *)1);
+    }
+
+    CBMHashTable *client_files = cbm_ht_create(16);
+    if (!client_files) {
+        cbm_ht_free(changed_set);
+        return 0;
+    }
+
+    /* 1. Check existing graph for files that defined an http_client before the edit */
+    incr_client_scan_ctx_t scan_ctx = {
+        .changed_paths = changed_set,
+        .client_files = client_files,
+    };
+    cbm_gbuf_foreach_node(existing, incr_find_existing_client_nodes, &scan_ctx);
+
+    /* 2. Check changed files on disk to detect newly added client instances */
+    for (int i = 0; i < file_count; i++) {
+        if (!is_changed[i]) {
+            continue;
+        }
+        if (cbm_ht_get(client_files, files[i].rel_path)) {
+            continue;
+        }
+        if (incr_is_client_file(&files[i])) {
+            char *k = strdup(files[i].rel_path);
+            if (k) {
+                cbm_ht_set(client_files, k, k);
+            }
+        }
+    }
+    cbm_ht_free(changed_set);
+
+    if (cbm_ht_count(client_files) == 0) {
+        free_string_hash_table(client_files);
+        return 0;
+    }
+
+    /* 3. Find files in existing graph buffer that import any client file */
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int added = 0;
+    if (cbm_gbuf_find_edges_by_type(existing, "IMPORTS", &edges, &edge_count) == 0 && edges) {
+        for (int e = 0; e < edge_count; e++) {
+            const cbm_gbuf_edge_t *edge = edges[e];
+            const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_id(existing, edge->target_id);
+            if (!tgt || !tgt->file_path || !cbm_ht_get(client_files, tgt->file_path)) {
+                continue;
+            }
+            const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(existing, edge->source_id);
+            if (!src || !src->file_path) {
+                continue;
+            }
+            for (int f = 0; f < file_count; f++) {
+                if (strcmp(files[f].rel_path, src->file_path) == 0) {
+                    if (!is_changed[f]) {
+                        is_changed[f] = true;
+                        added++;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    free_string_hash_table(client_files);
+    return added;
+}
+
 /* HANDLES edges into infra Routes come only from route matching. */
 static bool incr_handles_edge_is_not_infra_match(const cbm_gbuf_t *gbuf,
                                                  const cbm_gbuf_edge_t *edge, void *userdata) {
@@ -1214,6 +1396,12 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
             incr_expand_infra_changes(files, file_count, is_changed, deleted, deleted_count);
         n_changed += infra_added;
         n_unchanged -= infra_added;
+
+        int client_added =
+            incr_expand_client_importer_changes(existing, files, file_count, is_changed, deleted,
+                                                deleted_count);
+        n_changed += client_added;
+        n_unchanged -= client_added;
     }
 
     cbm_log_info("incremental.classify", "changed", itoa_buf(n_changed), "unchanged",

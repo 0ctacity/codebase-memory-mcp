@@ -546,6 +546,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
+    append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -1477,6 +1479,44 @@ static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
     }
 }
 
+/* Create CONFIGURES edges for one file's env accesses. */
+static void create_env_configures(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
+                                  const char *rel) {
+    char *file_qn = NULL;
+    const cbm_gbuf_node_t *file_node = NULL;
+    for (int j = 0; j < result->env_accesses.count; j++) {
+        const CBMEnvAccess *ea = &result->env_accesses.items[j];
+        if (!ea->env_key || !ea->env_key[0]) {
+            continue;
+        }
+        char env_qn[CBM_SZ_512];
+        snprintf(env_qn, sizeof(env_qn), "__env__%s", ea->env_key);
+        char env_props[CBM_SZ_512];
+        snprintf(env_props, sizeof(env_props), "{\"env_key\":\"%s\"}", ea->env_key);
+        int64_t env_id =
+            cbm_gbuf_upsert_node(ctx->gbuf, "EnvVar", ea->env_key, env_qn, "", 0, 0, env_props);
+        if (env_id <= 0) {
+            continue;
+        }
+        const cbm_gbuf_node_t *src = NULL;
+        if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
+            src = cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+        }
+        if (!src) {
+            if (!file_qn) {
+                file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+                file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+            }
+            src = file_node;
+        }
+        if (src && src->id != env_id) {
+            cbm_gbuf_insert_edge(ctx->gbuf, src->id, env_id, "CONFIGURES",
+                                 "{\"strategy\":\"env_access\"}");
+        }
+    }
+    free(file_qn);
+}
+
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache) {
     cbm_log_info("parallel.registry.start", "files", itoa_log(file_count));
@@ -1520,6 +1560,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
+        create_env_configures(ctx, result, rel);
         cbm_result_cache_release(result_cache, i, result);
     }
 
@@ -2595,6 +2636,20 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
                                                  call->callee_is_locally_bound, res.strategy);
 
+        /* First: a call on an axios.create() instance (#1916) — decided by the
+         * receiver's binding, before the #523 spelling check and the
+         * route-registration suffix fallback. MUST match pass_calls.c. */
+        char client_url[CBM_SZ_512];
+        if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
+                                              imp_keys, imp_vals, imp_count, call, client_url,
+                                              sizeof(client_url))) {
+            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                        .confidence = PP_HALF_CONF,
+                                        .strategy = "http_client_instance"};
+            emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &svc_res,
+                                         CBM_SVC_HTTP, client_url);
+            continue;
+        }
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
          * it to a spurious builtin short-name match (`requests.get` ->
