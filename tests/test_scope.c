@@ -180,6 +180,83 @@ TEST(scope_rebind_in_old_chunk) {
     PASS();
 }
 
+/* ── Frame index (#54) ─────────────────────────────────────────── */
+
+/* A frame that outgrows one chunk is looked up through its hash index. Every
+ * name resolves to the binding the linear scan finds, a rebind updates that
+ * binding in place, a child frame still shadows it, and a missing name is
+ * still missing. */
+TEST(scope_index_matches_linear_scan_issue54) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *s = cbm_scope_push(&a, NULL);
+    enum { N = 500 };
+    static char names[N][16];
+    for (int i = 0; i < N; i++) {
+        snprintf(names[i], sizeof(names[0]), "v%d", i);
+        cbm_scope_bind(s, names[i], named_t(&a, names[i]));
+    }
+    ASSERT_EQ(s->binding_count, N);
+    ASSERT_GTE(s->index.cap, 2 * N);
+    ASSERT_EQ(s->index.count, N);
+    for (int i = 0; i < N; i++) {
+        const CBMVarBinding *b = cbm_scope_lookup_local(s, names[i]);
+        ASSERT_NOT_NULL(b);
+        ASSERT_STR_EQ(b->type->data.named.qualified_name, names[i]);
+    }
+    ASSERT_NULL(cbm_scope_lookup_local(s, "absent"));
+    ASSERT_TRUE(cbm_type_is_unknown(cbm_scope_lookup(s, "absent")));
+
+    const CBMVarBinding *stable = cbm_scope_lookup_local(s, names[7]);
+    cbm_scope_bind(s, names[7], named_t(&a, "Rebound"));
+    ASSERT(cbm_scope_lookup_local(s, names[7]) == stable);
+    ASSERT_STR_EQ(stable->type->data.named.qualified_name, "Rebound");
+    ASSERT_EQ(s->binding_count, N);
+
+    CBMScope *child = cbm_scope_push(&a, s);
+    cbm_scope_bind(child, names[7], named_t(&a, "Child"));
+    ASSERT_STR_EQ(cbm_scope_lookup(child, names[7])->data.named.qualified_name, "Child");
+    ASSERT_STR_EQ(cbm_scope_lookup(child, names[8])->data.named.qualified_name, names[8]);
+    ASSERT_TRUE(cbm_scope_binds_local(child, names[7]));
+    ASSERT_FALSE(cbm_scope_binds_local(child, names[8]));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+/* A frame whose index was dropped (allocation failure) rebuilds it on the
+ * next new binding, sized from every binding in the frame rather than from
+ * the minimum, and the rebuilt index finds all of them. */
+TEST(scope_index_rebuild_sizes_from_all_bindings_issue54) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *s = cbm_scope_push(&a, NULL);
+    static char names[64][16];
+    for (int i = 0; i < 63; i++) {
+        snprintf(names[i], sizeof(names[0]), "binding_%d", i);
+        cbm_scope_bind(s, names[i], named_t(&a, "Old"));
+    }
+    const CBMVarBinding *stable = cbm_scope_lookup_local(s, names[7]);
+    ASSERT_NOT_NULL(stable);
+    memset(&s->index, 0, sizeof(s->index));
+    /* Without an index every lookup scans, and still finds the binding. */
+    ASSERT(cbm_scope_lookup_local(s, names[7]) == stable);
+    snprintf(names[63], sizeof(names[0]), "binding_63");
+    cbm_scope_bind(s, names[63], named_t(&a, "Old"));
+    ASSERT_EQ(s->binding_count, 64);
+    ASSERT_GTE(s->index.cap, 128);
+    ASSERT_EQ(s->index.count, 64);
+    ASSERT_NULL(cbm_scope_lookup_local(s, "absent"));
+    for (int i = 0; i < 64; i++) {
+        ASSERT_NOT_NULL(cbm_scope_lookup_local(s, names[i]));
+    }
+    cbm_scope_bind(s, names[7], named_t(&a, "New"));
+    ASSERT(cbm_scope_lookup_local(s, names[7]) == stable);
+    ASSERT_STR_EQ(stable->type->data.named.qualified_name, "New");
+    ASSERT_EQ(s->binding_count, 64);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(scope) {
@@ -193,4 +270,6 @@ SUITE(scope) {
     RUN_TEST(scope_dynamic_growth_300_bindings);
     RUN_TEST(scope_growth_chunk_boundary);
     RUN_TEST(scope_rebind_in_old_chunk);
+    RUN_TEST(scope_index_matches_linear_scan_issue54);
+    RUN_TEST(scope_index_rebuild_sizes_from_all_bindings_issue54);
 }

@@ -60,6 +60,13 @@ scripts/clean.sh
 # Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
 make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
 
+# Step 3a: the runner must ignore an inherited git repository environment
+# (#56: GIT_DIR overrides `git -C` and would point fixture git commands at the
+# caller's real repository).
+echo "=== Step 3a: inherited git environment isolation (#56) ==="
+make -j"$NPROC" -f Makefile.cbm build/c/test-runner $MAKE_ARGS
+bash "$ROOT/tests/test_git_env_isolation_contract.sh" "$ROOT/build/c/test-runner"
+
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
 # Opt-in via CBM_RUN_HANG_TEST=1 (it needs the prod binary, which the ASan unit

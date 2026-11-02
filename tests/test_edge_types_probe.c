@@ -43,6 +43,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "cbm.h"
+#include "service_patterns.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
@@ -133,12 +134,19 @@ static int et_edge_present(const EtFile *files, int nfiles, const char *edge, in
 
 enum { ET_ROUTE_ASSERT_MAX = 16 };
 
+static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int n_mean);
+
 /* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
  * Spring paths such as "/orders" when the real route is "/api/orders", and a
- * presence-only assertion would still allow stale partial Route nodes to leak. */
-static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+ * presence-only assertion would still allow stale partial Route nodes to leak.
+ * parallel pads the fixture past MIN_FILES_FOR_PARALLEL so the parallel
+ * resolver mints the routes; must_qn (optional) is a Route qualified_name that
+ * must exist — the identity cross-repo HTTP matching joins on. */
+static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
+                                bool parallel, const char *must_qn) {
     EtProj lp;
-    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
     cbm_node_t *nodes = NULL;
     int node_count = 0;
     int wanted = 0;
@@ -186,9 +194,24 @@ static int et_routes_exact(const EtFile *files, int nfiles, const char **routes)
         fprintf(stderr, "\n");
     }
 
+    if (store && must_qn) {
+        cbm_node_t qn_node;
+        memset(&qn_node, 0, sizeof(qn_node));
+        if (cbm_store_find_node_by_qn(store, lp.project, must_qn, &qn_node) != CBM_STORE_OK) {
+            fprintf(stderr, "  [ET-ROUTE] FAIL missing qualified_name %s\n", must_qn);
+            ok = 0;
+        } else {
+            cbm_node_free_fields(&qn_node);
+        }
+    }
+
     cbm_store_free_nodes(nodes, node_count);
     et_cleanup(&lp, store);
     return ok;
+}
+
+static int et_routes_exact(const EtFile *files, int nfiles, const char **routes) {
+    return et_routes_exact_mode(files, nfiles, routes, false, NULL);
 }
 
 /* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
@@ -209,6 +232,136 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
         n++;
     }
     return et_index_files(lp, files, n);
+}
+
+/* #598: a call that resolves to a GraphQL client used to name its Route after
+ * the WHOLE operation text (minus a leading "query "/"mutation "), so an
+ * anonymous `query { ... }` became one long Route and even a named operation
+ * carried its variables and selection set in the name. GraphQL Routes are now
+ * keyed by operation name only; anonymous operations share one bounded key per
+ * operation type. The Route set is asserted exactly (QN + name). Parallel path
+ * only: GRAPHQL_CALLS is emitted by pass_parallel.c. */
+typedef struct {
+    const char *qn;
+    const char *name;
+} EtGqlRoute;
+
+static int et_graphql_routes_exact(const EtFile *files, int nfiles, const EtGqlRoute *want,
+                                   int nwant) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int ok = store != NULL;
+    int got = 0;
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    }
+    for (int ni = 0; nodes && ni < node_count; ni++) {
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *name = nodes[ni].name ? nodes[ni].name : "";
+        if (strncmp(qn, "__graphql__", 11) != 0) {
+            continue;
+        }
+        got++;
+        int matched = 0;
+        for (int wi = 0; wi < nwant; wi++) {
+            if (strcmp(qn, want[wi].qn) == 0 && strcmp(name, want[wi].name) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        /* Operation text (selection sets, variables) must never leak into a key. */
+        if (!matched || strchr(qn, '{') || strchr(name, '{') || strlen(qn) > 160) {
+            fprintf(stderr, "  [ET-GQL] unexpected Route qn='%s' name='%s'\n", qn, name);
+            ok = 0;
+        }
+    }
+    if (got != nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL graphql routes expected=%d actual=%d\n", nwant, got);
+        ok = 0;
+    }
+    int edges = store ? cbm_store_count_edges_by_type(store, lp.project, "GRAPHQL_CALLS") : -1;
+    if (edges < nwant) {
+        fprintf(stderr, "  [ET-GQL] FAIL GRAPHQL_CALLS=%d expected>=%d\n", edges, nwant);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(graphql_route_keyed_by_operation_name_issue598) {
+    static const EtFile f[] = {
+        {"graphql/client.py", "def gql(query):\n    return query\n"},
+        {"api/ops.py",
+         "from graphql.client import gql\n\n\n"
+         "def get_user():\n"
+         "    return gql('query GetUser($id: ID!) { user(id: $id) { name } }')\n\n\n"
+         "def update_user():\n"
+         "    return gql('mutation UpdateUser($id: ID!) { updateUser(id: $id) { id } }')\n\n\n"
+         "def list_users():\n"
+         "    return gql('fragment U on User { id } query ListUsers { users { ...U } }')\n\n\n"
+         "def on_event():\n"
+         "    return gql('subscription OnEvent { event { id } }')\n\n\n"
+         "def products():\n"
+         "    return gql('query { products(search: \"x\") { items { sku } } }')\n\n\n"
+         "def orders():\n"
+         "    return gql('{ orders { id total } }')\n\n\n"
+         "def logout():\n"
+         "    return gql('mutation { logout }')\n"}};
+    static const EtGqlRoute want[] = {
+        {"__graphql__GetUser", "GetUser"},
+        {"__graphql__UpdateUser", "UpdateUser"},
+        {"__graphql__ListUsers", "ListUsers"},
+        {"__graphql__OnEvent", "OnEvent"},
+        /* products + orders: `query { }` and the `{ }` shorthand are both
+         * anonymous queries and share one key. */
+        {"__graphql__query__anonymous", "(anonymous query)"},
+        {"__graphql__mutation__anonymous", "(anonymous mutation)"},
+    };
+    ASSERT_TRUE(et_graphql_routes_exact(f, (int)(sizeof(f) / sizeof(f[0])), want,
+                                        (int)(sizeof(want) / sizeof(want[0]))));
+    PASS();
+}
+
+/* #598 parser edges the end-to-end fixture cannot reach through one language's
+ * string extraction: comments/strings/interpolations that contain braces, a
+ * bare word, non-document arguments and name truncation. */
+TEST(graphql_operation_identity_parser_issue598) {
+    const char *type = NULL;
+    char name[16];
+    static const struct {
+        const char *doc;
+        int named;
+        const char *type;
+        const char *name;
+    } cases[] = {
+        {"# fetch { all }\nquery Q1 { a }", 1, "query", "Q1"},
+        {"${UserFields} query WithFrag($id: ID) { u { ...UserFields } }", 1, "query", "WithFrag"},
+        {"fragment F on T @dir(x: \"{\") { a } mutation M2 { b }", 1, "mutation", "M2"},
+        {"\"\"\"doc { brace\"\"\" subscription S3 { c }", 1, "subscription", "S3"},
+        {"  query  \n ( $x: Int ) { a }", 0, "query", ""},
+        {"  { viewer { id } }", 0, "query", ""},
+        {"query GetUserByIdentifier { a }", 1, "query", "GetUserByIdenti"}, /* bounded */
+        {"data", 0, "operation", ""}, /* a bare word is not evidence of an operation */
+        {"https://api.example.com/graphql", 0, "operation", ""},
+        {"/graphql", 0, "operation", ""},
+        {"", 0, "operation", ""},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        bool named = cbm_service_pattern_graphql_operation(cases[i].doc, &type, name, sizeof(name));
+        if ((int)named != cases[i].named || strcmp(type, cases[i].type) != 0 ||
+            strcmp(name, cases[i].name) != 0) {
+            fprintf(stderr, "  [ET-GQL] case %zu '%s' -> named=%d type=%s name=%s\n", i,
+                    cases[i].doc, (int)named, type, name);
+            ASSERT_TRUE(0);
+        }
+    }
+    ASSERT_FALSE(cbm_service_pattern_graphql_operation(NULL, &type, name, sizeof(name)));
+    ASSERT_STR_EQ(type, "operation");
+    PASS();
 }
 
 /* #1085: count CALLS edges whose target node has `name`, indexing via the
@@ -380,6 +533,83 @@ TEST(handles_gin_go) {
          "    r.POST(\"/orders\", createOrder)\n"
          "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+    PASS();
+}
+
+/* #686: Go router group prefix composition (Fiber, Gin, Echo). In Fiber and
+ * Gin apps `v1 := app.Group("/v1")` followed by `v1.Get("/users", ...)`
+ * registers `/v1/users`, not `/users`. The AST resolution must follow:
+ *   - nested groups: `app.Group("/api").Group("/v1")` -> `/api/v1`
+ *   - re-bound receivers: `grp := ...; grp = ...` follows the binding in scope
+ *   - chained calls: `app.Group("/reports").Get("/daily", ...)`
+ *   - fallback: dynamic / non-literal group prefixes are not guessed, so the
+ *     route stays un-prefixed ("/dyn") rather than fabricating a path. */
+static const EtFile et_fiber_groups_issue686[] = {
+    {"main.go",
+     "package main\n\n"
+     "import \"github.com/gofiber/fiber/v2\"\n\n"
+     "func health(c *fiber.Ctx) error { return nil }\n"
+     "func getUser(c *fiber.Ctx) error { return nil }\n"
+     "func updateCustomer(c *fiber.Ctx) error { return nil }\n"
+     "func listOrders(c *fiber.Ctx) error { return nil }\n"
+     "func ping(c *fiber.Ctx) error { return nil }\n"
+     "func report(c *fiber.Ctx) error { return nil }\n"
+     "func dyn(c *fiber.Ctx) error { return nil }\n\n"
+     "func main() {\n"
+     "    app := fiber.New()\n"
+     "    app.Get(\"/health\", health)\n"
+     "    api := app.Group(\"/api\")\n"
+     "    v1 := api.Group(\"/v1\", authMiddleware)\n"
+     "    v1.Get(\"/users/:id\", getUser)\n"
+     "    admin := app.Group(\"/admin\")\n"
+     "    admin.Post(\"/customers/:id\", updateCustomer)\n"
+     "    grp := api.Group(\"/shop\")\n"
+     "    grp.Get(\"/orders\", listOrders)\n"
+     "    grp = app.Group(\"/internal\")\n"
+     "    grp.Get(\"/ping\", ping)\n"
+     "    app.Group(\"/reports\").Get(\"/daily\", report)\n"
+     "    prefix := \"/p\"\n"
+     "    dg := app.Group(prefix)\n"
+     "    dg.Get(\"/dyn\", dyn)\n"
+     "    app.Listen(\":3000\")\n"
+     "}\n\n"
+     "func authMiddleware(c *fiber.Ctx) error { return c.Next() }\n"}};
+
+static const char *et_fiber_groups_issue686_routes[] = {
+    "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
+    "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
+
+TEST(handles_fiber_group_prefix_sequential_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     false, NULL));
+    PASS();
+}
+
+TEST(handles_fiber_group_prefix_parallel_issue686) {
+    ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
+                                     true, NULL));
+    PASS();
+}
+
+/* #686 control for the same mechanism on Gin: `v1 := r.Group("/v1")` with the
+ * idiomatic brace block. */
+TEST(handles_gin_group_prefix_issue686) {
+    static const EtFile f[] = {
+        {"main.go",
+         "package main\n\n"
+         "import \"github.com/gin-gonic/gin\"\n\n"
+         "func listOrders(c *gin.Context) {}\n"
+         "func createOrder(c *gin.Context) {}\n\n"
+         "func main() {\n"
+         "    r := gin.Default()\n"
+         "    v1 := r.Group(\"/v1\")\n"
+         "    {\n"
+         "        v1.GET(\"/orders\", listOrders)\n"
+         "        v1.POST(\"/orders\", createOrder)\n"
+         "    }\n"
+         "}\n"}};
+    static const char *routes[] = {"/v1/orders", "/v1/orders", NULL}; /* GET + POST */
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
@@ -596,6 +826,206 @@ TEST(handles_laravel_php) {
          "Route::get('/users', 'showUsers');\n"
          "Route::post('/users', 'storeUser');\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+    PASS();
+}
+
+/* #952: Laravel applications register routes through the Illuminate Route
+ * facade, whose class lives in vendor/ and is never indexed. Callee of
+ * `Route::get(...)` (scoped_call_expression) was extracted as bare "get", so
+ * the empty-resolution route fallback ("::get" suffix table) never engaged
+ * and NO Route node minted — not even for flat registrations. Grouped routes
+ * additionally need the enclosing `prefix('/x')->group(...)` chain composed
+ * (same class as Spring's #734). Exact-set assertion distinguishes
+ * prefix-dropped from missing entirely. */
+TEST(handles_laravel_facade_routes_issue952) {
+    static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
+                                   "/companies/tenants/list", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::get('/api/welcome', WelcomeController::class);\n"
+         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+         "->group(function (): void {\n"
+         "    Route::get('/me', GetCurrentUserController::class);\n"
+         "    Route::post('/login', LoginUserController::class);\n"
+         "});\n"
+         "Route::prefix('companies')->group(function (): void {\n"
+         "    Route::prefix('tenants')->group(function (): void {\n"
+         "        Route::get('/list', ListTenantsController::class);\n"
+         "    });\n"
+         "});\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* #952 inverse guard: a non-router static call whose method name collides
+ * with a route verb (Cache::get) must NOT mint a Route node — the callee
+ * qualification is route-table-gated and the path gate requires a leading
+ * slash. */
+TEST(handles_laravel_facade_no_junk_routes_issue952) {
+    static const char *routes[] = {"/real", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('/real', RealController::class);\n"
+         "$v = Cache::get('users.count');\n"
+         "$w = Cache::get('/leading/slash/key');\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Assert the exact Route set as "METHOD /path" strings: the method comes from
+ * the Route QN ("__route__PUT__/articles/{}"), the path from the node name
+ * (the raw composed path). The count must match too, so a junk Route fails. */
+static int et_route_set_exact(const EtFile *files, int nfiles, const char **want, int parallel) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int found[ET_ROUTE_ASSERT_MAX] = {0};
+    while (want[wanted] && wanted < ET_ROUTE_ASSERT_MAX) {
+        wanted++;
+    }
+    int ok = store != NULL &&
+             cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) ==
+                 CBM_STORE_OK &&
+             node_count == wanted;
+    for (int ni = 0; store && ni < node_count; ni++) {
+        char got[512];
+        const char *qn = nodes[ni].qualified_name ? nodes[ni].qualified_name : "";
+        const char *m = strncmp(qn, "__route__", 9) == 0 ? qn + 9 : qn;
+        const char *end = strstr(m, "__");
+        snprintf(got, sizeof(got), "%.*s %s", end ? (int)(end - m) : 0, m,
+                 nodes[ni].name ? nodes[ni].name : "");
+        int matched = 0;
+        for (int wi = 0; wi < wanted; wi++) {
+            if (!found[wi] && strcmp(got, want[wi]) == 0) {
+                found[wi] = matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] unexpected %s\n", got);
+        }
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        if (!found[wi]) {
+            ok = 0;
+            fprintf(stderr, "  [ET-ROUTESET] missing %s\n", want[wi]);
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-ROUTESET] FAIL (%s path) expected=%d actual=%d\n",
+                parallel ? "parallel" : "sequential", wanted, node_count);
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* #1146: Laravel writes most route URIs without the leading slash —
+ * Route::get('users', ...) serves /users, Route::put('{article}', ...) inside
+ * prefix('articles') serves /articles/{article}, and '' is the group root.
+ * Both route passes only minted a Route for a first argument starting with
+ * '/', so Firefly III's API (258 registrations) and laravel.io's PUT/DELETE
+ * API routes had no Route at all. Covers the facade, a facade chain
+ * (Route::middleware(...)->get), $router, attribute-array group prefixes,
+ * bare group root ('') and a trailing-slash URI. */
+static const EtFile et_laravel_slashless[] = {
+    {"routes/api.php",
+     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+     "Route::get('users', 'UserController@index');\n"
+     "Route::post('users/', 'UserController@store');\n"
+     "Route::prefix('articles')->group(function () {\n"
+     "    Route::get('', 'ArticleController@index');\n"
+     "    Route::put('{article}', 'ArticleController@update');\n"
+     "    Route::delete('{article}/', 'ArticleController@destroy');\n"
+     "});\n"
+     "Route::group(['prefix' => 'v1/autocomplete', 'as' => 'auto.'], function () {\n"
+     "    Route::get('accounts', 'AutocompleteController@accounts');\n"
+     "});\n"
+     "Route::middleware('auth')->get('dashboard', 'DashboardController@show');\n"
+     "$router->get('lumen/users', 'UserController@index');\n"}};
+
+static const char *et_laravel_slashless_routes[] = {"GET /users",
+                                                    "POST /users",
+                                                    "GET /articles",
+                                                    "PUT /articles/{article}",
+                                                    "DELETE /articles/{article}",
+                                                    "GET /v1/autocomplete/accounts",
+                                                    "GET /dashboard",
+                                                    "GET /lumen/users",
+                                                    NULL};
+
+TEST(routes_laravel_slashless_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 0));
+    PASS();
+}
+
+TEST(routes_laravel_slashless_parallel_issue1146) {
+    ASSERT_TRUE(et_route_set_exact(et_laravel_slashless, 1, et_laravel_slashless_routes, 1));
+    PASS();
+}
+
+/* The string action of a slashless registration — 'index' inside a
+ * Route::controller() group, 'UserController@store' — does not say which
+ * class owns the method, so resolving it could only guess a same-named
+ * function anywhere in the repo (on krayin/laravel-crm 'update' and 'destroy'
+ * bound a chart.js function). Such routes are minted without a guessed
+ * HANDLES edge. Decoys: a JS function and a PHP method per action name. */
+TEST(routes_laravel_slashless_no_guessed_handlers_issue1146) {
+    static const char *want[] = {"GET /leads", "PUT /leads/edit/{id}", "POST /users", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::controller(LeadController::class)->prefix('leads')->group(function () {\n"
+         "    Route::get('', 'index');\n"
+         "    Route::put('edit/{id}', 'update');\n"
+         "});\n"
+         "Route::post('users', 'UserController@store');\n"},
+        {"resources/js/chart.js",
+         "function index() { return 1; }\nfunction update() { return 2; }\n"},
+        {"app/Http/Controllers/ActivityController.php",
+         "<?php\nnamespace App\\Http\\Controllers;\n\n"
+         "class ActivityController {\n    public function store() { return 1; }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 3, want, 0));
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, f, 3);
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    et_cleanup(&lp, store);
+    ASSERT_EQ(handles, 0);
+    PASS();
+}
+
+/* Precision guard for the slashless form: only a Laravel route registration
+ * (the Route facade, or $router) has its URI normalised. A string first
+ * argument of any other get/post call — a request input, a cache key, config,
+ * a collection or session lookup, a property that merely holds a router, a
+ * test client call — stays what it is and mints no Route. */
+TEST(routes_laravel_slashless_no_junk_issue1146) {
+    static const char *want[] = {"GET /real", NULL};
+    static const EtFile f[] = {
+        {"routes/web.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('real', 'RealController@show');\n\n"
+         "class UsersController {\n"
+         "    public function index($request) {\n"
+         "        $name = $request->get('name');\n"
+         "        $q = $request->query->get('q');\n"
+         "        $v = Cache::get('users.count');\n"
+         "        $c = config('app.name');\n"
+         "        $k = collect(['a' => 1])->get('a');\n"
+         "        $s = session()->get('key');\n"
+         "        $r = $this->router->get('status');\n"
+         "        $p = $this->post('login', []);\n"
+         "        return $this->get('users');\n"
+         "    }\n}\n"}};
+    ASSERT_TRUE(et_route_set_exact(f, 1, want, 0));
     PASS();
 }
 
@@ -1601,12 +2031,149 @@ TEST(override_go_interface) {
     PASS();
 }
 
+/* Index `files` (padded onto the parallel path when `parallel`), then require
+ * the exact Route-name set `routes` AND zero CALLS edges into any definition
+ * named `get`: every `get` in these fixtures lives in a different language
+ * than its would-be callers, so any such edge is the binding #725 refuses. */
+static int et_xlang_routes(const EtFile *files, int nfiles, bool parallel, const char **routes) {
+    EtProj lp;
+    cbm_store_t *store =
+        parallel ? et_index_parallel(&lp, files, nfiles) : et_index_files(&lp, files, nfiles);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int wanted = 0;
+    int ok = store != NULL;
+    while (routes[wanted]) {
+        wanted++;
+    }
+    if (!store || cbm_store_find_nodes_by_label(store, lp.project, "Route", &nodes, &node_count) !=
+                      CBM_STORE_OK) {
+        ok = 0;
+    } else if (node_count != wanted) {
+        ok = 0;
+    }
+    for (int wi = 0; wi < wanted; wi++) {
+        int hit = 0;
+        for (int ni = 0; ni < node_count; ni++) {
+            if (nodes[ni].name && strcmp(nodes[ni].name, routes[wi]) == 0) {
+                hit = 1;
+            }
+        }
+        if (!hit) {
+            fprintf(stderr, "  [ET-XLANG] missing Route %s\n", routes[wi]);
+            ok = 0;
+        }
+    }
+    if (!ok) {
+        fprintf(stderr, "  [ET-XLANG] expected=%d actual=%d available:", wanted, node_count);
+        for (int ni = 0; ni < node_count; ni++) {
+            fprintf(stderr, " %s", nodes[ni].name ? nodes[ni].name : "<null>");
+        }
+        fprintf(stderr, "\n");
+    }
+    int false_calls = 0;
+    cbm_node_t *gets = NULL;
+    int get_count = 0;
+    if (store &&
+        cbm_store_find_nodes_by_name(store, lp.project, "get", &gets, &get_count) == CBM_STORE_OK) {
+        for (int gi = 0; gi < get_count; gi++) {
+            cbm_edge_t *in = NULL;
+            int in_count = 0;
+            if (cbm_store_find_edges_by_target_type(store, gets[gi].id, "CALLS", &in, &in_count) ==
+                CBM_STORE_OK) {
+                false_calls += in_count;
+                cbm_store_free_edges(in, in_count);
+            }
+        }
+        cbm_store_free_nodes(gets, get_count);
+    }
+    if (false_calls != 0) {
+        fprintf(stderr, "  [ET-XLANG] %d cross-language CALLS into `get`\n", false_calls);
+        ok = 0;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+/* Laravel: facade `Route::get` and `$router->get` beside two JS `get`
+ * definitions. Controls: POST is unchanged, and a bare PHP `get('/x')` (no
+ * route-registration callee) stays dropped — no Route, no CALLS into JS. */
+static const EtFile et_xlang_laravel[] = {
+    {"app/Http/Controllers/LeadController.php",
+     "<?php\nnamespace App\\Http\\Controllers;\n\n"
+     "class LeadController\n{\n"
+     "    public function index() { return []; }\n"
+     "    public function store() { return []; }\n}\n"},
+    {"routes/web.php",
+     "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+     "use App\\Http\\Controllers\\LeadController;\n\n"
+     "Route::get('/leads', [LeadController::class, 'index']);\n"
+     "Route::post('/leads/store', [LeadController::class, 'store']);\n"
+     "$router->get('/reports', [LeadController::class, 'index']);\n\n"
+     "function report_file() { return get('/files/report'); }\n"},
+    {"resources/js/http.js", "export function get(url) {\n  return url;\n}\n"},
+    {"resources/js/store.js", "export class Store {\n  get(key) {\n    return key;\n  }\n}\n"},
+};
+static const char *et_xlang_laravel_routes[] = {"/leads", "/leads/store", "/reports", NULL};
+
+TEST(routes_laravel_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                false, et_xlang_laravel_routes));
+    PASS();
+}
+
+TEST(routes_laravel_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_laravel,
+                                (int)(sizeof(et_xlang_laravel) / sizeof(et_xlang_laravel[0])),
+                                true, et_xlang_laravel_routes));
+    PASS();
+}
+
+/* Express: `app.get` beside two Python `get` definitions. Controls: POST is
+ * unchanged; a member `memo.get(key)` (route suffix, no path) and a bare
+ * `get('/cache/key')` stay dropped — no Route, no CALLS into Python. */
+static const EtFile et_xlang_express[] = {
+    {"web/server.js",
+     "const express = require('express');\n"
+     "const { health } = require('./handlers');\n\n"
+     "const app = express();\n\n"
+     "app.get('/health', health);\n"
+     "app.post('/items', health);\n\n"
+     "function readCache(memo, key) {\n"
+     "  return memo.get(key) || get('/cache/key');\n"
+     "}\n"
+     "module.exports = { readCache };\n"},
+    {"web/handlers.js",
+     "function health(req, res) {\n  return res;\n}\nmodule.exports = { health };\n"},
+    {"tools/cache.py", "def get(key):\n    return key\n"},
+    {"tools/store.py", "class Store:\n    def get(self, key):\n        return key\n"},
+};
+static const char *et_xlang_express_routes[] = {"/health", "/items", NULL};
+
+TEST(routes_express_get_survives_xlang_guard) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                false, et_xlang_express_routes));
+    PASS();
+}
+
+TEST(routes_express_get_survives_xlang_guard_parallel) {
+    ASSERT_TRUE(et_xlang_routes(et_xlang_express,
+                                (int)(sizeof(et_xlang_express) / sizeof(et_xlang_express[0])),
+                                true, et_xlang_express_routes));
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_types_probe) {
     RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
+    RUN_TEST(graphql_route_keyed_by_operation_name_issue598);
+    RUN_TEST(graphql_operation_identity_parser_issue598);
     /* HANDLES — route→handler across web frameworks (8 frameworks) */
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
@@ -1614,6 +2181,9 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_express_ts);
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
+    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
+    RUN_TEST(handles_gin_group_prefix_issue686);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
@@ -1623,6 +2193,12 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_jaxrs_scala);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
+    RUN_TEST(handles_laravel_facade_routes_issue952);
+    RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
+    RUN_TEST(routes_laravel_slashless_issue1146);
+    RUN_TEST(routes_laravel_slashless_parallel_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_guessed_handlers_issue1146);
+    RUN_TEST(routes_laravel_slashless_no_junk_issue1146);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 
@@ -1680,4 +2256,10 @@ SUITE(edge_types_probe) {
 
     /* OVERRIDE — Go interface method override (parallel path) */
     RUN_TEST(override_go_interface);
+
+    /* Route registration vs the #725 cross-language guard (both resolvers) */
+    RUN_TEST(routes_laravel_get_survives_xlang_guard);
+    RUN_TEST(routes_laravel_get_survives_xlang_guard_parallel);
+    RUN_TEST(routes_express_get_survives_xlang_guard);
+    RUN_TEST(routes_express_get_survives_xlang_guard_parallel);
 }
