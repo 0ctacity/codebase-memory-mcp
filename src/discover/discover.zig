@@ -15,12 +15,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
+const interop = @import("../foundation/interop.zig");
 const gitignore = @import("gitignore.zig");
 const language = @import("language.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
 const Str = [*:0]const u8;
+const bprint = interop.bprint;
 const Gitignore = gitignore.Gitignore;
 const Lang = c.CBMLanguage;
 const Mode = c.cbm_index_mode_t;
@@ -188,15 +190,6 @@ fn strInList(s: []const u8, list: []const []const u8) bool {
         if (std.mem.eql(u8, s, item)) return true;
     }
     return false;
-}
-
-/// snprintf: writes the formatted text into buf, truncated and NUL-terminated,
-/// and returns the untruncated length.
-fn bprint(buf: []u8, comptime fmt: []const u8, args: anytype) usize {
-    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
-    w.print(fmt, args) catch {};
-    buf[w.end] = 0;
-    return std.fmt.count(fmt, args);
 }
 
 /// The C string held in buf.
