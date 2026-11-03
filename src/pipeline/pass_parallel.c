@@ -2051,6 +2051,11 @@ static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     if (cbm_service_pattern_is_client_navigation(pp_client_nav_lang(lang), call->callee_name)) {
         return;
     }
+    /* A bare `fetch` reaching here resolved to the project's own `fetch`,
+     * which shadows the global API (#856): a plain call, not HTTP. */
+    if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
+        return;
+    }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         if (arg_is_topic(ca)) {
@@ -2915,7 +2920,7 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
     }
 }
 
-/* Resolve base_classes → INHERITS edges for one definition. */
+/* Resolve base_classes → INHERITS / IMPLEMENTS edges for one definition. */
 static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                  const CBMDefinition *def, const cbm_gbuf_node_t *node,
                                  const char *mq, const char **ik, const char **iv, int ic) {
@@ -2929,7 +2934,13 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
         if (bn && node->id != bn->id) {
-            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id, "INHERITS", "{}");
+            /* A base that resolves to an Interface is an IMPLEMENTS relation
+             * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
+             * Type/Enum base is plain INHERITS. */
+            const char *base_label = cbm_registry_label_of(rc->registry, bqn);
+            const char *edge_type =
+                (base_label && strcmp(base_label, "Interface") == 0) ? "IMPLEMENTS" : "INHERITS";
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id, edge_type, "{}");
             ws->semantic_resolved++;
         }
     }
@@ -3032,6 +3043,122 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             ws->semantic_resolved++;
         }
     }
+}
+
+/* ── FastAPI Depends() tracking ──────────────────────────────────── */
+/* Scans Python function signatures for Depends(func_ref) and creates CALLS
+ * edges from the endpoint to the dependency function. Without this, FastAPI
+ * auth/DI functions appear as dead code (in_degree=0). */
+
+enum { PP_SIG_SCAN_LINES = 15, PP_REGEX_GROUPS = 2 };
+
+/* Python signature text of the def starting at start_line. Caller frees. */
+static char *extract_py_signature(const char *source, int start_line, int end_line) {
+    int sig_end = start_line + PP_SIG_SCAN_LINES;
+    if (end_line > 0 && sig_end > end_line) {
+        sig_end = end_line;
+    }
+    const char *p = source;
+    int line = SKIP_ONE;
+    while (*p && line < start_line) {
+        if (*p == '\n') {
+            line++;
+        }
+        p++;
+    }
+    const char *sig_start = p;
+    while (*p && line < sig_end) {
+        if (*p == '\n') {
+            line++;
+        }
+        p++;
+        if (p > sig_start + SKIP_ONE && p[-SKIP_ONE] == ':' && p[-PAIR_LEN] == ')') {
+            break;
+        }
+    }
+    size_t sig_len = (size_t)(p - sig_start);
+    char *sig = malloc(sig_len + SKIP_ONE);
+    if (!sig) {
+        return NULL;
+    }
+    memcpy(sig, sig_start, sig_len);
+    sig[sig_len] = '\0';
+    return sig;
+}
+
+/* CALLS edges for each Depends(func_ref) in one def's signature. */
+static void scan_depends_in_sig(resolve_ctx_t *rc, resolve_worker_state_t *ws,
+                                const cbm_regex_t *re, const char *sig,
+                                const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                const char **imp_keys, const char **imp_vals, int imp_count) {
+    cbm_regmatch_t match[PP_REGEX_GROUPS];
+    const char *scan = sig;
+    while (cbm_regexec(re, scan, PP_REGEX_GROUPS, match, 0) == 0) {
+        int ref_len = match[SKIP_ONE].rm_eo - match[SKIP_ONE].rm_so;
+        char func_ref[CBM_SZ_256];
+        if (ref_len >= (int)sizeof(func_ref)) {
+            ref_len = (int)sizeof(func_ref) - SKIP_ONE;
+        }
+        memcpy(func_ref, scan + match[SKIP_ONE].rm_so, (size_t)ref_len);
+        func_ref[ref_len] = '\0';
+        cbm_resolution_t res =
+            cbm_registry_resolve(rc->registry, func_ref, module_qn, imp_keys, imp_vals, imp_count);
+        if (res.qualified_name && res.qualified_name[0] != '\0') {
+            const cbm_gbuf_node_t *tn = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            if (tn && source_node->id != tn->id) {
+                cbm_gbuf_insert_edge(ws->local_edge_buf, source_node->id, tn->id, "CALLS",
+                                     "{\"confidence\":0.95,\"strategy\":\"fastapi_depends\"}");
+                ws->calls_resolved++;
+            }
+        }
+        scan += match[0].rm_eo;
+    }
+}
+
+static void resolve_file_fastapi_depends(resolve_ctx_t *rc, resolve_worker_state_t *ws,
+                                         const CBMFileResult *result, const char *path,
+                                         const char *module_qn, const char **imp_keys,
+                                         const char **imp_vals, int imp_count) {
+    bool has_depends = false;
+    for (int c = 0; c < result->calls.count && !has_depends; c++) {
+        const char *callee = result->calls.items[c].callee_name;
+        has_depends = callee && strcmp(callee, "Depends") == 0;
+    }
+    if (!has_depends) {
+        return;
+    }
+    cbm_regex_t depends_re;
+    if (cbm_regcomp(&depends_re, "Depends\\(([A-Za-z_][A-Za-z0-9_.]*)", CBM_REG_EXTENDED) != 0) {
+        return;
+    }
+    char *source_owned = NULL;
+    const char *source = result->source;
+    if (!source || result->source_len <= 0) {
+        int source_len = 0;
+        source_owned = path ? read_file(path, &source_len, NULL, NULL) : NULL;
+        source = source_owned;
+    }
+    for (int d = 0; source && d < result->defs.count; d++) {
+        const CBMDefinition *def = &result->defs.items[d];
+        if (!def->qualified_name || def->start_line <= 0 || !def->label ||
+            (strcmp(def->label, "Function") != 0 && strcmp(def->label, "Method") != 0)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *source_node =
+            cbm_gbuf_find_by_qn(rc->main_gbuf, def->qualified_name);
+        if (!source_node) {
+            continue;
+        }
+        char *sig = extract_py_signature(source, (int)def->start_line, (int)def->end_line);
+        if (!sig) {
+            continue;
+        }
+        scan_depends_in_sig(rc, ws, &depends_re, sig, source_node, module_qn, imp_keys, imp_vals,
+                            imp_count);
+        free(sig);
+    }
+    free_source(source_owned);
+    cbm_regfree(&depends_re);
 }
 
 /* F4: get (or lazily build ONCE) the shared all_defs Rust registry. Called by the
@@ -3153,16 +3280,21 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * entries as textual calls. Java/Kotlin per-file LSP can fill the
          * count with constructors or same-file calls while a mixed-source-root
          * Java↔Kotlin call remains unresolved, so JVM callers run whenever
-         * calls exist. */
+         * calls exist. Callable-reference candidates (`accept(handler)` with
+         * an imported `handler`) count the same way against reference rows. */
         bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
         bool rust_workspace_cross_lsp =
             (lang == CBM_LANG_RUST && rc->rust_manifest && rc->rust_manifest->member_count > 0);
+        int invocation_rows = cbm_pipeline_invocation_row_count(&result->resolved_calls);
+        int ref_candidates = 0;
+        for (int u = 0; u < result->usages.count; u++) {
+            ref_candidates += result->usages.items[u].may_be_call_reference ? 1 : 0;
+        }
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             result->calls.count > 0 &&
-             (jvm_cross_lsp || rust_workspace_cross_lsp ||
-              cbm_pipeline_invocation_row_count(&result->resolved_calls) <
-                  result->calls.count ||
+             (result->calls.count > 0 || ref_candidates > 0) &&
+             (jvm_cross_lsp || rust_workspace_cross_lsp || invocation_rows < result->calls.count ||
+              cbm_pipeline_reference_row_count(&result->resolved_calls) < ref_candidates ||
               (lang == CBM_LANG_ZIG && rc->def_modules &&
                cbm_pxc_zig_args_in_module(rc->cross_registries, rc->def_modules[file_idx]))) &&
              !is_generated);
@@ -3296,6 +3428,10 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         /* ── CALLS resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
         resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        if (lang == CBM_LANG_PYTHON) {
+            resolve_file_fastapi_depends(rc, ws, result, rc->files[file_idx].path, module_qn,
+                                         imp_keys, imp_vals, imp_count);
+        }
         atomic_fetch_add_explicit(&rc->time_ns_calls, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
