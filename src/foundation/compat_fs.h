@@ -57,6 +57,24 @@ int cbm_unlink(const char *path);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+struct stat;
+
+/* stat() by UTF-8 path. On Windows, converts to wide-char and calls _wstat64,
+ * filling only st_mode, st_size and st_mtime. On POSIX, delegates to stat.
+ * Returns 0 on success. */
+int cbm_stat_utf8(const char *path, struct stat *st);
+
+/* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
+ * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
+ * a directory walk from following a junction that points outside its root,
+ * mirroring the POSIX S_ISLNK skip. */
+int cbm_stat_no_follow(const char *path, struct stat *st);
+
+/* Absolute, canonical form of path into out: realpath() on POSIX, _fullpath()
+ * on Windows (which does not resolve links). Returns false on failure, leaving
+ * out unspecified. */
+bool cbm_canonical_path(const char *path, char *out, size_t out_sz);
+
 /* Open a file by UTF-8 path.
  * On Windows, converts to wide-char and calls _wfopen so paths with
  * non-ASCII characters (accents, CJK, etc.) are handled correctly.

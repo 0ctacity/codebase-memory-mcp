@@ -87,7 +87,7 @@ Language support is split between two layers:
 4. Add a test case in `tests/test_pipeline.c` for integration-level fixes
 5. Verify with a real open-source repo
 
-A language's tier comes from `cbm_language_tier()` in `src/discover/language.c`. Register a test
+A language's tier comes from `cbm_language_tier()` in `src/discover/language.zig`. Register a test
 that exercises one tier-2 or tier-3 language with `RUN_TEST_LANG(CBM_LANG_<LANG>, name)` instead of
 `RUN_TEST(name)`, and skip such rows in table-driven tests with `if (!tf_lang_runs(lang)) continue;`.
 

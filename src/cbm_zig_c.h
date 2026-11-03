@@ -31,8 +31,11 @@
 #include "zova/cbm_zova_operations.h"
 #include "zova/cbm_zova_repository.h"
 #include "zova/cbm_zova_route.h"
+#include <yyjson/yyjson.h>
 
 /* Headers of the ported modules: the Zig side implements these. */
+#include "discover/discover.h"
+#include "discover/userconfig.h"
 #include "git/git_context.h"
 #include "simhash/minhash.h"
 #include "watcher/watcher.h"

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #ifdef _WIN32
 
@@ -467,6 +468,39 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+int cbm_stat_utf8(const char *path, struct stat *st) {
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    struct _stat64 wst;
+    int ret = _wstat64(wpath, &wst);
+    free(wpath);
+    if (ret != 0) {
+        return CBM_NOT_FOUND;
+    }
+    st->st_mode = wst.st_mode;
+    st->st_size = wst.st_size;
+    st->st_mtime = wst.st_mtime;
+    return 0;
+}
+
+int cbm_stat_no_follow(const char *path, struct stat *st) {
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (wpath) {
+        DWORD attr = GetFileAttributesW(wpath);
+        free(wpath);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    return cbm_stat_utf8(path, st);
+}
+
+bool cbm_canonical_path(const char *path, char *out, size_t out_sz) {
+    return _fullpath(out, path, out_sz) != NULL;
+}
+
 /* Build a properly-quoted Windows command line from an argv array.
  * Returns a heap-allocated wide string, or NULL on allocation failure.
  * Quoting follows the MSVC CRT convention: arguments containing spaces,
@@ -609,6 +643,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h> /* PATH_MAX */
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -829,6 +864,33 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_stat_utf8(const char *path, struct stat *st) {
+    return stat(path, st);
+}
+
+int cbm_stat_no_follow(const char *path, struct stat *st) {
+    if (lstat(path, st) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (S_ISLNK(st->st_mode)) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+bool cbm_canonical_path(const char *path, char *out, size_t out_sz) {
+    char resolved[PATH_MAX];
+    if (!realpath(path, resolved)) {
+        return false;
+    }
+    size_t len = strlen(resolved);
+    if (len >= out_sz) {
+        return false;
+    }
+    memcpy(out, resolved, len + SKIP_ONE);
+    return true;
 }
 
 int cbm_exec_no_shell(const char *const *argv) {
