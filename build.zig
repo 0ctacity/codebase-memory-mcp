@@ -561,7 +561,6 @@ const native_sources = [_][]const u8{
     "src/cypher/cypher.c",
     "src/mcp/mcp.c",
     "src/mcp/index_supervisor.c",
-    "src/discover/discover.c",
     "src/graph_buffer/graph_buffer.c",
     "src/pipeline/fqn.c",
     "src/pipeline/path_alias.c",

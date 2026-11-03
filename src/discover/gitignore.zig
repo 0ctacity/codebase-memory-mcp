@@ -260,9 +260,9 @@ fn matchUnrooted(pattern: Str, rel_path: Str, basename: Str) bool {
 }
 
 /// 1 when the last matching pattern ignores rel_path, -1 when it re-includes
-/// it (a negated pattern), 0 when no pattern matches. discover.c tells the
-/// last two apart, so it declares this export itself.
-export fn cbm_gitignore_match_result(gi_c: ?*const Gitignore, rel_path_c: ?Str, is_dir: bool) c_int {
+/// it (a negated pattern), 0 when no pattern matches. discover.zig tells the
+/// last two apart.
+pub fn matchResult(gi_c: ?*const Gitignore, rel_path_c: ?Str, is_dir: bool) c_int {
     const gi = gi_c orelse return 0;
     const rel_path = rel_path_c orelse return 0;
 
@@ -286,7 +286,7 @@ export fn cbm_gitignore_match_result(gi_c: ?*const Gitignore, rel_path_c: ?Str, 
 }
 
 pub export fn cbm_gitignore_matches(gi: ?*const Gitignore, rel_path: ?Str, is_dir: bool) bool {
-    return cbm_gitignore_match_result(gi, rel_path, is_dir) > 0;
+    return matchResult(gi, rel_path, is_dir) > 0;
 }
 
 pub export fn cbm_gitignore_free(gi_c: ?*Gitignore) void {
