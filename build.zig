@@ -565,7 +565,6 @@ const native_sources = [_][]const u8{
     "src/zova/cbm_zova_repository.c",
     "src/zova/cbm_zova_bridge_stub.c",
     "src/zova/cbm_zova_plugin.c",
-    "src/cypher/cypher.c",
     "src/mcp/mcp.c",
     "src/mcp/index_supervisor.c",
     "src/graph_buffer/graph_buffer.c",

@@ -17,7 +17,7 @@ const Cond = c.cbm_condition_t;
 const ReturnItem = c.cbm_return_item_t;
 const ReturnClause = c.cbm_return_clause_t;
 const Query = c.cbm_query_t;
-const CStr = [*c]const u8;
+pub const CStr = [*c]const u8;
 
 const NOT_FOUND: c_int = c.CBM_NOT_FOUND;
 const INIT_CAP4 = 4;
@@ -28,7 +28,7 @@ const ORDER_KEYS_MAX = c.CBM_CYPHER_ORDER_KEYS_MAX;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-inline fn ix(i: c_int) usize {
+pub inline fn ix(i: c_int) usize {
     return @intCast(i);
 }
 
@@ -37,20 +37,20 @@ pub inline fn narrow(v: c_long) c_int {
     return @truncate(v);
 }
 
-fn mallocN(comptime T: type, n: usize) [*c]T {
+pub fn mallocN(comptime T: type, n: usize) [*c]T {
     return @ptrCast(@alignCast(c.malloc(n * @sizeOf(T))));
 }
 
-fn callocN(comptime T: type, n: usize) [*c]T {
+pub fn callocN(comptime T: type, n: usize) [*c]T {
     return @ptrCast(@alignCast(c.calloc(n, @sizeOf(T))));
 }
 
-fn reallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
+pub fn reallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
     return @ptrCast(@alignCast(c.realloc(@ptrCast(p), n * @sizeOf(T))));
 }
 
 /// safe_realloc from foundation/platform.h: frees the old block on failure.
-fn safeReallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
+pub fn safeReallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
     const size = if (n * @sizeOf(T) == 0) 1 else n * @sizeOf(T);
     const tmp = c.realloc(@ptrCast(p), size);
     if (tmp == null) c.free(@ptrCast(p));
