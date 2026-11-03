@@ -150,17 +150,17 @@ static const RFile k_files[] = {
 };
 static const int k_nfiles = (int)(sizeof(k_files) / sizeof(k_files[0]));
 
-/* The full pipeline switches to the parallel (worker) path above
- * MIN_FILES_FOR_PARALLEL=50 files (pipeline.c). The bug has TWO faces:
+/* The bug had TWO faces, one per pipeline (the sequential one has since been
+ * deleted):
  *   - sequential: cbm_gbuf_upsert_node clobbered the Folder node in place;
  *   - parallel:   merge_update_existing clobbered it during worker-local gbuf
  *                 merge (worker order → run-to-run nondeterminism).
- * The 4-file fixture only exercises the sequential face, so a second fixture
- * pads the same core files with FILLER_COUNT inert same-package classes to
- * push the file count over the threshold and exercise the merge face too. */
+ * The 4-file fixture exercised the sequential face; a second fixture pads the
+ * same core files with FILLER_COUNT inert same-package classes to exercise the
+ * merge face too. */
 enum { REPRO787_FILLER_COUNT = 60, REPRO787_NAME_SZ = 64, REPRO787_BODY_SZ = 192 };
 
-/* Build the >50-file fixture into files[]/name_bufs[]/body_bufs[] (caller
+/* Build the padded fixture into files[]/name_bufs[]/body_bufs[] (caller
  * arrays sized k_nfiles + REPRO787_FILLER_COUNT). Returns total file count.
  * Caller frees name_bufs/body_bufs entries [k_nfiles..total). */
 static int build_parallel_fixture(RFile *files, char **name_bufs, char **body_bufs) {
@@ -323,7 +323,7 @@ static const int k_nexpected = (int)(sizeof(k_expected) / sizeof(k_expected[0]))
 /*
  * repro_issue787_usage_exact_sources
  *
- * Single-run correctness check (sequential pipeline path): after indexing
+ * Single-run correctness check on the 4-file fixture: after indexing
  * the 4-file fixture exactly once, the USAGE edges targeting IRepository
  * must source from exactly the three expected files.
  *
@@ -457,12 +457,11 @@ TEST(repro_issue787_usage_stable_across_runs) {
 /*
  * repro_issue787_usage_stable_parallel
  *
- * PARALLEL-path check: same core fixture padded past MIN_FILES_FOR_PARALLEL
- * (>50 files) so index_repository takes the worker/merge path, repeated N=3
+ * Padded check: same core fixture with filler files, repeated N=3
  * times.  Asserts the distinct USAGE source set equals the expected files on
  * every run.
  *
- * RED on buggy HEAD via a DIFFERENT mechanism than the sequential tests:
+ * RED on buggy HEAD via a DIFFERENT mechanism than the 4-file tests:
  * merge_update_existing (graph_buffer.c) applied unconditional "src wins" when
  * a worker-local gbuf's per-file Module def (directory QN) collided with the
  * main gbuf's Folder node, relabelling it Module and setting its file_path to

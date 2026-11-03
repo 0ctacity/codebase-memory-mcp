@@ -1011,7 +1011,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         /* The Rust resolver wants CBMRustLSPDef (rust_lsp.h), not the
          * pipeline's CBMLSPDef — the structs share their first 9 fields
          * but diverge after, so convert into the scratch arena. The
-         * workspace manifest (set once by the sequential driver) lets
+         * workspace manifest (set by each resolve worker) lets
          * `crate_a::foo` route across the crate boundary (#56). */
         CBMRustLSPDef *rdefs = pxc_lspdefs_to_rust(&scratch, defs, def_count);
         cbm_run_rust_lsp_cross_with_manifest(&scratch, source, source_len, module_qn, rdefs,
@@ -1075,8 +1075,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
  * there is no readable Cargo.toml, leaving *out_m untouched. The resulting
  * manifest feeds cross-CRATE Rust resolution (#56): its [workspace].members
  * map lets `crate_a::foo` route to the member crate's def. */
-/* Per-file cross-LSP dispatch, shared by the PARALLEL resolve worker and the
- * SEQUENTIAL driver. One code path = one semantics: filter the global defs
+/* Per-file cross-LSP dispatch for the parallel resolve worker: filter the global defs
  * down to the file's own+imported modules via the module-def index, resolve
  * through the shared prebuilt registry when the language has one (per-file
  * OVERLAY pattern — no registry build, no finalize), and only fall back to

@@ -1081,8 +1081,8 @@ TEST(contract_edge_handles) {
 }
 
 /* HTTP_CALLS — call resolving to a QN containing an HTTP-client lib id
- * ("requests") with a URL-shaped first arg -> Route node. Uses the SEQUENTIAL
- * pass path (small fixture): a local wrapper whose QN carries the lib substring. */
+ * ("requests") with a URL-shaped first arg -> Route node. Uses a small
+ * fixture: a local wrapper whose QN carries the lib substring. */
 TEST(contract_edge_http_calls) {
     static const LangFile f[] = {
         {"service_b.py",
@@ -1109,7 +1109,7 @@ TEST(contract_edge_async_calls) {
     PASS();
 }
 
-/* The sequential call pass must write parseable properties for broker edges
+/* The call pass must write parseable properties for broker edges
  * and their Route nodes. */
 TEST(contract_async_calls_properties_are_json) {
     static const LangFile f[] = {
@@ -1150,7 +1150,7 @@ TEST(contract_async_calls_properties_are_json) {
 /* DATA_FLOWS — caller -> handler through a shared Route: a decorator handler
  * (HANDLES) and an HTTP call to the SAME ANY-method path (HTTP_CALLS) on a
  * Route whose QN matches (__route__ANY__/orders). create_data_flows then links
- * the HTTP caller to the route handler. Sequential-path-safe: the HTTP call
+ * the HTTP caller to the route handler. The HTTP call
  * resolves to a local "requests"-substring wrapper, and method NULL -> "ANY". */
 TEST(contract_edge_data_flows) {
     static const LangFile f[] = {
@@ -1349,9 +1349,7 @@ TEST(contract_edge_depends_on) {
     PASS();
 }
 
-/* Index `meaningful` files plus enough trivial pad files to cross the
- * MIN_FILES_FOR_PARALLEL (=50) threshold, forcing the PARALLEL pipeline path
- * (the only path that emits GRAPHQL_CALLS/GRPC_CALLS/TRPC_CALLS/INFRA_MAPS). */
+/* Index `meaningful` files plus PARALLEL_PAD_FILES trivial pad files. */
 enum { PARALLEL_PAD_FILES = 52 };
 
 static cbm_store_t *index_parallel_fixture(LangProj *lp, const LangFile *meaningful, int n_mean) {
@@ -1372,8 +1370,8 @@ static cbm_store_t *index_parallel_fixture(LangProj *lp, const LangFile *meaning
     return lang_index_files(lp, files, n);
 }
 
-/* GRAPHQL_CALLS + GRPC_CALLS + TRPC_CALLS + INFRA_MAPS — all parallel-path-only,
- * so they share one padded (>50-file) index. Each edge is triggered by an
+/* GRAPHQL_CALLS + GRPC_CALLS + TRPC_CALLS + INFRA_MAPS share one padded
+ * index. Each edge is triggered by an
  * independent in-repo symbol whose resolved QN carries the relevant library
  * substring; combining them in one repo doesn't couple them. */
 TEST(contract_edge_parallel_service_edges) {

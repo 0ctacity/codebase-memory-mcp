@@ -451,7 +451,7 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
 /* The weak short-name strategies that actually reach the call-resolution
  * guards: the registry's suffix_match / unique_name and the parallel
  * field_type_hint. "fuzzy" is listed as defensive insurance only —
- * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel resolvers
+ * cbm_registry_fuzzy_resolve is not wired into the resolver
  * today, so it never reaches these helpers, but naming it keeps a future wiring
  * from silently reintroducing the noise. Everything else — same_module /
  * import_map / import_map_suffix / qualified_suffix / callee_suffix /

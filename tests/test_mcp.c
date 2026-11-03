@@ -3763,8 +3763,7 @@ TEST(store_list_files_prefers_canonical_file_nodes) {
     PASS();
 }
 
-/* Write the 64-file Go fixture (above MIN_FILES_FOR_PARALLEL, so the gated
- * parallel extract runs). Generation 2 gives every file a second definition,
+/* Write the 64-file Go fixture. Generation 2 gives every file a second definition,
  * so a re-run must re-extract all of them. */
 static bool budget_fixture_write(const char *repo, int generation) {
     for (int i = 0; i < 64; i++) {

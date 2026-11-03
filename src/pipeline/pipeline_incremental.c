@@ -1545,7 +1545,7 @@ static int run_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
     free(changed_files);
     cbm_registry_free(registry);
     cbm_path_alias_collection_free(path_aliases);
-    cbm_pkgmap_free(ctx.pkgmap); /* built by the parallel or sequential extract, if it ran */
+    cbm_pkgmap_free(ctx.pkgmap); /* built by the parallel extract, if it ran */
     ctx.pkgmap = NULL;
     cbm_pipeline_set_pkgmap(NULL);
 
