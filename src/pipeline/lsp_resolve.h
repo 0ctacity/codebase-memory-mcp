@@ -497,13 +497,24 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference(
 }
 
 /* Rows that take part in the CALLS join. Count-based heuristics that compare
- * LSP output with textual calls must not count reference rows. */
+ * LSP output with textual calls must not count reference rows, nor the
+ * confidence-0 lsp_unresolved diagnostics the join ignores. */
 static inline int cbm_pipeline_invocation_row_count(const CBMResolvedCallArray *arr) {
     int n = 0;
     for (int i = 0; arr && i < arr->count; i++) {
-        if (arr->items[i].kind == CBM_RESOLVED_INVOCATION) {
+        if (arr->items[i].kind == CBM_RESOLVED_INVOCATION &&
+            arr->items[i].confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
             n++;
         }
+    }
+    return n;
+}
+
+/* Rows that take part in the CALL_REFERENCE join. */
+static inline int cbm_pipeline_reference_row_count(const CBMResolvedCallArray *arr) {
+    int n = 0;
+    for (int i = 0; arr && i < arr->count; i++) {
+        n += arr->items[i].kind == CBM_RESOLVED_CALL_REFERENCE ? 1 : 0;
     }
     return n;
 }
