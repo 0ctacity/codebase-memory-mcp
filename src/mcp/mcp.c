@@ -6799,6 +6799,393 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
     return gm;
 }
 
+/* ── In-process content scan ────────────────────────────────────────
+ * The scoped search_code path scans the indexed file list here instead of
+ * spawning `xargs grep` (POSIX) or a PowerShell Select-String pipeline
+ * (Windows), and fills grep_match_t directly, stopping at the match limit:
+ *   - patterns: the pattern split on '\n', as `grep -f` reads its file; an
+ *     empty pattern matches every line;
+ *   - literal mode is a substring match (grep -F); regex mode runs each line
+ *     through cbm_regex, the platform's POSIX ERE engine (grep -E), with the
+ *     GNU escapes (\b \< \w \s) grep accepts;
+ *   - a NUL byte in the first 32 KiB marks the file binary and yields no hit,
+ *     as grep prints no lines for it; after a later NUL nothing more is
+ *     reported, as GNU grep stops line output there;
+ *   - a listed file that cannot be read is skipped, as grep's error exit was
+ *     ignored.
+ * Ported from upstream 8df0639c without the cancellation checks (the server
+ * handles one request at a time) and without the intermediate grep text. */
+enum {
+    SEARCH_SCAN_BINARY_PROBE = 32768,
+    SEARCH_SCAN_CHECK_EVERY = 4096, /* lines between deadline checks */
+};
+
+typedef struct {
+    char **items;
+    size_t *lengths;
+    int count;
+    cbm_regex_t *regexes; /* regex mode: one per non-empty pattern */
+    int compiled;
+    bool any_empty; /* an empty pattern: every line matches */
+} search_scan_patterns_t;
+
+typedef struct {
+    grep_match_t *gm;
+    int count;
+    int cap;
+    int limit;
+    const char *root_path;
+    size_t root_len;
+} search_scan_hits_t;
+
+static void search_scan_patterns_free(search_scan_patterns_t *patterns) {
+    for (int i = 0; i < patterns->count; i++) {
+        free(patterns->items[i]);
+    }
+    for (int i = 0; patterns->regexes && i < patterns->compiled; i++) {
+        if (patterns->lengths[i] > 0) {
+            cbm_regfree(&patterns->regexes[i]);
+        }
+    }
+    free(patterns->items);
+    free(patterns->lengths);
+    free(patterns->regexes);
+    memset(patterns, 0, sizeof(*patterns));
+}
+
+static bool search_scan_patterns_parse(search_scan_patterns_t *patterns, const char *pattern,
+                                       bool use_regex) {
+    memset(patterns, 0, sizeof(*patterns));
+    int count = 1;
+    for (const char *p = pattern; *p; p++) {
+        count += *p == '\n' ? SKIP_ONE : 0;
+    }
+    patterns->items = calloc((size_t)count, sizeof(char *));
+    patterns->lengths = calloc((size_t)count, sizeof(size_t));
+    patterns->regexes = use_regex ? calloc((size_t)count, sizeof(cbm_regex_t)) : NULL;
+    if (!patterns->items || !patterns->lengths || (use_regex && !patterns->regexes)) {
+        search_scan_patterns_free(patterns);
+        return false;
+    }
+    const char *start = pattern;
+    for (int i = 0; i < count; i++) {
+        const char *end = strchr(start, '\n');
+        size_t length = end ? (size_t)(end - start) : strlen(start);
+        patterns->items[i] = malloc(length + SKIP_ONE);
+        if (!patterns->items[i]) {
+            patterns->count = i;
+            search_scan_patterns_free(patterns);
+            return false;
+        }
+        memcpy(patterns->items[i], start, length);
+        patterns->items[i][length] = '\0';
+        patterns->lengths[i] = length;
+        patterns->any_empty = patterns->any_empty || length == 0;
+        start = end ? end + SKIP_ONE : start + length;
+    }
+    patterns->count = count;
+    for (int i = 0; use_regex && i < count; i++) {
+        if (patterns->lengths[i] > 0 &&
+            cbm_regcomp(&patterns->regexes[i], patterns->items[i],
+                        CBM_REG_EXTENDED | CBM_REG_ENHANCED | CBM_REG_NOSUB) != CBM_REG_OK) {
+            patterns->compiled = i;
+            search_scan_patterns_free(patterns);
+            return false;
+        }
+        patterns->compiled = i + SKIP_ONE;
+    }
+    return true;
+}
+
+/* First occurrence of needle in hay; memmem where the C library has it. */
+static const char *search_scan_find(const char *hay, size_t hay_length, const char *needle,
+                                    size_t needle_length) {
+    if (needle_length == 0) {
+        return hay;
+    }
+    if (needle_length > hay_length) {
+        return NULL;
+    }
+#ifdef _WIN32
+    const char *last = hay + (hay_length - needle_length);
+    for (const char *p = hay; p <= last;) {
+        p = memchr(p, (unsigned char)needle[0], (size_t)(last - p) + SKIP_ONE);
+        if (!p) {
+            return NULL;
+        }
+        if (memcmp(p, needle, needle_length) == 0) {
+            return p;
+        }
+        p++;
+    }
+    return NULL;
+#else
+    return memmem(hay, hay_length, needle, needle_length);
+#endif
+}
+
+static size_t search_scan_count_newlines(const char *from, const char *to) {
+    size_t count = 0;
+    while (from < to) {
+        const char *newline = memchr(from, '\n', (size_t)(to - from));
+        if (!newline) {
+            break;
+        }
+        count++;
+        from = newline + SKIP_ONE;
+    }
+    return count;
+}
+
+static bool search_scan_line_matches(const search_scan_patterns_t *patterns, bool use_regex,
+                                     const char *line) {
+    if (patterns->any_empty) {
+        return true;
+    }
+    for (int i = 0; i < patterns->count; i++) {
+        if (use_regex ? cbm_regexec(&patterns->regexes[i], line, 0, NULL, 0) == CBM_REG_OK
+                      : strstr(line, patterns->items[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Append one hit the way collect_grep_matches stores a grep record: the path
+ * relative to the root, and the line without trailing CRs, truncated to the
+ * content buffer. False on allocation failure. */
+static bool search_scan_add_hit(search_scan_hits_t *hits, const char *path, size_t line_number,
+                                const char *line, size_t line_length) {
+    safe_grow(hits->gm, hits->count, hits->cap, PAIR_LEN);
+    if (!hits->gm) {
+        return false;
+    }
+    grep_match_t *m = &hits->gm[hits->count];
+    snprintf(m->file, sizeof(m->file), "%s",
+             strip_root_prefix(path, hits->root_path, hits->root_len));
+#ifdef _WIN32
+    cbm_normalize_path_sep(m->file);
+#endif
+    m->line = line_number > (size_t)INT_MAX ? INT_MAX : (int)line_number;
+    while (line_length > 0 && line[line_length - SKIP_ONE] == '\r') {
+        line_length--;
+    }
+    if (line_length >= sizeof(m->content)) {
+        line_length = sizeof(m->content) - SKIP_ONE;
+    }
+    memcpy(m->content, line, line_length);
+    m->content[line_length] = '\0';
+    sanitize_ascii(m->content);
+    hits->count++;
+    return true;
+}
+
+typedef enum {
+    SEARCH_SCAN_OK = 0,
+    SEARCH_SCAN_DEADLINE = 1,
+    SEARCH_SCAN_FAILED = 2,
+} search_scan_rc_t;
+
+/* Scan one file. `buffer` holds its bytes plus one spare byte. Stops early once
+ * hits->count reaches hits->limit. */
+static search_scan_rc_t search_scan_buffer(search_scan_hits_t *hits,
+                                           const search_scan_patterns_t *patterns, bool use_regex,
+                                           const char *path, char *buffer, size_t length,
+                                           uint64_t deadline_ms) {
+    size_t probe = length < SEARCH_SCAN_BINARY_PROBE ? length : SEARCH_SCAN_BINARY_PROBE;
+    if (memchr(buffer, '\0', probe)) {
+        return SEARCH_SCAN_OK;
+    }
+    const char *nul = memchr(buffer, '\0', length);
+    if (nul) {
+        /* Lines up to the last complete line before the NUL. */
+        size_t keep = 0;
+        for (size_t i = (size_t)(nul - buffer); i > 0; i--) {
+            if (buffer[i - SKIP_ONE] == '\n') {
+                keep = i;
+                break;
+            }
+        }
+        length = keep;
+    }
+    buffer[length] = '\0';
+    size_t line_number = 1;
+    size_t since_check = 0;
+    bool single_literal = !use_regex && !patterns->any_empty && patterns->count == 1;
+    size_t pos = 0;
+    while (pos < length && hits->count < hits->limit) {
+        if (++since_check >= SEARCH_SCAN_CHECK_EVERY) {
+            since_check = 0;
+            if (cbm_now_ms() >= deadline_ms) {
+                return SEARCH_SCAN_DEADLINE;
+            }
+        }
+        size_t line_start = pos;
+        if (single_literal) {
+            /* Jump to the next occurrence instead of visiting every line. */
+            const char *hit = search_scan_find(buffer + pos, length - pos, patterns->items[0],
+                                               patterns->lengths[0]);
+            if (!hit) {
+                break;
+            }
+            line_start = (size_t)(hit - buffer);
+            while (line_start > pos && buffer[line_start - SKIP_ONE] != '\n') {
+                line_start--;
+            }
+            line_number += search_scan_count_newlines(buffer + pos, buffer + line_start);
+        }
+        char *newline = memchr(buffer + line_start, '\n', length - line_start);
+        size_t line_end = newline ? (size_t)(newline - buffer) : length;
+        /* Windows matched Select-String's Line, which has no trailing CR, so
+         * `foo$` matched a CRLF line there; POSIX grep matches with the CR. */
+        size_t match_end = line_end;
+#ifdef _WIN32
+        if (match_end > line_start && buffer[match_end - SKIP_ONE] == '\r') {
+            match_end--;
+        }
+#endif
+        char saved = buffer[match_end];
+        buffer[match_end] = '\0';
+        bool matched =
+            single_literal || search_scan_line_matches(patterns, use_regex, buffer + line_start);
+        buffer[match_end] = saved;
+        if (matched && !search_scan_add_hit(hits, path, line_number, buffer + line_start,
+                                            line_end - line_start)) {
+            return SEARCH_SCAN_FAILED;
+        }
+        pos = line_end + SKIP_ONE;
+        line_number++;
+    }
+    return SEARCH_SCAN_OK;
+}
+
+/* Read a whole file into *buffer (grown as needed), leaving one spare byte. */
+static bool search_scan_read_file(const char *path, char **buffer, size_t *capacity,
+                                  size_t *length) {
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return false;
+    }
+    size_t used = 0;
+    bool ok = true;
+    for (;;) {
+        if (*capacity - used < CBM_SZ_64K + SKIP_ONE) {
+            size_t grown = *capacity ? *capacity * PAIR_LEN : (size_t)CBM_SZ_64K * PAIR_LEN;
+            if (grown <= *capacity || grown > (size_t)INT_MAX) {
+                ok = false;
+                break;
+            }
+            char *next = realloc(*buffer, grown);
+            if (!next) {
+                ok = false;
+                break;
+            }
+            *buffer = next;
+            *capacity = grown;
+        }
+        size_t want = *capacity - used - SKIP_ONE;
+        size_t got = fread(*buffer + used, 1, want, fp);
+        used += got;
+        if (got < want) {
+            ok = !ferror(fp);
+            break;
+        }
+    }
+    (void)fclose(fp);
+    *length = used;
+    return ok;
+}
+
+/* Scan every file in filelist_path (the write_scoped_filelist format) and
+ * return up to `limit` hits in file-list order. *out_rc is SEARCH_SCAN_OK,
+ * SEARCH_SCAN_DEADLINE once cbm_now_ms() reaches deadline_ms, or
+ * SEARCH_SCAN_FAILED (bad regex, unreadable list, allocation failure); the
+ * array is returned only on SEARCH_SCAN_OK. */
+static grep_match_t *search_scan_in_process(const char *filelist_path, const char *root_path,
+                                            const char *pattern, bool use_regex, int limit,
+                                            uint64_t deadline_ms, int *out_count,
+                                            search_scan_rc_t *out_rc) {
+#ifdef _WIN32
+    const char record_separator = '\n';
+#else
+    const char record_separator = '\0';
+#endif
+    *out_count = 0;
+    *out_rc = SEARCH_SCAN_FAILED;
+    search_scan_patterns_t patterns;
+    if (!search_scan_patterns_parse(&patterns, pattern, use_regex)) {
+        return NULL;
+    }
+    char *list = NULL;
+    size_t list_capacity = 0;
+    size_t list_length = 0;
+    search_scan_hits_t hits = {
+        .cap = CBM_SZ_64, .limit = limit, .root_path = root_path, .root_len = strlen(root_path)};
+    hits.gm = malloc((size_t)hits.cap * sizeof(grep_match_t));
+    if (!hits.gm || !search_scan_read_file(filelist_path, &list, &list_capacity, &list_length)) {
+        free(hits.gm);
+        free(list);
+        search_scan_patterns_free(&patterns);
+        return NULL;
+    }
+    char *buffer = NULL;
+    size_t capacity = 0;
+    search_scan_rc_t rc = SEARCH_SCAN_OK;
+    size_t pos = 0;
+    while (rc == SEARCH_SCAN_OK && pos < list_length && hits.count < limit) {
+        const char *end = memchr(list + pos, record_separator, list_length - pos);
+        size_t record_end = end ? (size_t)(end - list) : list_length;
+        list[record_end] = '\0';
+        const char *path = list + pos;
+        pos = record_end + SKIP_ONE;
+        if (!path[0]) {
+            continue;
+        }
+        if (cbm_now_ms() >= deadline_ms) {
+            rc = SEARCH_SCAN_DEADLINE;
+            break;
+        }
+        size_t length = 0;
+        if (!search_scan_read_file(path, &buffer, &capacity, &length)) {
+            continue;
+        }
+        rc = search_scan_buffer(&hits, &patterns, use_regex, path, buffer, length, deadline_ms);
+    }
+    free(buffer);
+    free(list);
+    search_scan_patterns_free(&patterns);
+    *out_rc = rc;
+    if (rc != SEARCH_SCAN_OK) {
+        free(hits.gm);
+        return NULL;
+    }
+    *out_count = hits.count;
+    return hits.gm;
+}
+
+int cbm_mcp_search_scan_for_testing(const char *filelist_path, const char *root_path,
+                                    const char *pattern, bool use_regex, int limit,
+                                    uint64_t deadline_ms, char *out, size_t out_size) {
+    int count = 0;
+    search_scan_rc_t rc = SEARCH_SCAN_FAILED;
+    grep_match_t *gm = search_scan_in_process(filelist_path, root_path, pattern, use_regex, limit,
+                                              deadline_ms, &count, &rc);
+    size_t used = 0;
+    if (out_size > 0) {
+        out[0] = '\0';
+    }
+    for (int i = 0; i < count && used < out_size; i++) {
+        int n = snprintf(out + used, out_size - used, "%s:%d:%s\n", gm[i].file, gm[i].line,
+                         gm[i].content);
+        if (n < 0) {
+            break;
+        }
+        used += (size_t)n;
+    }
+    free(gm);
+    return (int)rc;
+}
+
 /* Find the tightest node containing a line in a file. Returns index or -1. */
 static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
     int best = CBM_NOT_FOUND;
@@ -7050,9 +7437,8 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
     return true;
 }
 
-/* Write pattern to a temp file for grep -f. Returns true on success. */
-static bool write_pattern_file(char *tmpfile, int tmpfile_sz, const char *pattern) {
-    snprintf(tmpfile, tmpfile_sz, "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
+/* Write pattern to the temp file for grep -f. Returns true on success. */
+static bool write_pattern_file(const char *tmpfile, const char *pattern) {
     FILE *tf = fopen(tmpfile, "w");
     if (!tf) {
         return false;
@@ -7137,7 +7523,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
      * explicit error so callers can tell "broken pattern" from "no matches". */
     if (use_regex) {
         cbm_regex_t probe;
-        if (cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != CBM_REG_OK) {
+        if (cbm_regcomp(&probe, pattern, CBM_REG_EXTENDED | CBM_REG_ENHANCED | CBM_REG_NOSUB) !=
+            CBM_REG_OK) {
             if (has_path_filter) {
                 cbm_regfree(&path_regex);
             }
@@ -7189,16 +7576,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 1: Grep scan ──────────────────────────────────── */
     char tmpfile[CBM_SZ_256];
-    if (!write_pattern_file(tmpfile, sizeof(tmpfile), pattern)) {
-        char errmsg[CBM_SZ_256];
-        snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
-                 strerror(errno));
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result(errmsg, true);
-    }
+    snprintf(tmpfile, sizeof(tmpfile), "%s/cbm_search_%d.pat", cbm_tmpdir(), (int)getpid());
 
     /* No grep-level match limit — let grep find all matches, then dedup and
      * cap in our code. The -m flag caused results from large vendored files
@@ -7219,6 +7597,15 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                    has_path_filter ? &path_regex : NULL, file_pattern,
                                    &scoped_written);
 
+    /* The indexed file list is scanned in process. On Windows the list does not
+     * apply file_pattern (the PowerShell -like filter does), so that case keeps
+     * the subprocess. */
+#ifdef _WIN32
+    bool scan_in_process = scoped && !file_pattern;
+#else
+    bool scan_in_process = scoped;
+#endif
+
     /* Collect grep matches into array */
     int gm_count = 0;
     grep_match_t *gm = NULL;
@@ -7228,9 +7615,42 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
          * platform-dependent (GNU execs grep once with no operands, BSD
          * skips), and the post-grep filter would drop every hit anyway. */
         gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
-        cbm_unlink(tmpfile);
         cbm_unlink(filelist);
+    } else if (scan_in_process) {
+        search_scan_rc_t scan_rc = SEARCH_SCAN_FAILED;
+        gm = search_scan_in_process(filelist, root_path, pattern, use_regex, grep_limit,
+                                    cbm_now_ms() + MCP_SEARCH_SCAN_TIMEOUT_MS, &gm_count, &scan_rc);
+        cbm_unlink(filelist);
+        if (!gm) {
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            return cbm_mcp_text_result(scan_rc == SEARCH_SCAN_DEADLINE
+                                           ? "search_code scan exceeded its execution deadline"
+                                           : "search failed",
+                                       true);
+        }
     } else {
+        if (!write_pattern_file(tmpfile, pattern)) {
+            char errmsg[CBM_SZ_256];
+            snprintf(errmsg, sizeof(errmsg), "search failed: cannot create temp file (%s)",
+                     strerror(errno));
+            if (scoped) {
+                cbm_unlink(filelist);
+            }
+            if (has_path_filter) {
+                cbm_regfree(&path_regex);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            return cbm_mcp_text_result(errmsg, true);
+        }
         char cmd[CBM_SZ_4K];
         build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
                        root_path);

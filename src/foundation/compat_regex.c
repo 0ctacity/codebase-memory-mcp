@@ -84,6 +84,11 @@ static int translate_flags(int flags) {
     if (flags & CBM_REG_NEWLINE) {
         posix_flags |= REG_NEWLINE;
     }
+#ifdef REG_ENHANCED
+    if (flags & CBM_REG_ENHANCED) {
+        posix_flags |= REG_ENHANCED;
+    }
+#endif
     return posix_flags;
 }
 

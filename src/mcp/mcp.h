@@ -212,4 +212,12 @@ bool cbm_parse_file_uri(const char *uri, char *out_path, int out_size);
 /* CBM_INDEX_MAX_RESTARTS as the supervised index path reads it (tests). */
 int cbm_index_restart_cap_for_testing(void);
 
+/* Run search_code's in-process scanner over a file list in the scoped format
+ * (NUL-separated on POSIX, newline-separated on Windows) and write the hits
+ * as "file:line:content\n" into out (tests). Returns 0 on success, 1 when
+ * deadline_ms (a cbm_now_ms() value) passed, 2 on failure. */
+int cbm_mcp_search_scan_for_testing(const char *filelist_path, const char *root_path,
+                                    const char *pattern, bool use_regex, int limit,
+                                    uint64_t deadline_ms, char *out, size_t out_size);
+
 #endif /* CBM_MCP_H */
