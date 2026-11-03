@@ -13,20 +13,23 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
 const parser = @import("parser.zig");
+const interop = @import("../foundation/interop.zig");
 
-const CStr = parser.CStr;
+const CStr = interop.CStr;
 const ix = parser.ix;
 const narrow = parser.narrow;
-const heapStrdup = parser.heapStrdup;
-const strFree = parser.strFree;
-const bprint = parser.bprint;
-const sp = parser.sp;
-const ciEq = parser.ciEq;
+const heapStrdup = interop.heapStrdup;
+const strFree = interop.strFree;
+const bprint = interop.bprint;
+const sp = interop.sp;
+const ciEq = interop.ciEq;
 const isScalarValueFunc = parser.isScalarValueFunc;
-const mallocN = parser.mallocN;
-const callocN = parser.callocN;
-const reallocN = parser.reallocN;
-const safeReallocN = parser.safeReallocN;
+const mallocN = interop.mallocN;
+const callocN = interop.callocN;
+const reallocN = interop.reallocN;
+const safeReallocN = interop.safeReallocN;
+const log = interop.log;
+const logWarn = interop.logWarn;
 
 const Node = c.cbm_node_t;
 const Edge = c.cbm_edge_t;
@@ -80,14 +83,6 @@ fn at(p: anytype, i: usize) At(@TypeOf(p)) {
 }
 
 const Str = [*:0]const u8;
-
-fn log(level: c.CBMLogLevel, msg: Str, kvs: anytype) void {
-    @call(.auto, c.cbm_log, .{ level, msg } ++ kvs ++ .{@as(?Str, null)});
-}
-
-fn logWarn(msg: Str, kvs: anytype) void {
-    log(c.CBM_LOG_WARN, msg, kvs);
-}
 
 /// C's (long long) conversion of a double. Out-of-range values and NaN are
 /// undefined in C; this gives what the hardware conversion gives, so the

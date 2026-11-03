@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const c = @import("c");
+const interop = @import("../foundation/interop.zig");
 
 const Tok = c.cbm_token_type_t;
 const Token = c.cbm_token_t;
@@ -17,7 +18,16 @@ const Cond = c.cbm_condition_t;
 const ReturnItem = c.cbm_return_item_t;
 const ReturnClause = c.cbm_return_clause_t;
 const Query = c.cbm_query_t;
-pub const CStr = [*c]const u8;
+const CStr = interop.CStr;
+const mallocN = interop.mallocN;
+const callocN = interop.callocN;
+const reallocN = interop.reallocN;
+const safeReallocN = interop.safeReallocN;
+const strFree = interop.strFree;
+const heapStrdup = interop.heapStrdup;
+const sp = interop.sp;
+const bprint = interop.bprint;
+const ciEq = interop.ciEq;
 
 const NOT_FOUND: c_int = c.CBM_NOT_FOUND;
 const INIT_CAP4 = 4;
@@ -37,42 +47,6 @@ pub inline fn narrow(v: c_long) c_int {
     return @truncate(v);
 }
 
-pub fn mallocN(comptime T: type, n: usize) [*c]T {
-    return @ptrCast(@alignCast(c.malloc(n * @sizeOf(T))));
-}
-
-pub fn callocN(comptime T: type, n: usize) [*c]T {
-    return @ptrCast(@alignCast(c.calloc(n, @sizeOf(T))));
-}
-
-pub fn reallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
-    return @ptrCast(@alignCast(c.realloc(@ptrCast(p), n * @sizeOf(T))));
-}
-
-/// safe_realloc from foundation/platform.h: frees the old block on failure.
-pub fn safeReallocN(comptime T: type, p: [*c]T, n: usize) [*c]T {
-    const size = if (n * @sizeOf(T) == 0) 1 else n * @sizeOf(T);
-    const tmp = c.realloc(@ptrCast(p), size);
-    if (tmp == null) c.free(@ptrCast(p));
-    return @ptrCast(@alignCast(tmp));
-}
-
-/// safe_str_free from foundation/platform.h.
-pub fn strFree(slot: *CStr) void {
-    if (slot.* != null) {
-        c.free(@ptrCast(@constCast(slot.*)));
-        slot.* = null;
-    }
-}
-
-pub fn heapStrdup(s: CStr) [*c]u8 {
-    if (s == null) return null;
-    const len = c.strlen(s);
-    const d = mallocN(u8, len + 1);
-    if (d != null) @memcpy(d[0 .. len + 1], s[0 .. len + 1]);
-    return d;
-}
-
 fn heapStrndup(s: CStr, n: usize) [*c]u8 {
     const d = mallocN(u8, n + 1);
     if (d != null) {
@@ -82,31 +56,8 @@ fn heapStrndup(s: CStr, n: usize) [*c]u8 {
     return d;
 }
 
-/// The C string s as a slice; NULL reads as "(null)", the way printf's %s
-/// prints it.
-pub fn sp(s: CStr) []const u8 {
-    if (s == null) return "(null)";
-    return std.mem.span(s);
-}
-
-/// snprintf into buf: writes what fits plus a NUL and returns the length the
-/// whole output would have had.
-pub fn bprint(buf: []u8, comptime fmt: []const u8, args: anytype) usize {
-    if (buf.len == 0) return std.fmt.count(fmt, args);
-    var w: std.Io.Writer = .fixed(buf[0 .. buf.len - 1]);
-    w.print(fmt, args) catch {};
-    buf[w.end] = 0;
-    return std.fmt.count(fmt, args);
-}
-
 fn strEql(a: CStr, b: []const u8) bool {
     return a != null and std.mem.eql(u8, std.mem.span(a), b);
-}
-
-/// ASCII case-insensitive string equality.
-pub fn ciEq(a: CStr, b: CStr) bool {
-    if (a == null or b == null) return false;
-    return std.ascii.eqlIgnoreCase(std.mem.span(a), std.mem.span(b));
 }
 
 // ══════════════════════════════════════════════════════════════════

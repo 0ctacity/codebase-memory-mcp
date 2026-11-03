@@ -489,6 +489,7 @@ endif
 # into the "c" module they use for C declarations.
 CBM_ZIG_SRC = src/cbm_zig.zig
 CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cli/cli_zig.h \
+               src/foundation/interop.zig \
                src/cypher/parser.zig src/cypher/cypher.zig src/cypher/cypher.h \
                src/discover/discover.zig src/discover/gitignore.zig src/discover/language.zig \
                src/discover/userconfig.zig \

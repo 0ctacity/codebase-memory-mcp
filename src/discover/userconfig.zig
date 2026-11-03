@@ -15,8 +15,10 @@
 
 const std = @import("std");
 const c = @import("c");
+const interop = @import("../foundation/interop.zig");
 
 const Str = [*:0]const u8;
+const logWarn = interop.logWarn;
 const Lang = c.CBMLanguage;
 
 const MAX_CONFIG_SIZE = 65536;
@@ -130,13 +132,6 @@ fn langFromString(s: Str) Lang {
         if (std.mem.eql(u8, entry.name, lower[0..i])) return entry.lang;
     }
     return LANG_UNKNOWN;
-}
-
-// ── Logging ────────────────────────────────────────────────────────
-
-/// cbm_log_warn: cbm_log with the NULL key terminator the C macro appends.
-fn logWarn(msg: Str, kvs: anytype) void {
-    @call(.auto, c.cbm_log, .{ c.CBM_LOG_WARN, msg } ++ kvs ++ .{@as(?Str, null)});
 }
 
 // ── JSON parsing ───────────────────────────────────────────────────

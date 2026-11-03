@@ -16,10 +16,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("c");
+const interop = @import("../foundation/interop.zig");
 
 const is_windows = builtin.os.tag == .windows;
 
 const Str = [*:0]const u8;
+const logInfo = interop.logInfo;
+const logWarn = interop.logWarn;
 
 // ── Constants ──────────────────────────────────────────────────────
 
@@ -131,19 +134,6 @@ const Watcher = struct {
 };
 
 // ── Helpers ────────────────────────────────────────────────────────
-
-/// cbm_log with the NULL key terminator the C convenience macros append.
-fn log(level: c.CBMLogLevel, msg: Str, kvs: anytype) void {
-    @call(.auto, c.cbm_log, .{ level, msg } ++ kvs ++ .{@as(?Str, null)});
-}
-
-fn logInfo(msg: Str, kvs: anytype) void {
-    log(c.CBM_LOG_INFO, msg, kvs);
-}
-
-fn logWarn(msg: Str, kvs: anytype) void {
-    log(c.CBM_LOG_WARN, msg, kvs);
-}
 
 fn dupZ(s: Str) ?[*:0]u8 {
     const len = std.mem.len(s);
