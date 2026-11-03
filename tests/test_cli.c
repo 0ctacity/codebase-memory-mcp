@@ -3669,6 +3669,152 @@ TEST(cli_zova_ops_strict_parser_dispatch_and_exit_mapping) {
     PASS();
 }
 
+/* Runs zova-ops with stdout sent to out_path and copies the JSON report's
+ * "reason" into reason. Returns the exit code, or -1 if the redirect failed. */
+static int zova_ops_reason(int argc, char **argv, const char *out_path, char *reason,
+                           size_t reason_size) {
+    reason[0] = '\0';
+    (void)fflush(stdout);
+    int saved = dup(fileno(stdout));
+    FILE *out = fopen(out_path, "w+");
+    if (saved < 0 || !out || dup2(fileno(out), fileno(stdout)) < 0) {
+        if (out)
+            (void)fclose(out);
+        if (saved >= 0)
+            close(saved);
+        return -1;
+    }
+    int rc = cbm_cmd_zova_ops(argc, argv);
+    (void)fflush(stdout);
+    (void)dup2(saved, fileno(stdout));
+    close(saved);
+    char buf[4096] = {0};
+    rewind(out);
+    size_t n = fread(buf, 1, sizeof(buf) - 1, out);
+    (void)fclose(out);
+    yyjson_doc *doc = yyjson_read(buf, n, 0);
+    const char *value = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "reason"));
+    snprintf(reason, reason_size, "%s", value ? value : "");
+    yyjson_doc_free(doc);
+    return rc;
+}
+
+/* Pins every zova-ops action's flag rules and the order of usage errors. */
+TEST(cli_zova_ops_flag_rules_and_error_order) {
+    enum { IN, OUT, WS, CONFIRM, REPO, CONFIRM_REPLACE, REPLACE, NFLAGS };
+    static const char *const flag_names[NFLAGS] = {
+        "--input",     "--output",          "--workspace-id", "--confirm-workspace",
+        "--repo-path", "--confirm-replace", "--replace",
+    };
+    static const struct {
+        const char *action;
+        unsigned required, optional;
+    } rules[] = {
+        {"status", 0, 0},
+        {"backup", 1u << OUT, 0},
+        {"restore", 1u << IN | 1u << CONFIRM_REPLACE, 0},
+        {"export-database", 1u << OUT, 0},
+        {"import-database", 1u << IN | 1u << CONFIRM_REPLACE, 0},
+        {"export-workspace", 1u << WS | 1u << OUT, 0},
+        {"import-workspace", 1u << IN, 1u << REPLACE},
+        {"delete-workspace", 1u << WS | 1u << CONFIRM, 0},
+        {"compact", 0, 0},
+        {"health", 0, 1u << WS},
+        {"recover-workspace", 1u << WS | 1u << REPO, 0},
+        {"migrate-format", 0, 0},
+    };
+    char cache[256], repo[256], file[512], out_path[512], reason[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-cli-zova-rules-cache-%d", (int)getpid());
+    snprintf(repo, sizeof(repo), "/tmp/cbm-cli-zova-rules-repo-%d", (int)getpid());
+    snprintf(file, sizeof(file), "%s/archive", cache);
+    snprintf(out_path, sizeof(out_path), "%s/stdout.json", cache);
+    test_rmdir_r(cache);
+    test_rmdir_r(repo);
+    ASSERT_EQ(test_mkdirp(cache), 0);
+    ASSERT_EQ(test_mkdirp(repo), 0);
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(setenv("CBM_CACHE_DIR", cache, 1), 0);
+    char workspace[] = "w1_00000000000000000000000000000000";
+    char *values[NFLAGS] = {file, file, workspace, workspace, repo, NULL, NULL};
+    const char *invalid_flags = "invalid flags for zova-ops action";
+
+    /* For each action: its required flags pass validation; dropping one, or
+     * adding a flag that is neither required nor optional, is a usage error;
+     * adding an optional flag still passes. */
+    for (size_t r = 0; r < sizeof(rules) / sizeof(rules[0]); r++) {
+        for (int variant = -1; variant < NFLAGS; variant++) {
+            unsigned flags = rules[r].required;
+            if (variant >= 0)
+                flags ^= 1u << variant;
+            bool expect_valid = (flags & rules[r].required) == rules[r].required &&
+                                (flags & ~(rules[r].required | rules[r].optional)) == 0;
+            char *argv[2 + 2 * NFLAGS];
+            int argc = 0;
+            argv[argc++] = (char *)rules[r].action;
+            for (int f = 0; f < NFLAGS; f++) {
+                if (!(flags & 1u << f))
+                    continue;
+                argv[argc++] = (char *)flag_names[f];
+                if (values[f])
+                    argv[argc++] = values[f];
+            }
+            argv[argc++] = "--json";
+            int rc = zova_ops_reason(argc, argv, out_path, reason, sizeof(reason));
+            if (expect_valid) {
+                ASSERT_TRUE(rc == 0 || rc == 1);
+                ASSERT_STR_NEQ(reason, invalid_flags);
+            } else {
+                ASSERT_EQ(rc, 2);
+                ASSERT_STR_EQ(reason, invalid_flags);
+            }
+        }
+    }
+
+    /* Usage errors, in the order they are checked. */
+    const struct {
+        int argc;
+        const char *argv[6];
+        const char *reason;
+    } errors[] = {
+        {0, {NULL}, "missing zova-ops action"},
+        {1, {"--json"}, "missing zova-ops action"},
+        {2, {"vacuum", "--wat"}, "unknown zova-ops action"},
+        {3, {"status", "--json", "--json"}, "duplicate --json"},
+        {3, {"restore", "--confirm-replace", "--confirm-replace"}, "duplicate --confirm-replace"},
+        {3, {"import-workspace", "--replace", "--replace"}, "duplicate --replace"},
+        {2, {"status", "--wat"}, "unknown zova-ops flag"},
+        {3, {"status", "wat", "--json"}, "unknown zova-ops flag"},
+        {2, {"backup", "--output"}, "missing or duplicate flag value"},
+        {3, {"backup", "--output", "--json"}, "missing or duplicate flag value"},
+        {5, {"backup", "--output", "a", "--output", "b"}, "missing or duplicate flag value"},
+        {3, {"health", "--workspace-id", "bad"}, "--json is required"},
+        {5,
+         {"status", "--confirm-workspace", "bad", "--workspace-id", "bad"},
+         "--json is required"},
+        {6,
+         {"status", "--confirm-workspace", "bad", "--workspace-id", "bad", "--json"},
+         "invalid --workspace-id"},
+        {4, {"status", "--confirm-workspace", "bad", "--json"}, "invalid --confirm-workspace"},
+        {4, {"status", "--confirm-workspace", workspace, "--json"}, invalid_flags},
+    };
+    for (size_t e = 0; e < sizeof(errors) / sizeof(errors[0]); e++) {
+        char *argv[6];
+        memcpy(argv, errors[e].argv, sizeof(argv));
+        ASSERT_EQ(zova_ops_reason(errors[e].argc, argv, out_path, reason, sizeof(reason)), 2);
+        ASSERT_STR_EQ(reason, errors[e].reason);
+    }
+
+    if (saved_cache_copy)
+        ASSERT_EQ(setenv("CBM_CACHE_DIR", saved_cache_copy, 1), 0);
+    else
+        ASSERT_EQ(unsetenv("CBM_CACHE_DIR"), 0);
+    free(saved_cache_copy);
+    test_rmdir_r(repo);
+    test_rmdir_r(cache);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3893,4 +4039,5 @@ SUITE(cli) {
     RUN_TEST(cli_print_tool_help_issue680);
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
     RUN_TEST(cli_zova_ops_strict_parser_dispatch_and_exit_mapping);
+    RUN_TEST(cli_zova_ops_flag_rules_and_error_order);
 }
