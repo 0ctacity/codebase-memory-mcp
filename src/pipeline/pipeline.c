@@ -12,8 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3 };
-#define PL_NSEC_PER_SEC 1000000000LL
+enum { CBM_DIR_PERMS = 0755 };
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
@@ -48,12 +47,6 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3 };
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
-
-static inline void *intptr_to_ptr(intptr_t v) {
-    void *p;
-    memcpy(&p, &v, sizeof(p));
-    return p;
-}
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
 
@@ -117,34 +110,15 @@ struct cbm_pipeline {
     bool saved_summary_valid;
 };
 
-/* ── Timing helper ──────────────────────────────────────────────── */
-
-static double elapsed_ms(struct timespec start) {
-    struct timespec now;
-    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
-    return ((double)(now.tv_sec - start.tv_sec) * CBM_MS_PER_SEC) +
-           ((double)(now.tv_nsec - start.tv_nsec) / CBM_US_PER_SEC_F);
-}
-
-/* Format int to string for logging. Thread-safe via TLS rotating buffers. */
-static const char *itoa_buf(int val) {
-    static CBM_TLS char bufs[PL_RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & PL_RING_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
-
 /* Log current + peak RSS and the budget at a pipeline phase boundary (memory
  * profiling). The process peak is cumulative, so the boundary where peak_mb
  * first rises is the phase that set it (#49). */
 void cbm_pipeline_log_phase_mem(const char *phase) {
     enum { PL_BYTES_PER_MB = 1024 * 1024 };
     cbm_log_info("mem.phase", "phase", phase, "rss_mb",
-                 itoa_buf((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
-                 itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)), "budget_mb",
-                 itoa_buf((int)(cbm_mem_budget() / PL_BYTES_PER_MB)));
+                 cbm_log_itoa((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
+                 cbm_log_itoa((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)), "budget_mb",
+                 cbm_log_itoa((int)(cbm_mem_budget() / PL_BYTES_PER_MB)));
 }
 
 /* Post-extraction budget gate. The extract phase enforces the budget with
@@ -172,8 +146,9 @@ int cbm_pipeline_budget_gate(const char *phase) {
     if (!cbm_mem_over_budget()) {
         return 0;
     }
-    cbm_log_error("mem.budget.exceeded", "rss_mb", itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))),
-                  "budget_mb", itoa_buf((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
+    cbm_log_error("mem.budget.exceeded", "rss_mb",
+                  cbm_log_itoa((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
+                  cbm_log_itoa((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
                   phase ? phase : "post_extract", "action", "fail_whole");
     return CBM_PIPELINE_ABORT_OVER_BUDGET;
 }
@@ -404,7 +379,8 @@ void cbm_pipeline_stamp_coverage(cbm_pipeline_t *p, cbm_gbuf_t *gbuf) {
         }
     }
     if (partial > 0 || missed > 0) {
-        cbm_log_info("index.coverage", "partial", itoa_buf(partial), "missed", itoa_buf(missed));
+        cbm_log_info("index.coverage", "partial", cbm_log_itoa(partial), "missed",
+                     cbm_log_itoa(missed));
     }
 }
 
@@ -603,7 +579,7 @@ static void create_folder_chain(cbm_pipeline_t *p, const cbm_stem_marks_t *marks
                                 CBMHashTable *seen_dirs) {
     char *walk = strdup(dir);
     while (walk[0] != '\0' && !cbm_ht_get(seen_dirs, walk)) {
-        cbm_ht_set(seen_dirs, strdup(walk), intptr_to_ptr(SKIP_ONE));
+        cbm_ht_set(seen_dirs, strdup(walk), cbm_intptr_to_ptr(SKIP_ONE));
         char folder_buf[CBM_SZ_8K];
         const char *folder_qn =
             cbm_stem_marks_folder_qn(marks, p->project_name, walk, folder_buf, sizeof(folder_buf));
@@ -644,7 +620,7 @@ static void create_folder_chain(cbm_pipeline_t *p, const cbm_stem_marks_t *marks
 
 static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
                           const cbm_file_info_t *files, int file_count) {
-    cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
+    cbm_log_info("pass.start", "pass", "structure", "files", cbm_log_itoa(file_count));
 
     /* Project node */
     /* coverage_version marks a generation whose File nodes carry coverage
@@ -733,8 +709,9 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
     cbm_ht_foreach(seen_dirs, free_seen_dir_key, NULL);
     cbm_ht_free(seen_dirs);
 
-    cbm_log_info("pass.done", "pass", "structure", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)),
-                 "edges", itoa_buf(cbm_gbuf_edge_count(p->gbuf)));
+    cbm_log_info("pass.done", "pass", "structure", "nodes",
+                 cbm_log_itoa(cbm_gbuf_node_count(p->gbuf)), "edges",
+                 cbm_log_itoa(cbm_gbuf_edge_count(p->gbuf)));
     return 0;
 }
 
@@ -1029,7 +1006,7 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         passes[i].fn(ctx);
         cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(t)));
+                     cbm_log_itoa((int)cbm_elapsed_ms(t)));
         cbm_pipeline_log_phase_mem(passes[i].name);
     }
     return 0;
@@ -1039,8 +1016,8 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
 static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                const cbm_file_info_t *files, int file_count, int worker_count,
                                struct timespec *t) {
-    cbm_log_info("pipeline.mode", "mode", "parallel", "workers", itoa_buf(worker_count), "files",
-                 itoa_buf(file_count));
+    cbm_log_info("pipeline.mode", "mode", "parallel", "workers", cbm_log_itoa(worker_count),
+                 "files", cbm_log_itoa(file_count));
     _Atomic int64_t shared_ids;
     atomic_init(&shared_ids, cbm_gbuf_next_id(p->gbuf));
     CBMFileResult **cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
@@ -1051,7 +1028,7 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
     cbm_log_info("pass.timing", "pass", "parallel_extract", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(*t)));
+                 cbm_log_itoa((int)cbm_elapsed_ms(*t)));
     if (rc != 0 || check_cancel(p)) {
         free(cache);
         return rc != 0 ? rc : CBM_NOT_FOUND;
@@ -1064,11 +1041,11 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * memory-pressure threshold and got it SIGKILLed at registry entry. */
     cbm_mem_collect();
     cbm_log_info("mem.collect", "phase", "post_extract", "rss_mb",
-                 itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))));
+                 cbm_log_itoa((int)(cbm_mem_rss() / (1024 * 1024))));
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_build_registry_from_cache(ctx, files, file_count, cache);
     cbm_log_info("pass.timing", "pass", "registry_build", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(*t)));
+                 cbm_log_itoa((int)cbm_elapsed_ms(*t)));
     cbm_pipeline_log_phase_mem("registry_build");
     /* #49: registry_build is the first post-extract whole-graph allocation. */
     if (rc == 0 && !check_cancel(p)) {
@@ -1150,7 +1127,7 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(*t)));
+                 cbm_log_itoa((int)cbm_elapsed_ms(*t)));
     cbm_pipeline_log_phase_mem("lsp_cross_prepare");
     /* #49: the cross-file registries are a whole-graph working set allocated
      * after extract. Stop before resolve if they pushed RSS over the budget. */
@@ -1163,7 +1140,7 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                                  def_count, def_modules, module_def_index, &cross_registries);
         cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(*t)));
+                     cbm_log_itoa((int)cbm_elapsed_ms(*t)));
         cbm_pipeline_log_phase_mem("parallel_resolve");
     }
     cbm_pxc_free_module_def_index(module_def_index);
@@ -1195,7 +1172,7 @@ static int run_parallel_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     cbm_pipeline_pass_k8s(ctx, files, file_count);
-    cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
+    cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", cbm_log_itoa((int)cbm_elapsed_ms(*t)));
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
@@ -1215,7 +1192,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc == 0 && cbm_result_spill_load_failures(ctx->spill) > 0) {
         /* A pass ran without some parked results: never publish that graph. */
         cbm_log_error("mem.spill.failed", "load_failures",
-                      itoa_buf((int)cbm_result_spill_load_failures(ctx->spill)));
+                      cbm_log_itoa((int)cbm_result_spill_load_failures(ctx->spill)));
         rc = CBM_NOT_FOUND;
     }
     if (ctx->spill) {
@@ -1224,8 +1201,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         int64_t loads = 0;
         cbm_result_spill_stats(ctx->spill, &parked, &bytes, &loads);
         if (parked > 0) {
-            cbm_log_info("mem.spill.done", "parked", itoa_buf((int)parked), "mb",
-                         itoa_buf((int)(bytes / (1024 * 1024))), "loads", itoa_buf((int)loads));
+            cbm_log_info("mem.spill.done", "parked", cbm_log_itoa((int)parked), "mb",
+                         cbm_log_itoa((int)(bytes / (1024 * 1024))), "loads",
+                         cbm_log_itoa((int)loads));
         }
         cbm_result_spill_close(ctx->spill);
         ctx->spill = NULL;
@@ -1274,7 +1252,7 @@ static int try_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
                 } else if (hash_count > 0 &&
                            file_count <= hash_count + (hash_count / PAIR_LEN)) {
                     cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
-                                 itoa_buf(hash_count), "authority", "zova");
+                                 cbm_log_itoa(hash_count), "authority", "zova");
                     /* The exported snapshot owns all of its data. Release the
                      * read transaction before publishing the next generation,
                      * otherwise it pins the old WAL and prevents checkpointing. */
@@ -1295,9 +1273,9 @@ static int try_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
                     return rc == 0 ? 0 : PIPELINE_INCREMENTAL_FATAL;
                 }
                 if (hash_count > 0 && !p->format_migration) {
-                    cbm_log_info("pipeline.route", "path", "mode_change_reindex",
-                                 "stored_hashes", itoa_buf(hash_count), "discovered",
-                                 itoa_buf(file_count), "authority", "zova");
+                    cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
+                                 cbm_log_itoa(hash_count), "discovered", cbm_log_itoa(file_count),
+                                 "authority", "zova");
                 }
                 cbm_zova_workspace_snapshot_free(&snapshot);
             }
@@ -1306,18 +1284,6 @@ static int try_incremental(cbm_pipeline_t *p, cbm_file_info_t *files, int file_c
         }
     }
     return CBM_NOT_FOUND;
-}
-
-/* Get platform-specific mtime in nanoseconds. */
-static int64_t stat_mtime_ns(const struct stat *fst) {
-#ifdef __APPLE__
-    return ((int64_t)fst->st_mtimespec.tv_sec * PL_NSEC_PER_SEC) +
-           (int64_t)fst->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)fst->st_mtime * 1000000000LL;
-#else
-    return ((int64_t)fst->st_mtim.tv_sec * PL_NSEC_PER_SEC) + (int64_t)fst->st_mtim.tv_nsec;
-#endif
 }
 
 static int pipeline_publish_zova_user_database(
@@ -1343,7 +1309,7 @@ static int pipeline_publish_zova_user_database(
         hashes[count++] = (cbm_zova_file_hash_input_t){
             .file_path = files[i].rel_path,
             .content_hash = "",
-            .mtime_ns = stat_mtime_ns(&fst),
+            .mtime_ns = cbm_stat_mtime_ns(&fst),
             .size_bytes = fst.st_size,
         };
     }
@@ -1388,7 +1354,7 @@ static int pipeline_publish_zova_user_database(
         .node_vectors_deleted = result.node_vectors_deleted,
         .token_vectors_upserted = result.token_vectors_upserted,
         .token_vectors_deleted = result.token_vectors_deleted,
-        .route_ms = elapsed_ms(route_started),
+        .route_ms = cbm_elapsed_ms(route_started),
         .normalization_ms = result.normalization_ms,
         .model_nodes_ms = result.model_nodes_ms,
         .model_edges_ms = result.model_edges_ms,
@@ -1398,8 +1364,7 @@ static int pipeline_publish_zova_user_database(
         .model_edge_payload_ms = result.model_edge_payload_ms,
         .model_edge_digest_ms = result.model_edge_digest_ms,
         .model_edge_default_payloads = result.model_edge_default_payloads,
-        .model_edge_payload_scratch_edges =
-            result.model_edge_payload_scratch_edges,
+        .model_edge_payload_scratch_edges = result.model_edge_payload_scratch_edges,
         .model_hashes_ms = result.model_hashes_ms,
         .model_vectors_ms = result.model_vectors_ms,
         .model_digests_ms = result.model_digests_ms,
@@ -1557,7 +1522,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         if (!gh_threaded) {
             cbm_pipeline_githistory_compute(ctx->repo_path, &gh_result);
             cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
-                         itoa_buf((int)elapsed_ms(t_gh)));
+                         cbm_log_itoa((int)cbm_elapsed_ms(t_gh)));
         }
     } else {
         cbm_log_info("pass.skip", "pass", "githistory", "reason", "fast_mode");
@@ -1566,15 +1531,15 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     if (gh_threaded) {
         cbm_thread_join(&gh_thread);
         cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(t_gh)));
+                     cbm_log_itoa((int)cbm_elapsed_ms(t_gh)));
     }
 
     int gh_edges = 0;
     if (gh_result.count > 0 || gh_result.file_temporal_count > 0) {
         gh_edges = cbm_pipeline_githistory_apply(ctx, &gh_result);
     }
-    cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_buf(gh_result.commit_count),
-                 "edges", itoa_buf(gh_edges));
+    cbm_log_info("pass.done", "pass", "githistory", "commits", cbm_log_itoa(gh_result.commit_count),
+                 "edges", cbm_log_itoa(gh_edges));
     free(gh_result.couplings);
     free(gh_result.file_temporal);
     return 0;
@@ -1590,7 +1555,8 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_START(t_tests);
     int rc = cbm_pipeline_pass_tests(ctx, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_tests", t_tests, file_count);
-    cbm_log_info("pass.timing", "pass", "tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    cbm_log_info("pass.timing", "pass", "tests", "elapsed_ms",
+                 cbm_log_itoa((int)cbm_elapsed_ms(t)));
     if (rc == 0 && !check_cancel(p)) {
         CBM_PROF_START(t_gh);
         rc = run_githistory(p, ctx);
@@ -1642,7 +1608,8 @@ static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
     CBM_PROF_START(t_struct);
     pass_structure(p, ctx->stem_marks, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
-    cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms",
+                 cbm_log_itoa((int)cbm_elapsed_ms(t)));
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -1720,11 +1687,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cbm_log_warn("pipeline.discover", "degraded", "true");
     }
     if (rc != 0) {
-        cbm_log_error("pipeline.err", "phase", "discover", "rc", itoa_buf(rc));
+        cbm_log_error("pipeline.err", "phase", "discover", "rc", cbm_log_itoa(rc));
     }
     CBM_PROF_END_N("pipeline", "1_discover", t_discover, file_count);
-    cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t0)));
+    cbm_log_info("pipeline.discover", "files", cbm_log_itoa(file_count), "elapsed_ms",
+                 cbm_log_itoa((int)cbm_elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
@@ -1782,9 +1749,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
     cbm_pipeline_log_phase_mem("pipeline_done");
-    cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
-                 itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t0)));
+    cbm_log_info("pipeline.done", "nodes", cbm_log_itoa(cbm_gbuf_node_count(p->gbuf)), "edges",
+                 cbm_log_itoa(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
+                 cbm_log_itoa((int)cbm_elapsed_ms(t0)));
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:

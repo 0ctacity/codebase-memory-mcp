@@ -6,6 +6,7 @@
 #include "foundation/constants.h"
 #include "foundation/compat.h" // CBM_TLS
 #include "foundation/log.h"    // cbm_log_error -- walker stack allocation failure
+#include "foundation/str_util.h" // cbm_path_base
 #include <stdlib.h>            // calloc/free for the symbol-set cache
 
 enum {
@@ -271,10 +272,6 @@ static bool has_prefix(const char *str, const char *prefix) {
 }
 
 // Extract basename from path
-static const char *path_basename(const char *path) {
-    const char *last = strrchr(path, '/');
-    return last ? last + SKIP_ONE : path;
-}
 
 // Strip extension from basename
 static void strip_ext(const char *base, char *buf, size_t buflen) {
@@ -295,7 +292,7 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
     if (!rel_path) {
         return false;
     }
-    const char *base = path_basename(rel_path);
+    const char *base = cbm_path_base(rel_path);
 
     /* A file under a conventional test directory is a test file whatever its
      * basename, matching cbm_is_test_path in pass_tests.c (#1294). */

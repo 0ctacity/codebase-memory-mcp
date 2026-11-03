@@ -86,12 +86,6 @@ const char *cbm_stem_marks_module_qn(const cbm_stem_marks_t *m, const char *qn,
  * file set, and which of them yields. */
 int cbm_stem_marks_side(const cbm_stem_marks_t *m, const char *qn);
 
-/* Time unit conversions */
-#define CBM_NS_PER_SEC 1000000000LL
-#define CBM_US_PER_SEC 1000000LL
-#define CBM_MS_PER_SEC 1000.0
-#define CBM_US_PER_SEC_F 1e6
-
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 
 /* Per-worker manifest collection entry. */

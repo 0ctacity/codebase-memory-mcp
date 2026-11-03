@@ -21,6 +21,7 @@
 #include <string.h>
 #include <ctype.h>
 #include "foundation/compat_regex.h"
+#include "foundation/str_util.h"
 
 /* ── Config link confidence scores ───────────────────────────────── */
 /* Strategy 1: Key→Symbol matching */
@@ -223,15 +224,6 @@ typedef struct {
     char name[CBM_SZ_256];
 } dep_entry_t;
 
-/* Extract basename from a file path. */
-static const char *path_basename(const char *path) {
-    if (!path) {
-        return "";
-    }
-    const char *slash = strrchr(path, '/');
-    return slash ? slash + SKIP_ONE : path;
-}
-
 /* Check if a Cargo.toml QN contains a dependency section in any dotted part. */
 static bool is_cargo_dep_section(const char *qn) {
     char qn_copy[CBM_SZ_512];
@@ -266,7 +258,7 @@ static int collect_manifest_deps(const cbm_gbuf_node_t *const *vars, int var_cou
                                  dep_entry_t *out, int max_out) {
     int n = 0;
     for (int i = 0; i < var_count && n < max_out; i++) {
-        const char *base = path_basename(vars[i]->file_path);
+        const char *base = cbm_path_base(vars[i]->file_path);
         if (!is_manifest_file(base)) {
             continue;
         }

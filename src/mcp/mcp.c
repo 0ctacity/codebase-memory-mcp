@@ -105,18 +105,6 @@ enum {
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
-static char *heap_strdup(const char *s) {
-    if (!s) {
-        return NULL;
-    }
-    size_t len = strlen(s);
-    char *d = malloc(len + SKIP_ONE);
-    if (d) {
-        memcpy(d, s, len + SKIP_ONE);
-    }
-    return d;
-}
-
 /* Write yyjson_mut_doc to heap-allocated JSON string.
  * ALLOW_INVALID_UNICODE: some database strings may contain non-UTF-8 bytes
  * from older indexing runs — don't fail serialization over it. */
@@ -156,8 +144,8 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
     }
 
     out->jsonrpc =
-        heap_strdup(v_jsonrpc && yyjson_is_str(v_jsonrpc) ? yyjson_get_str(v_jsonrpc) : "2.0");
-    out->method = heap_strdup(yyjson_get_str(v_method));
+        cbm_heap_strdup(v_jsonrpc && yyjson_is_str(v_jsonrpc) ? yyjson_get_str(v_jsonrpc) : "2.0");
+    out->method = cbm_heap_strdup(yyjson_get_str(v_method));
 
     if (v_id) {
         out->has_id = true;
@@ -166,7 +154,7 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
         } else if (yyjson_is_str(v_id)) {
             /* JSON-RPC 2.0 §4 permits string ids (Claude Desktop uses them).
              * Preserve verbatim instead of coercing via strtol (issue #253). */
-            out->id_str = heap_strdup(yyjson_get_str(v_id));
+            out->id_str = cbm_heap_strdup(yyjson_get_str(v_id));
         }
     }
 
@@ -825,7 +813,7 @@ char *cbm_mcp_get_tool_name(const char *params_json) {
     yyjson_val *name = yyjson_obj_get(root, "name");
     char *result = NULL;
     if (name && yyjson_is_str(name)) {
-        result = heap_strdup(yyjson_get_str(name));
+        result = cbm_heap_strdup(yyjson_get_str(name));
     }
     yyjson_doc_free(doc);
     return result;
@@ -843,7 +831,7 @@ char *cbm_mcp_get_arguments(const char *params_json) {
         result = yyjson_val_write(args, 0, NULL);
     }
     yyjson_doc_free(doc);
-    return result ? result : heap_strdup("{}");
+    return result ? result : cbm_heap_strdup("{}");
 }
 
 char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
@@ -855,7 +843,7 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     yyjson_val *val = yyjson_obj_get(root, key);
     char *result = NULL;
     if (val && yyjson_is_str(val)) {
-        result = heap_strdup(yyjson_get_str(val));
+        result = cbm_heap_strdup(yyjson_get_str(val));
     }
     yyjson_doc_free(doc);
     return result;
@@ -880,7 +868,7 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
 #ifdef _WIN32
     if (_access(repo_path, 0) == 0 && _fullpath(real, repo_path, sizeof(real))) {
         cbm_normalize_path_sep(real);
-        char *canonical = heap_strdup(real);
+        char *canonical = cbm_heap_strdup(real);
         if (canonical) {
             free(repo_path);
             return canonical;
@@ -889,7 +877,7 @@ static char *canonicalize_repo_path_if_exists(char *repo_path) {
 #else
     if (realpath(repo_path, real)) {
         cbm_normalize_path_sep(real);
-        char *canonical = heap_strdup(real);
+        char *canonical = cbm_heap_strdup(real);
         if (canonical) {
             free(repo_path);
             return canonical;
@@ -1120,7 +1108,7 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
         return;
     }
     free(srv->current_project);
-    srv->current_project = project ? heap_strdup(project) : NULL;
+    srv->current_project = project ? cbm_heap_strdup(project) : NULL;
 }
 
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
@@ -1214,7 +1202,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     srv->store = cbm_store_open_zova_workspace_query(path, workspace_id);
     srv->owns_store = srv->store != NULL;
     free(srv->current_project);
-    srv->current_project = srv->store ? heap_strdup(project) : NULL;
+    srv->current_project = srv->store ? cbm_heap_strdup(project) : NULL;
     return srv->store;
 }
 
@@ -1312,17 +1300,17 @@ static char *build_project_list_error(const char *reason) {
                  "Call index_repository first.\"}",
                  reason);
     }
-    return heap_strdup(buf);
+    return cbm_heap_strdup(buf);
 }
 
 /* Distinct from "unknown project": the caller omitted the project argument
  * entirely (no recognized key). Name the literal "project" key so the fix is
  * obvious (#640). Caller must free() result. */
 static char *build_missing_project_error(void) {
-    return heap_strdup("{\"error\":\"missing required argument: project\",\"hint\":\"Pass "
-                       "the project as the \\\"project\\\" argument, e.g. "
-                       "{\\\"project\\\":\\\"<name from list_projects>\\\"}. Run "
-                       "list_projects to see indexed projects.\"}");
+    return cbm_heap_strdup("{\"error\":\"missing required argument: project\",\"hint\":\"Pass "
+                           "the project as the \\\"project\\\" argument, e.g. "
+                           "{\\\"project\\\":\\\"<name from list_projects>\\\"}. Run "
+                           "list_projects to see indexed projects.\"}");
 }
 
 /* Pick the right no-store error: a NULL project means the argument was missing
@@ -1643,8 +1631,8 @@ static bool compare_parse_arguments(const char *args, char **base_project, char 
         return false;
     }
 
-    *base_project = heap_strdup(yyjson_get_str(base));
-    *target_project = heap_strdup(yyjson_get_str(target));
+    *base_project = cbm_heap_strdup(yyjson_get_str(base));
+    *target_project = cbm_heap_strdup(yyjson_get_str(target));
     yyjson_doc_free(doc);
     if (!*base_project || !*target_project) {
         free(*base_project);
@@ -2938,8 +2926,8 @@ static void coverage_file_parse(const cbm_zova_file_coverage_t *row, coverage_fi
     if (!row->properties) {
         /* Tracked by a file hash but without a File node: nothing extracted. */
         out->status = "skipped";
-        out->phase = heap_strdup("structure");
-        out->reason = heap_strdup("tracked file has no File node");
+        out->phase = cbm_heap_strdup("structure");
+        out->reason = cbm_heap_strdup("tracked file has no File node");
         return;
     }
     yyjson_doc *doc = yyjson_read(row->properties, strlen(row->properties), 0);
@@ -2952,13 +2940,13 @@ static void coverage_file_parse(const cbm_zova_file_coverage_t *row, coverage_fi
          * a9535092). It was still indexed. */
         out->status = yyjson_get_bool(yyjson_obj_get(root, "parse_unusable")) ? "unusable"
                                                                                : "partial";
-        out->ranges = heap_strdup(ranges ? ranges : "");
+        out->ranges = cbm_heap_strdup(ranges ? ranges : "");
     } else if (coverage && strcmp(coverage, CBM_COVERAGE_MISSED) == 0) {
         const char *phase = yyjson_get_str(yyjson_obj_get(root, "coverage_phase"));
         const char *reason = yyjson_get_str(yyjson_obj_get(root, "coverage_reason"));
         out->status = "skipped";
-        out->phase = heap_strdup(phase ? phase : "");
-        out->reason = heap_strdup(reason ? reason : "");
+        out->phase = cbm_heap_strdup(phase ? phase : "");
+        out->reason = cbm_heap_strdup(reason ? reason : "");
     }
     yyjson_doc_free(doc);
 }
@@ -3515,13 +3503,13 @@ static char *coverage_snippet_note(cbm_zova_repository_t *repo, const char *work
                      "The parser recovered from errors in this file (lines %s); the graph may "
                      "miss definitions or calls there. Read the source directly.",
                      c.ranges[0] ? c.ranges : "unknown");
-            note = heap_strdup(buf);
+            note = cbm_heap_strdup(buf);
         } else if (c.phase) {
             snprintf(buf, sizeof(buf),
                      "This file was not extracted (%s%s%s); the graph may miss its definitions. "
                      "Read the source directly.",
                      c.phase, c.reason && c.reason[0] ? ": " : "", c.reason ? c.reason : "");
-            note = heap_strdup(buf);
+            note = cbm_heap_strdup(buf);
         }
         coverage_file_clear(&c);
     }
@@ -4528,7 +4516,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (!direction) {
-        direction = heap_strdup("both");
+        direction = cbm_heap_strdup("both");
     }
 
     /* Find the node by name. If the bare-name lookup misses, fall back to
@@ -4749,7 +4737,7 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     cbm_project_t proj = {0};
     const char *workspace_id = cbm_zova_repository_workspace_id(repo);
     char *root = cbm_zova_repository_get_project(repo, workspace_id, &proj) == CBM_STORE_OK
-                     ? heap_strdup(proj.root_path)
+                     ? cbm_heap_strdup(proj.root_path)
                      : NULL;
     safe_str_free(&proj.name);
     safe_str_free(&proj.indexed_at);
@@ -5419,7 +5407,7 @@ cbm_zova_coord_status_t cbm_mcp_index_hold_acquire(const char *root_path, int64_
                                                    cbm_zova_index_hold_t *out,
                                                    char *out_workspace_id,
                                                    size_t out_workspace_id_size) {
-    char *root = root_path ? heap_strdup(root_path) : NULL;
+    char *root = root_path ? cbm_heap_strdup(root_path) : NULL;
     if (!root) {
         if (out) memset(out, 0, sizeof(*out));
         return CBM_ZOVA_COORD_ERROR;
@@ -5570,7 +5558,7 @@ static char *index_repository_run(cbm_mcp_server_t *srv, const char *args) {
     }
     free(name_override);
 
-    char *project_name = heap_strdup(cbm_pipeline_project_name(p));
+    char *project_name = cbm_heap_strdup(cbm_pipeline_project_name(p));
 
     /* Close cached store — the pipeline republishes the project to cbm.zova */
     if (srv->owns_store && srv->store) {
@@ -5692,14 +5680,14 @@ static char *index_repository_run(cbm_mcp_server_t *srv, const char *args) {
 /* Copy a node from an array into a heap-allocated standalone node. */
 static void copy_node(const cbm_node_t *src, cbm_node_t *dst) {
     dst->id = src->id;
-    dst->project = heap_strdup(src->project);
-    dst->label = heap_strdup(src->label);
-    dst->name = heap_strdup(src->name);
-    dst->qualified_name = heap_strdup(src->qualified_name);
-    dst->file_path = heap_strdup(src->file_path);
+    dst->project = cbm_heap_strdup(src->project);
+    dst->label = cbm_heap_strdup(src->label);
+    dst->name = cbm_heap_strdup(src->name);
+    dst->qualified_name = cbm_heap_strdup(src->qualified_name);
+    dst->file_path = cbm_heap_strdup(src->file_path);
     dst->start_line = src->start_line;
     dst->end_line = src->end_line;
-    dst->properties_json = src->properties_json ? heap_strdup(src->properties_json) : NULL;
+    dst->properties_json = src->properties_json ? cbm_heap_strdup(src->properties_json) : NULL;
 }
 
 /* Build a JSON suggestions response for ambiguous or fuzzy results. */
@@ -7830,7 +7818,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     free(since); /* no-op after the swap (since is NULL); frees it otherwise */
 
     if (!base_branch) {
-        base_branch = heap_strdup("main");
+        base_branch = cbm_heap_strdup("main");
     }
 
     /* Reject shell metacharacters, and a leading '-', in the user-supplied
@@ -8209,7 +8197,7 @@ char *cbm_mcp_render_compact(const char *json) {
         compact_value(&b, yyjson_get_str(k), v, 0);
     }
     yyjson_doc_free(doc);
-    return b.buf ? b.buf : heap_strdup("");
+    return b.buf ? b.buf : cbm_heap_strdup("");
 }
 
 /* Tools whose schema advertises format:"compact". */
@@ -8663,16 +8651,16 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         detect_session(srv);
         maybe_auto_index(srv);
     } else if (strcmp(req.method, "ping") == 0) {
-        result_json = heap_strdup("{}");
+        result_json = cbm_heap_strdup("{}");
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list_page(req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
-            req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+            req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : cbm_heap_strdup("{}");
         srv->active_request_id = req.id;
         free(srv->active_request_id_str);
-        srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
+        srv->active_request_id_str = req.id_str ? cbm_heap_strdup(req.id_str) : NULL;
 
         struct timespec t0;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t0);

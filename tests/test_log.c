@@ -117,6 +117,17 @@ TEST(log_int_helper) {
     PASS();
 }
 
+TEST(log_itoa_keeps_sixteen_values) {
+    const char *vals[16];
+    for (int i = 0; i < 16; i++) {
+        vals[i] = cbm_log_itoa(i - 8);
+    }
+    ASSERT_STR_EQ(vals[0], "-8");
+    ASSERT_STR_EQ(vals[15], "7");
+    ASSERT_STR_EQ(cbm_log_itoa(INT32_MIN), "-2147483648");
+    PASS();
+}
+
 TEST(log_json_output) {
     cbm_log_set_level(CBM_LOG_DEBUG);
     cbm_log_set_format(CBM_LOG_FORMAT_JSON);
@@ -290,6 +301,7 @@ SUITE(log) {
     RUN_TEST(log_filtered_by_level);
     RUN_TEST(log_error_output);
     RUN_TEST(log_int_helper);
+    RUN_TEST(log_itoa_keeps_sixteen_values);
     RUN_TEST(log_json_output);
     RUN_TEST(log_text_sanitizes_control_chars);
     RUN_TEST(log_sink_tee_keeps_stderr);

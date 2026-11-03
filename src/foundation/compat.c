@@ -125,6 +125,26 @@ int cbm_clock_gettime(int clk_id, struct timespec *tp) {
 }
 #endif
 
+char *cbm_heap_strdup(const char *s) {
+    if (!s) {
+        return NULL;
+    }
+    size_t len = strlen(s);
+    char *d = malloc(len + SKIP_ONE);
+    if (d) {
+        memcpy(d, s, len + SKIP_ONE);
+    }
+    return d;
+}
+
+double cbm_elapsed_ms(struct timespec start) {
+    struct timespec now;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &now);
+    double s = (double)(now.tv_sec - start.tv_sec);
+    double ns = (double)(now.tv_nsec - start.tv_nsec);
+    return (s * (double)CBM_MSEC_PER_SEC) + (ns / (double)CBM_NSEC_PER_MSEC);
+}
+
 /* ── Per-thread CPU time ──────────────────────────────────────── */
 
 uint64_t cbm_thread_cpu_time_ns(void) {

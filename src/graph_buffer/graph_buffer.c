@@ -45,12 +45,6 @@ enum {
 #include <string.h> // strdup
 #include <time.h>
 
-static inline void *intptr_to_ptr(intptr_t v) {
-    void *p;
-    memcpy(&p, &v, sizeof(p));
-    return p;
-}
-
 /* ── Internal types ──────────────────────────────────────────────── */
 
 /* Edge key for dedup hash table — composite key as string "srcID:tgtID:type",
@@ -140,13 +134,14 @@ static void free_retained_dump_edges(CBMDumpEdge *edges, int edge_count);
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
-static char *heap_strdup(const char *s) {
-    return s ? strdup(s) : strdup("{}");
+/* Copy s, or "{}" when s is NULL. */
+static char *dup_or_empty_json(const char *s) {
+    return cbm_heap_strdup(s ? s : "{}");
 }
 
 /* Intern a repetitive string into the buffer's pool: identical content collapses
  * to a single heap copy owned by the pool. NULL maps to "{}" (matches
- * heap_strdup). The returned pointer is stable for the buffer's lifetime and
+ * dup_or_empty_json). The returned pointer is stable for the buffer's lifetime and
  * must never be freed or mutated by callers. Returns NULL only on OOM. */
 static const char *gb_intern(cbm_gbuf_t *gb, const char *s) {
     const char *key = s ? s : "{}";
@@ -841,8 +836,8 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * consistent (the old code left the node listed under its ORIGINAL
          * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
          * which is how the flickering Function set reached the semantic pass). */
-        char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
+        char *new_name = dup_or_empty_json(name);
+        char *new_props = properties_json ? dup_or_empty_json(properties_json) : NULL;
         const char *new_label_interned = gb_intern(gb, label);
         bool label_changed = !existing->label || !new_label_interned ||
                              strcmp(existing->label, new_label_interned) != 0;
@@ -888,12 +883,12 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     int64_t id = alloc_next_id(gb);
     node->id = id;
     node->label = (char *)gb_intern(gb, label);
-    node->name = heap_strdup(name);
-    node->qualified_name = heap_strdup(qualified_name);
+    node->name = dup_or_empty_json(name);
+    node->qualified_name = dup_or_empty_json(qualified_name);
     node->file_path = (char *)gb_intern(gb, file_path);
     node->start_line = start_line;
     node->end_line = end_line;
-    node->properties_json = heap_strdup(properties_json);
+    node->properties_json = dup_or_empty_json(properties_json);
 
     /* Store pointer in array and register in all indexes */
     cbm_da_push(&gb->nodes, node);
@@ -918,7 +913,7 @@ bool cbm_gbuf_set_node_props(cbm_gbuf_t *gb, const char *qualified_name,
     if (!node) {
         return false;
     }
-    char *new_props = heap_strdup(properties_json);
+    char *new_props = dup_or_empty_json(properties_json);
     if (!new_props) {
         return false;
     }
@@ -988,7 +983,7 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        cbm_ht_set(deleted_set, strdup(id_buf), cbm_intptr_to_ptr(SKIP_ONE));
 
         /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
@@ -1030,7 +1025,7 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        cbm_ht_set(deleted_set, strdup(id_buf), cbm_intptr_to_ptr(SKIP_ONE));
 
         /* Remove from secondary indexes */
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
@@ -1214,7 +1209,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
         /* Pick one canonical value so parallel worker merge order cannot
          * change the retained properties for a deduplicated edge. */
         if (edge_properties_should_replace(existing->properties_json, properties_json)) {
-            char *replacement = heap_strdup(properties_json);
+            char *replacement = dup_or_empty_json(properties_json);
             if (replacement) {
                 free(existing->properties_json);
                 existing->properties_json = replacement;
@@ -1234,7 +1229,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
     edge->source_id = source_id;
     edge->target_id = target_id;
     edge->type = (char *)gb_intern(gb, type);
-    edge->properties_json = heap_strdup(properties_json);
+    edge->properties_json = dup_or_empty_json(properties_json);
 
     /* Store pointer in array */
     cbm_da_push(&gb->edges, edge);
@@ -1457,13 +1452,13 @@ static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
             }
             existing->label = (char *)new_label;
             free(existing->name);
-            existing->name = heap_strdup(sn->name);
+            existing->name = dup_or_empty_json(sn->name);
             existing->file_path = (char *)gb_intern(dst, sn->file_path);
             existing->start_line = sn->start_line;
             existing->end_line = sn->end_line;
             if (sn->properties_json) {
                 free(existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
+                existing->properties_json = dup_or_empty_json(sn->properties_json);
             }
             if (label_changed) {
                 node_ptr_array_t *by_label = get_or_create_node_array(
@@ -1499,12 +1494,12 @@ static void merge_copy_new_node(cbm_gbuf_t *dst, const cbm_gbuf_node_t *sn) {
 
     node->id = sn->id;
     node->label = (char *)gb_intern(dst, sn->label);
-    node->name = heap_strdup(sn->name);
-    node->qualified_name = heap_strdup(sn->qualified_name);
+    node->name = dup_or_empty_json(sn->name);
+    node->qualified_name = dup_or_empty_json(sn->qualified_name);
     node->file_path = (char *)gb_intern(dst, sn->file_path);
     node->start_line = sn->start_line;
     node->end_line = sn->end_line;
-    node->properties_json = heap_strdup(sn->properties_json);
+    node->properties_json = dup_or_empty_json(sn->properties_json);
 
     cbm_da_push(&dst->nodes, node);
     register_node_in_indexes(dst, node);

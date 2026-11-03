@@ -31,6 +31,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
+#include "foundation/str_util.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -521,18 +522,16 @@ static bool c_cpp_family(CBMLanguage lang) {
     return lang == CBM_LANG_C || lang == CBM_LANG_CPP;
 }
 
-static const char *path_basename(const char *path) {
-    if (!path || !path[0]) {
-        return path;
-    }
-    const char *slash = strrchr(path, '/');
+/* cbm_path_base, but on Windows a backslash also separates directories. */
+static const char *native_path_basename(const char *path) {
+    const char *base = cbm_path_base(path);
 #ifdef _WIN32
-    const char *bslash = strrchr(path, '\\');
-    if (bslash && (!slash || bslash > slash)) {
-        slash = bslash;
+    const char *bslash = strrchr(base, '\\');
+    if (bslash) {
+        base = bslash + SKIP_ONE;
     }
 #endif
-    return slash ? slash + 1 : path;
+    return base;
 }
 
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
@@ -547,7 +546,7 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
         return false;
     }
-    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    CBMLanguage target_lang = cbm_language_for_filename(native_path_basename(target_file_path));
     if (target_lang == CBM_LANG_COUNT) {
         return false;
     }
@@ -575,7 +574,7 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
         return false;
     }
-    CBMLanguage target_lang = cbm_language_for_filename(path_basename(target_file_path));
+    CBMLanguage target_lang = cbm_language_for_filename(native_path_basename(target_file_path));
     if (target_lang == CBM_LANG_COUNT) {
         return false;
     }

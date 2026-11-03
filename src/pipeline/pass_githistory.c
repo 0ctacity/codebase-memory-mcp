@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_MAX_FILES = 20 };
+enum { GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_MAX_FILES = 20 };
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
@@ -32,20 +32,6 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[GH_RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & GH_RING_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
-
-static bool ends_with(const char *s, size_t slen, const char *suffix) {
-    size_t sflen = strlen(suffix);
-    return slen >= sflen && strcmp(s + slen - sflen, suffix) == 0;
-}
 
 bool cbm_is_trackable_file(const char *path) {
     if (!path) {
@@ -70,13 +56,12 @@ bool cbm_is_trackable_file(const char *path) {
         return false;
     }
     /* Skip non-source file extensions */
-    size_t len = strlen(path);
-    if (ends_with(path, len, ".lock") || ends_with(path, len, ".sum") ||
-        ends_with(path, len, ".min.js") || ends_with(path, len, ".min.css") ||
-        ends_with(path, len, ".map") || ends_with(path, len, ".wasm") ||
-        ends_with(path, len, ".png") || ends_with(path, len, ".jpg") ||
-        ends_with(path, len, ".gif") || ends_with(path, len, ".ico") ||
-        ends_with(path, len, ".svg")) {
+    if (cbm_str_ends_with(path, ".lock") || cbm_str_ends_with(path, ".sum") ||
+        cbm_str_ends_with(path, ".min.js") || cbm_str_ends_with(path, ".min.css") ||
+        cbm_str_ends_with(path, ".map") || cbm_str_ends_with(path, ".wasm") ||
+        cbm_str_ends_with(path, ".png") || cbm_str_ends_with(path, ".jpg") ||
+        cbm_str_ends_with(path, ".gif") || cbm_str_ends_with(path, ".ico") ||
+        cbm_str_ends_with(path, ".svg")) {
         return false;
     }
     return true;
@@ -521,7 +506,7 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     free(result.couplings);
     free(result.file_temporal);
 
-    cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_log(result.commit_count),
-                 "edges", itoa_log(edge_count));
+    cbm_log_info("pass.done", "pass", "githistory", "commits", cbm_log_itoa(result.commit_count),
+                 "edges", cbm_log_itoa(edge_count));
     return 0;
 }

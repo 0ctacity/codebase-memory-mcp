@@ -20,6 +20,10 @@ char *cbm_path_join_n(CBMArena *a, const char **parts, int n);
 /* Get the file extension (without dot). Returns "" if none. */
 const char *cbm_path_ext(const char *path);
 
+/* Get the text from the last '.' in the whole path, dot included (".go").
+ * Returns "" if none. Unlike cbm_path_ext, a dot in a directory name counts. */
+const char *cbm_path_last_dot(const char *path);
+
 /* Get the base name (after last '/'). Returns path if no '/'. */
 const char *cbm_path_base(const char *path);
 

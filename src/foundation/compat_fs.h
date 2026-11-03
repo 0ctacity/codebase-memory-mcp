@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Directory iteration ──────────────────────────────────────── */
@@ -63,6 +64,9 @@ struct stat;
  * filling only st_mode, st_size and st_mtime. On POSIX, delegates to stat.
  * Returns 0 on success. */
 int cbm_stat_utf8(const char *path, struct stat *st);
+
+/* Modification time of st in nanoseconds. Windows has whole seconds only. */
+int64_t cbm_stat_mtime_ns(const struct stat *st);
 
 /* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
  * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps

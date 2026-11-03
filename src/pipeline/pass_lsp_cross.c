@@ -43,20 +43,7 @@
 
 enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* source size cap, in MiB */
-    PXC_ITOA_BUF = 16,
 };
-
-/* Format an int into a thread-local rotating buffer for log key=value emission.
- * Kept local so passes don't grow a foundation-wide formatting API just for
- * log output. */
-static const char *itoa_buf(int val) {
-    static _Thread_local char bufs[PXC_ITOA_BUF][PXC_ITOA_BUF];
-    static _Thread_local int slot = 0;
-    char *out = bufs[slot];
-    slot = (slot + 1) & (PXC_ITOA_BUF - 1);
-    snprintf(out, PXC_ITOA_BUF, "%d", val);
-    return out;
-}
 
 /* ── Local helpers ─────────────────────────────────────────────── */
 
@@ -1421,7 +1408,7 @@ CBMZigArgType *cbm_pxc_collect_zig_args(const cbm_pipeline_ctx_t *ctx, CBMFileRe
             collect.items[n++] = collect.items[i];
         }
     }
-    cbm_log_info("lsp_cross.zig_anytype", "arg_types", itoa_buf(n));
+    cbm_log_info("lsp_cross.zig_anytype", "arg_types", cbm_log_itoa(n));
     *out_count = n;
     return collect.items;
 }

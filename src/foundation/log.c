@@ -2,6 +2,7 @@
  * log.c — Structured key-value logging to stderr.
  */
 #include "log.h"
+#include "foundation/compat.h"
 #include "foundation/constants.h"
 #include <ctype.h>
 #include <inttypes.h>
@@ -262,6 +263,16 @@ void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t va
     char value_buf[CBM_SZ_32];
     snprintf(value_buf, sizeof(value_buf), "%" PRId64, value);
     cbm_log(level, msg, key ? key : "?", value_buf, NULL);
+}
+
+const char *cbm_log_itoa(int value) {
+    enum { RING = 16 };
+    static CBM_TLS char bufs[RING][CBM_SZ_32];
+    static CBM_TLS int idx = 0;
+    char *out = bufs[idx];
+    idx = (idx + SKIP_ONE) % RING;
+    snprintf(out, CBM_SZ_32, "%d", value);
+    return out;
 }
 
 static void copy_path_without_query(const char *path, char *out, size_t outsz) {
