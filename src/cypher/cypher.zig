@@ -255,12 +255,12 @@ fn jsonExtractProp(json: CStr, key: CStr, buf: []u8) CStr {
     return buf.ptr;
 }
 
-// Rotating buffers so several edge properties can be read per row (e.g.
-// projecting r.url_path and r.confidence together). Unlike node_prop_bufs
-// these are process-wide, as in the C engine this replaced: queries running
-// on different threads share the ring.
-var edge_prop_bufs: [PROP_BUFS][PROP_BUF_SZ]u8 = std.mem.zeroes([PROP_BUFS][PROP_BUF_SZ]u8);
-var edge_prop_idx: c_int = 0;
+// Rotating thread-local buffers so several edge properties can be read per
+// row (e.g. projecting r.url_path and r.confidence together). Like
+// node_prop_bufs they must be thread-local: a process-wide ring let queries
+// on different threads overwrite each other's values.
+threadlocal var edge_prop_bufs: [PROP_BUFS][PROP_BUF_SZ]u8 = std.mem.zeroes([PROP_BUFS][PROP_BUF_SZ]u8);
+threadlocal var edge_prop_idx: c_int = 0;
 
 /// Edge property by name.
 fn edgeProp(e: ?*const Edge, prop: CStr) CStr {

@@ -2685,6 +2685,102 @@ TEST(cypher_bare_edge_return_exposes_properties_json) {
     PASS();
 }
 
+/* Edge property values pass through a ring of scratch buffers before they are
+ * copied into a row. The ring was process-wide, so two queries on different
+ * threads overwrote each other's values: each thread here reads only its own
+ * url_path, and any other value in its rows came from the other thread. */
+enum { EDGE_RACE_TARGETS = 64, EDGE_RACE_ROUNDS = 3000, EDGE_RACE_THREADS = 4 };
+
+typedef struct {
+    cbm_store_t *store;
+    const char *url_path;
+    int wrong;
+} edge_race_run_t;
+
+static cbm_store_t *setup_edge_race_store(const char *url_path) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "race", "/tmp/race");
+    cbm_node_t src = {.project = "race",
+                      .label = "Function",
+                      .name = "Caller",
+                      .qualified_name = "race.Caller",
+                      .file_path = "caller.go"};
+    int64_t src_id = cbm_store_upsert_node(s, &src);
+    char props[128];
+    snprintf(props, sizeof(props), "{\"url_path\":\"%s\"}", url_path);
+    for (int i = 0; i < EDGE_RACE_TARGETS; i++) {
+        char name[32];
+        char qn[48];
+        snprintf(name, sizeof(name), "Target%d", i);
+        snprintf(qn, sizeof(qn), "race.Target%d", i);
+        cbm_node_t dst = {.project = "race",
+                          .label = "Function",
+                          .name = name,
+                          .qualified_name = qn,
+                          .file_path = "target.go"};
+        cbm_edge_t e = {.project = "race",
+                        .source_id = src_id,
+                        .target_id = cbm_store_upsert_node(s, &dst),
+                        .type = "HTTP_CALLS",
+                        .properties_json = props};
+        cbm_store_insert_edge(s, &e);
+    }
+    return s;
+}
+
+static void *edge_race_thread(void *opaque) {
+    edge_race_run_t *run = opaque;
+    for (int round = 0; round < EDGE_RACE_ROUNDS; round++) {
+        cbm_cypher_result_t r = {0};
+        if (cbm_cypher_execute(run->store,
+                               "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN b.name, r.url_path", "race", 0,
+                               &r) != 0 ||
+            r.row_count != EDGE_RACE_TARGETS) {
+            run->wrong++;
+        }
+        for (int row = 0; row < r.row_count; row++) {
+            const char *got = cypher_get_col(&r, row, "r.url_path");
+            if (!got || strcmp(got, run->url_path) != 0) {
+                run->wrong++;
+            }
+        }
+        cbm_cypher_result_free(&r);
+    }
+    return NULL;
+}
+
+TEST(cypher_edge_prop_concurrent_queries_isolated) {
+    static const char *paths[EDGE_RACE_THREADS] = {
+        "/thread-a/orders",
+        "/thread-b/a-longer-health-check-path",
+        "/thread-c/x",
+        "/thread-d/users/profile/settings",
+    };
+    edge_race_run_t runs[EDGE_RACE_THREADS] = {0};
+    cbm_thread_t threads[EDGE_RACE_THREADS];
+    int started = 0;
+    for (int i = 0; i < EDGE_RACE_THREADS; i++) {
+        runs[i].url_path = paths[i];
+        runs[i].store = setup_edge_race_store(paths[i]);
+    }
+    for (int i = 0; i < EDGE_RACE_THREADS; i++) {
+        if (cbm_thread_create(&threads[i], 8 * 1024 * 1024, edge_race_thread, &runs[i]) == 0) {
+            started++;
+        }
+    }
+    for (int i = 0; i < started; i++) {
+        (void)cbm_thread_join(&threads[i]);
+    }
+    int wrong = 0;
+    for (int i = 0; i < EDGE_RACE_THREADS; i++) {
+        wrong += runs[i].wrong;
+        cbm_store_close(runs[i].store);
+    }
+    ASSERT_EQ(started, EDGE_RACE_THREADS);
+    ASSERT_EQ(wrong, 0);
+    PASS();
+}
+
 TEST(cypher_edge_return_without_filter) {
     cbm_store_t *s = setup_cypher_multi_edge_store();
     cbm_cypher_result_t r = {0};
@@ -5553,6 +5649,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_edge_filter_contains);
     RUN_TEST(cypher_edge_filter_numeric_gte);
     RUN_TEST(cypher_bare_edge_return_exposes_properties_json);
+    RUN_TEST(cypher_edge_prop_concurrent_queries_isolated);
     RUN_TEST(cypher_edge_return_without_filter);
     RUN_TEST(cypher_edge_filter_equals);
     RUN_TEST(cypher_edge_filter_starts_with);
