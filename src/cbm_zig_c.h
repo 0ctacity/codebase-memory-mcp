@@ -21,9 +21,11 @@
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_regex.h"
 #include "foundation/compat_thread.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
+#include "foundation/limits.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
@@ -34,6 +36,7 @@
 #include <yyjson/yyjson.h>
 
 /* Headers of the ported modules: the Zig side implements these. */
+#include "cypher/cypher.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "git/git_context.h"
