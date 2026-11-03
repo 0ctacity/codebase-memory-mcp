@@ -9427,6 +9427,43 @@ TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
     return typed_http_no_url_twin_case(0);
 }
 
+/* An unresolved callee that only looks like a route registration by its
+ * suffix (`request.headers.get('content-type')`, `unified().use(plugin)`) and
+ * has no route path is not a call to anything indexed. The callee_suffix
+ * fallback hands emit_service_edge the caller as the target, so its plain
+ * CALLS fall-through minted a caller->caller self-loop. */
+TEST(pipeline_unresolved_route_suffix_call_adds_no_self_loop) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_suffix_loop_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "src/headers.ts",
+                    "export function readHeader(request: Request): string | null {\n"
+                    "  return request.headers.get('content-type');\n"
+                    "}\n"
+                    "export function register(app: any) {\n"
+                    "  app.get('/health', readHeader);\n"
+                    "}\n");
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = th_open_repo_store(tmp);
+    ASSERT_NOT_NULL(s);
+    bool self_loop = cross_file_call_exists(s, project, "readHeader", "readHeader");
+    /* Control: a suffix call with a route path still registers its route. */
+    int routes = route_registrations_from(s, project, "register");
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    ASSERT_FALSE(self_loop);
+    ASSERT_EQ(routes, 1);
+    PASS();
+}
+
 /* `import Axios from "axios"` -- the default-import binding capitalized, a
  * common convention -- must classify `Axios.get/post/delete(url)` as HTTP
  * client calls exactly like `axios.*`. The library table matched only the
@@ -12364,6 +12401,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_arg_url_skips_client_navigation);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
+    RUN_TEST(pipeline_unresolved_route_suffix_call_adds_no_self_loop);
     RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
     RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
     RUN_TEST(pipeline_python_websocket_decorators_register_routes);

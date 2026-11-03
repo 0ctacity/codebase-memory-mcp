@@ -2705,9 +2705,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
+                /* The caller stands in for the unknown target, so a plain
+                 * CALLS fall-through would be a self-loop. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false, lang, route_mount);
+                                  imp_count, true, lang, route_mount);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level
