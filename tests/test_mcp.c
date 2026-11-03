@@ -4209,6 +4209,394 @@ TEST(search_code_ampersand_accepted_issue272) {
     PASS();
 }
 
+/* ── In-process search_code scanner (#60) ─────────────────────── */
+
+enum { SCAN_OK = 0, SCAN_DEADLINE = 1, SCAN_FAILED = 2, SCAN_OUT_SIZE = 64 * 1024 };
+
+static bool scan_write_file(const char *root, const char *name, const char *data, size_t len) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", root, name);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        return false;
+    }
+    bool ok = fwrite(data, 1, len, fp) == len;
+    return fclose(fp) == 0 && ok;
+}
+
+/* Write <root>/<name> records in write_scoped_filelist's format to <root>/list. */
+static bool scan_write_list(const char *root, const char *const *names, int count, char *list,
+                            size_t list_size) {
+    snprintf(list, list_size, "%s/list", root);
+    FILE *fp = fopen(list, "wb");
+    if (!fp) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        fprintf(fp, "%s/%s", root, names[i]);
+#ifdef _WIN32
+        fputc('\n', fp);
+#else
+        fputc('\0', fp);
+#endif
+    }
+    return fclose(fp) == 0;
+}
+
+static int scan_run(const char *list, const char *root, const char *pattern, bool use_regex,
+                    char *out) {
+    return cbm_mcp_search_scan_for_testing(list, root, pattern, use_regex, 500, UINT64_MAX, out,
+                                           SCAN_OUT_SIZE);
+}
+
+TEST(search_scan_matches_literal_multi_regex_and_empty) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_basic"));
+    const char *text = "alpha\nbeta\ngamma alpha\n";
+    ASSERT_TRUE(scan_write_file(root, "a.c", text, strlen(text)));
+    const char *names[] = {"a.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 1, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "alpha", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:1:alpha\na.c:3:gamma alpha\n");
+    /* grep -f semantics: each '\n'-separated item is its own pattern. */
+    ASSERT_EQ(scan_run(list, root, "beta\ngamma", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:2:beta\na.c:3:gamma alpha\n");
+    ASSERT_EQ(scan_run(list, root, "^gam+a", true, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:3:gamma alpha\n");
+    ASSERT_EQ(scan_run(list, root, "", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:1:alpha\na.c:2:beta\na.c:3:gamma alpha\n");
+    ASSERT_EQ(scan_run(list, root, "delta", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "");
+    ASSERT_EQ(scan_run(list, root, "a(", true, out), SCAN_FAILED);
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* Regex mode accepts the GNU escapes grep -E does (\b \< \> \w \s) on every
+ * platform; macOS libc needs REG_ENHANCED for them. */
+TEST(search_scan_regex_gnu_escapes) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_gnu"));
+    const char *text = "  free(p);\nfreedom\n_foo bar\n";
+    ASSERT_TRUE(scan_write_file(root, "a.c", text, strlen(text)));
+    const char *names[] = {"a.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 1, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "\\bfree\\b", true, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:1:  free(p);\n");
+    ASSERT_EQ(scan_run(list, root, "\\<free\\>", true, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:1:  free(p);\n");
+    ASSERT_EQ(scan_run(list, root, "^\\w+o\\sbar$", true, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:3:_foo bar\n");
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* A NUL in the first 32 KiB marks the file binary (no hits); after a later
+ * NUL only the complete lines before it are scanned. */
+TEST(search_scan_skips_binary_and_stops_at_late_nul) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_nul"));
+    const char bin[] = "ab\0cd match\n";
+    ASSERT_TRUE(scan_write_file(root, "bin.c", bin, sizeof(bin) - 1));
+
+    enum { PAD_LINES = 10240 }; /* "pad\n" x 10240 = 40 KiB */
+    size_t cap = PAD_LINES * 4 + 128;
+    char *late = malloc(cap);
+    ASSERT_NOT_NULL(late);
+    size_t len = 0;
+    for (int i = 0; i < PAD_LINES; i++) {
+        memcpy(late + len, "pad\n", 4);
+        len += 4;
+    }
+    const char tail[] = "match before\nmatch cut\0x\nmatch after\n";
+    memcpy(late + len, tail, sizeof(tail) - 1);
+    len += sizeof(tail) - 1;
+    ASSERT_TRUE(scan_write_file(root, "late.c", late, len));
+    free(late);
+
+    const char *names[] = {"bin.c", "late.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 2, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+    ASSERT_EQ(scan_run(list, root, "match", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "late.c:10241:match before\n");
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* Hits never carry the CR. `foo$` matches a CRLF line only on Windows, where
+ * Select-String matched the line without its CR; POSIX grep keeps it. */
+TEST(search_scan_crlf_lines) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_crlf"));
+    const char *text = "foo\r\nbar\r\n";
+    ASSERT_TRUE(scan_write_file(root, "crlf.c", text, strlen(text)));
+    const char *names[] = {"crlf.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 1, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "foo", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "crlf.c:1:foo\n");
+    ASSERT_EQ(scan_run(list, root, "foo$", true, out), SCAN_OK);
+#ifdef _WIN32
+    ASSERT_STR_EQ(out, "crlf.c:1:foo\n");
+#else
+    ASSERT_STR_EQ(out, "");
+#endif
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* 600 hits over two files: exactly the first 500, in file-list order. */
+TEST(search_scan_stops_at_limit_in_list_order) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_limit"));
+    char *text = malloc(300 * 8 + 1);
+    ASSERT_NOT_NULL(text);
+    size_t len = 0;
+    for (int i = 0; i < 300; i++) {
+        memcpy(text + len, "hit\n", 4);
+        len += 4;
+    }
+    ASSERT_TRUE(scan_write_file(root, "one.c", text, len));
+    ASSERT_TRUE(scan_write_file(root, "two.c", text, len));
+    free(text);
+    const char *names[] = {"one.c", "two.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 2, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "hit", false, out), SCAN_OK);
+    int lines = 0;
+    for (const char *p = out; *p; p++) {
+        lines += *p == '\n';
+    }
+    ASSERT_EQ(lines, 500);
+    ASSERT_TRUE(strncmp(out, "one.c:1:hit\n", 12) == 0);
+    ASSERT_NOT_NULL(strstr(out, "one.c:300:hit\ntwo.c:1:hit\n"));
+    size_t out_len = strlen(out);
+    ASSERT_TRUE(out_len > 14 && strcmp(out + out_len - 14, "two.c:200:hit\n") == 0);
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* A listed file that no longer exists is skipped, as grep's error exit was
+ * ignored; later files are still scanned. */
+TEST(search_scan_skips_missing_file) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_missing"));
+    const char *text = "match\n";
+    ASSERT_TRUE(scan_write_file(root, "a.c", text, strlen(text)));
+    const char *names[] = {"gone.c", "a.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 2, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "match", false, out), SCAN_OK);
+    ASSERT_STR_EQ(out, "a.c:1:match\n");
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+TEST(search_scan_reports_deadline) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_deadline"));
+    const char *text = "match\n";
+    ASSERT_TRUE(scan_write_file(root, "a.c", text, strlen(text)));
+    const char *names[] = {"a.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 1, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(
+        cbm_mcp_search_scan_for_testing(list, root, "match", false, 500, 1, out, SCAN_OUT_SIZE),
+        SCAN_DEADLINE);
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* A 5,000-byte line: its hit is cut to the 1023-byte content buffer and the
+ * next line keeps its number. */
+TEST(search_scan_long_line) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s", th_mktempdir("cbm_scan_long"));
+    enum { LONG_LEN = 5000 };
+    char *text = malloc(LONG_LEN + 64);
+    ASSERT_NOT_NULL(text);
+    memset(text, 'x', LONG_LEN);
+    const char tail[] = " match\nmatch two\n";
+    memcpy(text + LONG_LEN, tail, sizeof(tail) - 1);
+    ASSERT_TRUE(scan_write_file(root, "long.c", text, LONG_LEN + sizeof(tail) - 1));
+    free(text);
+    const char *names[] = {"long.c"};
+    char list[512];
+    ASSERT_TRUE(scan_write_list(root, names, 1, list, sizeof(list)));
+    char *out = malloc(SCAN_OUT_SIZE);
+    ASSERT_NOT_NULL(out);
+
+    ASSERT_EQ(scan_run(list, root, "match", false, out), SCAN_OK);
+    ASSERT_TRUE(strncmp(out, "long.c:1:", 9) == 0);
+    const char *content = out + 9;
+    const char *eol = strchr(content, '\n');
+    ASSERT_NOT_NULL(eol);
+    ASSERT_EQ((int)(eol - content), 1023);
+    ASSERT_STR_EQ(eol + 1, "long.c:2:match two\n");
+
+    free(out);
+    th_cleanup(root);
+    PASS();
+}
+
+/* #60 acceptance: mode=full after a line longer than any read buffer returns
+ * the function's exact source. */
+TEST(search_code_full_mode_after_long_line) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", th_mktempdir("cbm_search_long"));
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    cbm_mkdir(proj_dir);
+
+    char src_path[640];
+    snprintf(src_path, sizeof(src_path), "%s/main.go", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("var data = \"", fp);
+    for (int i = 0; i < 5000; i++) {
+        fputc('x', fp);
+    }
+    fputs("\"\n\nfunc Hello() {\n\treturn\n}\n", fp);
+    fclose(fp);
+
+    th_remove_zova_user_database();
+    cbm_mcp_server_t *srv = cbm_mcp_server_new();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "search-long-line";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "Hello",
+                    .qualified_name = "search-long-line.main.Hello",
+                    .file_path = "main.go",
+                    .start_line = 3,
+                    .end_line = 5};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+    ASSERT_EQ(th_publish_store_project(st, proj), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"func Hello\",\"mode\":\"full\","
+                                   "\"project\":\"search-long-line\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"source\":\"func Hello() {\\n\\treturn\\n}\\n\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_cleanup(tmp);
+    PASS();
+}
+
+/* Literal search is case-sensitive on every platform. The Windows scoped scan
+ * used Select-String, which ignores case, before #60. */
+TEST(search_code_literal_is_case_sensitive) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":98,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"handlerequest\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_EQ(grep_matches, 0);
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* A project with no indexed files falls back to the recursive grep scan. */
+TEST(search_code_unindexed_project_scans_recursively) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", th_mktempdir("cbm_search_unindexed"));
+    const char *text = "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n";
+    ASSERT_TRUE(scan_write_file(tmp, "main.go", text, strlen(text)));
+
+    th_remove_zova_user_database();
+    cbm_mcp_server_t *srv = cbm_mcp_server_new();
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "search-unindexed";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, tmp);
+    ASSERT_EQ(th_publish_store_project(st, proj), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"search-unindexed\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_TRUE(grep_matches > 0);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_cleanup(tmp);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new();
 
@@ -6832,6 +7220,17 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_scan_matches_literal_multi_regex_and_empty);
+    RUN_TEST(search_scan_regex_gnu_escapes);
+    RUN_TEST(search_scan_skips_binary_and_stops_at_late_nul);
+    RUN_TEST(search_scan_crlf_lines);
+    RUN_TEST(search_scan_stops_at_limit_in_list_order);
+    RUN_TEST(search_scan_skips_missing_file);
+    RUN_TEST(search_scan_reports_deadline);
+    RUN_TEST(search_scan_long_line);
+    RUN_TEST(search_code_full_mode_after_long_line);
+    RUN_TEST(search_code_literal_is_case_sensitive);
+    RUN_TEST(search_code_unindexed_project_scans_recursively);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);

@@ -18,6 +18,9 @@
 #define CBM_REG_ICASE 2
 #define CBM_REG_NOSUB 4
 #define CBM_REG_NEWLINE 8
+/* GNU-style escapes (\b \< \> \w \s ...) as grep -E accepts them. glibc and
+ * TRE support these by default; macOS libc needs REG_ENHANCED. */
+#define CBM_REG_ENHANCED 16
 
 /* ── Error codes ──────────────────────────────────────────────── */
 
