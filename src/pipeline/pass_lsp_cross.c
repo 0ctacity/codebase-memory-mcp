@@ -42,13 +42,13 @@
 /* ── Constants ─────────────────────────────────────────────────── */
 
 enum {
-    PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
+    PXC_MAX_FILE_BYTES_FACTOR = 100, /* source size cap, in MiB */
     PXC_ITOA_BUF = 16,
 };
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
- * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
- * grow a foundation-wide formatting API just for log output. */
+ * Kept local so passes don't grow a foundation-wide formatting API just for
+ * log output. */
 static const char *itoa_buf(int val) {
     static _Thread_local char bufs[PXC_ITOA_BUF][PXC_ITOA_BUF];
     static _Thread_local int slot = 0;
@@ -70,7 +70,7 @@ static bool pxc_module_is_dir(CBMLanguage lang) {
 }
 
 /* Slurp a file into a malloc'd, NUL-terminated buffer. Mirrors the
- * read_file helper in pass_calls.c / pass_parallel.c (kept local so the
+ * read_file helper in pass_parallel.c (kept local so the
  * pipeline doesn't grow a public read-file API just for this pass). */
 static char *pxc_read_file(const char *path, int *out_len) {
     FILE *f = cbm_fopen(path, "rb");
@@ -914,10 +914,10 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
  * cbm_pxc_run_one's signature is shared with the parallel pass
  * (pass_parallel.c) and cannot grow a manifest parameter without touching
  * that file. We therefore pass the parsed workspace manifest to the Rust
- * cross-file resolver through a file-static borrowed pointer that the
- * sequential driver (cbm_pipeline_pass_lsp_cross, below) sets up once per
- * pass run from the project's root Cargo.toml. The manifest's strings are
- * owned by `g_pxc_rust_manifest_arena`; the pointer is borrowed (NULL when
+ * cross-file resolver through a thread-local borrowed pointer that each
+ * resolve worker sets from the manifest cbm_pxc_build_rust_manifest read
+ * once from the project's root Cargo.toml. The manifest's strings are
+ * owned by the caller's arena; the pointer is borrowed (NULL when
  * the project has no Cargo.toml — single-crate / non-workspace projects,
  * where in-file resolution needs no workspace metadata). */
 static _Thread_local const CBMCargoManifest *g_pxc_rust_manifest = NULL;
@@ -1455,153 +1455,6 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
     return true;
-}
-
-int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                int file_count, CBMFileResult **cache) {
-    if (!ctx || !files || file_count <= 0 || !cache)
-        return 0;
-
-    cbm_log_info("pass.start", "pass", "lsp_cross", "files", itoa_buf(file_count));
-
-    /* Build the Rust workspace manifest once (only when the project has at
-     * least one Rust file, to avoid an unconditional Cargo.toml read).
-     * The manifest's strings live in `cargo_arena`; the resolver borrows
-     * the pointer through the file-static set below. */
-    bool have_rust = false;
-    for (int i = 0; i < file_count; i++) {
-        if (cache[i] && files[i].language == CBM_LANG_RUST) {
-            have_rust = true;
-            break;
-        }
-    }
-    CBMArena cargo_arena;
-    CBMCargoManifest cargo_manifest;
-    bool have_manifest = false;
-    if (have_rust) {
-        cbm_arena_init(&cargo_arena);
-        have_manifest = cbm_pxc_build_rust_manifest(ctx, &cargo_arena, &cargo_manifest);
-        cbm_pxc_set_rust_manifest(have_manifest ? &cargo_manifest : NULL);
-    }
-
-    /* Per-file module QN cache so we don't recompute it once per def + once
-     * per call. cbm_pipeline_fqn_module mallocs; freed at end. */
-    char **def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
-    if (!def_modules) {
-        cbm_log_error("pass.err", "pass", "lsp_cross", "phase", "alloc");
-        return 0;
-    }
-
-    int def_count = 0;
-    CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(ctx, cache, files, file_count,
-                                                   ctx->project_name, def_modules, NULL,
-                                                   &def_count);
-
-    /* Shared prepare (mirrors run_parallel_pipeline): inverted module-def
-     * index + per-language shared registries, built ONCE for the whole pass.
-     * The per-file loop below then dispatches through the SAME helper the
-     * parallel resolve worker uses — previously this driver handed the FULL
-     * def list to full per-file registry builds (O(files x defs); the
-     * ms-typescript sequential crawl). The registries live in the
-     * CALLER-OWNED ctx->seq_cross_arena: resolved_calls may borrow registry
-     * strings that the later calls pass still reads, so the arena must
-     * outlive this pass (run_sequential_pipeline destroys it after all
-     * passes; freeing here was a pass_calls use-after-free). */
-    CBMModuleDefIndex *module_def_index =
-        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
-    CBMCrossLspRegistries cross_registries = {0};
-    if (all_defs) {
-        CBMArena *xa = &ctx->seq_cross_arena;
-        if (!ctx->seq_cross_arena_live) {
-            cbm_arena_init(xa);
-            ctx->seq_cross_arena_live = true;
-        }
-        cross_registries.go = cbm_go_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.python = cbm_py_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.c = cbm_c_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
-        cross_registries.zig_args = cbm_pxc_collect_zig_args(
-            ctx, cache, files, file_count, def_modules, module_def_index, all_defs, def_count, xa,
-            &cross_registries.zig_arg_count);
-    }
-
-    int processed = 0;
-    int skipped_no_lsp = 0;
-    int skipped_no_source = 0;
-    int per_lang_calls = 0;
-
-    for (int i = 0; i < file_count; i++) {
-        if (!cache[i])
-            continue;
-        CBMLanguage lang = files[i].language;
-        if (!cbm_pxc_has_cross_lsp(lang)) {
-            skipped_no_lsp++;
-            continue;
-        }
-
-        int source_len = 0;
-        char *source = pxc_read_file(files[i].path, &source_len);
-        if (!source || source_len <= 0) {
-            free(source);
-            skipped_no_source++;
-            continue;
-        }
-
-        if (!def_modules[i]) {
-            def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
-                                                         pxc_module_is_dir(files[i].language));
-        }
-
-        const char **imp_keys = NULL;
-        const char **imp_vals = NULL;
-        int imp_count = 0;
-        pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys, &imp_vals,
-                             &imp_count);
-
-        /* Journal around the resolve: a hang here must be attributed to THIS
-         * file, not to a stale extraction marker (the innocent-quarantine
-         * failure mode). */
-        cbm_index_mark_start(files[i].rel_path);
-        bool had_error = cache[i]->has_error;
-        cbm_pxc_dispatch_file(lang, cache[i], source, source_len, files[i].rel_path, def_modules[i],
-                              &cross_registries, module_def_index, all_defs, def_count, imp_keys,
-                              imp_vals, imp_count, NULL, NULL);
-        cbm_index_mark_done(files[i].rel_path);
-        /* A cross-file walk that stopped incomplete kept only the calls it
-         * had before; the file is indexed with less resolution than it
-         * should have, so the gap is reported rather than silent. */
-        if (!had_error && cache[i]->has_error && ctx->pipeline) {
-            cbm_pipeline_add_file_error(ctx->pipeline, files[i].rel_path, cache[i]->error_msg,
-                                        "lsp_incomplete");
-        }
-        per_lang_calls++;
-        processed++;
-
-        pxc_free_import_map(imp_keys, imp_vals, imp_count);
-        free(source);
-    }
-
-    cbm_pxc_free_module_def_index(module_def_index);
-    free((void *)cross_registries.zig_args);
-    free(all_defs);
-    for (int i = 0; i < file_count; i++)
-        free(def_modules[i]);
-    free(def_modules);
-
-    /* Drop the borrowed manifest pointer before its arena dies, so a later
-     * pass (or a stale thread-local) can never read freed manifest memory. */
-    if (have_rust) {
-        cbm_pxc_set_rust_manifest(NULL);
-        cbm_arena_destroy(&cargo_arena);
-    }
-    (void)have_manifest;
-
-    cbm_log_info("pass.done", "pass", "lsp_cross", "files_processed", itoa_buf(processed),
-                 "files_skipped_no_lsp", itoa_buf(skipped_no_lsp), "files_skipped_no_source",
-                 itoa_buf(skipped_no_source), "defs_total", itoa_buf(def_count), "lsp_calls",
-                 itoa_buf(per_lang_calls));
-    return 0;
 }
 
 /* ── Per-module def index (gopls "package summary" pattern) ──── */

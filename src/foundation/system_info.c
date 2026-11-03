@@ -281,8 +281,8 @@ cbm_system_info_t cbm_system_info(void) {
 }
 
 int cbm_default_worker_count(bool initial) {
-    /* CBM_WORKERS env override. Zero selects the sequential path; positive
-     * values are clamped to [1, CBM_WORKERS_MAX].
+    /* CBM_WORKERS env override. Zero means one worker; positive values are
+     * accepted in [1, CBM_WORKERS_MAX].
      * Useful inside containers where sysconf(_SC_NPROCESSORS_ONLN)
      * reports host CPUs rather than the cgroup's effective CPU quota.
      * Same precedence shape as other CBM_* env overrides:

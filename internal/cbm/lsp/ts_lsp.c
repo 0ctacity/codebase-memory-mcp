@@ -5535,7 +5535,7 @@ void cbm_batch_ts_lsp_cross(CBMArena *arena, CBMBatchTSLSPFile *files, int file_
         return;
     // Project-scope merging happens implicitly: every file's CBMLSPDef set already
     // includes both same-file and cross-file defs (built by the caller). The plan §17
-    // finding #4 fix ensures the *caller* (pass_calls.c) merges interface declarations
+    // finding #4 fix ensures the *caller* merges interface declarations
     // by QN before passing them in.
     for (int i = 0; i < file_count; i++) {
         CBMBatchTSLSPFile *f = &files[i];

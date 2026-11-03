@@ -412,8 +412,7 @@ static size_t pp_json_escaped_len(const char *s) {
  * field mid-value produced unterminated strings/arrays — malformed properties
  * JSON that aborts every json_extract()-based consumer downstream (seen on the
  * Linux kernel: 50-param functions truncated at the 2 KB cap). Dropping an
- * oversized optional field whole keeps the JSON valid. Twin of
- * pass_definitions.c — keep both in sync. */
+ * oversized optional field whole keeps the JSON valid. */
 static void append_json_string(char *buf, size_t bufsize, size_t *pos, const char *key,
                                const char *val) {
     if (!val || val[0] == '\0') {
@@ -487,7 +486,7 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
 
 /* Append an already-serialized JSON value verbatim: ,"key":<json>. Atomic like
  * append_json_string. For `variants`, which extraction builds as a JSON array
- * of objects (cbm.h). Twin of pass_definitions.c -- keep both in sync. */
+ * of objects (cbm.h). */
 static void append_json_raw(char *buf, size_t bufsize, size_t *pos, const char *key,
                             const char *json) {
     if (!json || json[0] == '\0') {
@@ -507,8 +506,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
      * keep a lean properties blob (lossless — those fields are always zero for
-     * non-functions). Cuts RAM, gbuf-merge copy and dump volume. Mirrors
-     * pass_definitions.c::build_def_props — keep both in sync. */
+     * non-functions). Cuts RAM, gbuf-merge copy and dump volume. */
     const bool is_fn =
         def->label && (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
     int n;
@@ -978,9 +976,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * skip in this worker's list (merged into the pipeline's file-error list
          * later, surfacing in skipped[]) and move on — the good files still
          * index and status stays "indexed". No-op unless the supervisor set
-         * CBM_INDEX_QUARANTINE_FILE. Covers the parallel path; the supervisor's
-         * single-threaded recovery run instead takes the sequential path
-         * (pass_definitions.c), and cbm_extract_file's hard guard backstops both. */
+         * CBM_INDEX_QUARANTINE_FILE. cbm_extract_file's hard guard backstops
+         * this check. */
         if (cbm_index_is_quarantined(fi->rel_path)) {
             const char *phase = cbm_index_quarantine_phase(fi->rel_path);
             if (!phase) {
@@ -1057,8 +1054,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             /* Indexed, but with unrecovered ERROR/MISSING regions. Not a skip:
              * recorded under the distinct "parse_partial" phase with the
              * line-range list as the reason, or "parse_unusable" when one range
-             * covers most of the file (see parse_unusable in cbm.h). Keep in
-             * sync with pass_definitions.c. */
+             * covers most of the file (see parse_unusable in cbm.h). */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "",
                        result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
@@ -1377,10 +1373,12 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         return 0;
     }
     /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait) — see pass_definitions.c for rationale. Struct
-     * included so Rust/Go/Swift/D structs resolve as type targets. Variable/Field
-     * defs are registered too so READS/WRITES can resolve.
-     * KEEP IN SYNC with pass_definitions.c and pipeline_incremental.c. */
+     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
+     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and
+     * method/field resolution can reach them — Struct included so Rust/Go/
+     * Swift/D structs resolve as type targets. Variable/Field defs are
+     * registered too so READS/WRITES can resolve.
+     * KEEP IN SYNC with pipeline_incremental.c's seed set. */
     if (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
         strcmp(def->label, "Field") == 0) {
@@ -2360,7 +2358,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
  * same way emit_service_edge classifies that fallback, and nothing else: no
  * CALLS edge to the refused target and no URL-argument scan. Dropping the
  * whole call lost every GET registration in a mixed-language repo while POST
- * (no `post` to collide with) survived. Mirrors pass_calls.c. */
+ * (no `post` to collide with) survived. */
 static void emit_xlang_refused_route(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                      const CBMCall *call, const char *module_qn,
                                      const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
@@ -2535,11 +2533,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         /* LSP-resolved calls take precedence over registry textual matching.
-         * Same helper + same CBM_LSP_CONFIDENCE_FLOOR as the sequential
-         * pipeline (pass_calls.c) — both paths must admit the same set of
-         * LSP overrides so a project doesn't get different attributions
-         * depending on whether parallel mode kicked in. Unique-tail
-         * fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
+         * The shared helper and CBM_LSP_CONFIDENCE_FLOOR (lsp_resolve.h)
+         * decide which LSP overrides are admitted. Unique-tail fallbacks
+         * are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
         bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
         cbm_resolution_t res = {0};
         const CBMResolvedCall *lsp = NULL;
@@ -2591,10 +2587,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * ref to an alias-path QN that never matches a def node, so lsp_target
          * is NULL). The old `else` ran the registry ONLY when lsp was null, so
          * an LSP-with-unresolvable-target dropped the edge outright — silently
-         * losing every alias-imported JSX component edge on the parallel path
-         * (~21% of a Next.js call graph) while the sequential pass, which falls
-         * THROUGH to the registry here, kept them. This restores seq/parallel
-         * parity via the import_map / unique_name resolution. */
+         * losing every alias-imported JSX component edge (~21% of a Next.js
+         * call graph). Falling THROUGH to the registry keeps them via the
+         * import_map / unique_name resolution. */
         if (!res.qualified_name || !res.qualified_name[0]) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
@@ -2607,8 +2602,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
 
-        /* Perl call-graph noise guard (#476), mirroring the sequential pass
-         * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
+        /* Perl call-graph noise guard (#476). Perl has no LSP resolver; for
+         * builtins (push/shift/
          * keys/...) and method calls ($obj->m, unresolved receiver), suppress
          * only WEAK cross-file short-name matches and keep the high-confidence
          * same_module / import_map strategies so a genuine same-file or
@@ -2630,15 +2625,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * main-identical by construction. res.strategy may carry an lsp_* value
          * here (LSP-resolved calls keep res through this point); the helper's
          * EXPLICIT drop-list leaves lsp_ts_method / lsp_cross untouched. See
-         * #606 direction.
-         *
-         * This language set MUST match the one in pass_calls.c exactly — see the
-         * note there. */
+         * #606 direction. */
         bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                     lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                     lang == CBM_LANG_ZIG;
-        /* Bare-call local-binding suppression — see the note in pass_calls.c.
-         * This gate MUST stay identical to the one there. */
+        /* Bare-call local-binding suppression. A member call has a receiver the
+         * guard above can reason about; a bare `run()` has none, so that guard
+         * cannot see this class at all. Python-only today because the
+         * extraction flag is set only for Python. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
         bool drop_plain_call =
             cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
@@ -2648,7 +2642,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
 
         /* First: a call on an axios.create() instance (#1916) — decided by the
          * receiver's binding, before the #523 spelling check and the
-         * route-registration suffix fallback. MUST match pass_calls.c. */
+         * route-registration suffix fallback. */
         char client_url[CBM_SZ_512];
         if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
                                               imp_keys, imp_vals, imp_count, call, client_url,
@@ -2667,7 +2661,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pattern, so the resolved-QN service checks below miss it and the call
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
-         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+         * node, not the unindexed library). (#523) */
         cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
@@ -2690,7 +2684,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             /* A callee an import binds to an external client library
              * (`send` under `from paho.mqtt import publish as send`):
              * spelled through its import, then classified. The binding
-             * outranks a weak name match. MUST match pass_calls.c. */
+             * outranks a weak name match. */
             char spelled[CBM_SZ_512];
             cbm_svc_kind_t isvc = cbm_pipeline_external_import_service(
                 lang, &result->imports, imp_keys, imp_count, call, spelled, sizeof(spelled));
@@ -2719,7 +2713,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                  * has failed to find a local/imported `fetch`. Call the low-level
                  * emitter directly — emit_service_edge re-derives its own kind
                  * from res->qualified_name via cbm_service_pattern_match, which
-                 * "fetch" deliberately never matches (mirrors pass_calls.c). */
+                 * "fetch" deliberately never matches. */
                 const char *u = call->first_string_arg;
                 if (u && u[0] != '\0' && (u[0] == '/' || strstr(u, "://") != NULL)) {
                     cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
@@ -2746,7 +2740,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                    memory_order_relaxed);
         if (target_node && source_node->id != target_node->id &&
             cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-            /* #725: same guard as pass_calls.c — do not emit a suffix_match
+            /* #725: do not emit a suffix_match
              * CALLS edge across a language boundary. A route registration
              * behind the refused binding still gets its Route. */
             emit_xlang_refused_route(ws->local_edge_buf, source_node, call, module_qn, rc->registry,
@@ -2758,7 +2752,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * resolve to an unindexed QN (target_node == NULL), but their edge
              * target is a synthesized route node, not the library — emit them
              * anyway so cross-repo matching has an HTTP_CALLS edge to work with
-             * (#523). Mirrors the sequential resolve_single_call bypass. */
+             * (#523). */
             cbm_svc_kind_t psvc = cbm_service_pattern_match(res.qualified_name);
             if ((psvc == CBM_SVC_HTTP || psvc == CBM_SVC_ASYNC) && !target_node) {
                 const char *u = call->first_string_arg;
@@ -2788,9 +2782,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     }
 }
 
-/* Resolve USAGE and CALL_REFERENCE edges for one file. Mirrors
- * resolve_usage_edges in pass_usages.c: CALL_REFERENCE only through the exact
- * LSP join, never from the textual registry. */
+/* Resolve USAGE and CALL_REFERENCE edges for one file. CALL_REFERENCE only
+ * through the exact LSP join, never from the textual registry. */
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
                                 const char **imp_keys, const char **imp_vals, int imp_count,
@@ -2827,8 +2820,7 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             }
             tgt = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
             /* #1928: the registry fallback is a bare-name guess — never let it
-             * bind a reference across a language boundary. Mirrors the
-             * sequential twin (pass_usages.c). */
+             * bind a reference across a language boundary. */
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
@@ -2905,8 +2897,7 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
             continue;
         }
         /* #1928: every resolution here is a bare-name registry guess — never
-         * let it bind a read/write across a language boundary. Mirrors the
-         * sequential twin (pass_usages.c). */
+         * let it bind a read/write across a language boundary. */
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
@@ -3376,8 +3367,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
                 /* Shared per-file dispatch (pass_lsp_cross.c): module-def
                  * filter → shared prebuilt registry (overlay pattern) →
-                 * filtered per-file fallback. The SAME helper drives the
-                 * sequential pass — one path, one semantics. Journal the
+                 * filtered per-file fallback. Journal the
                  * file around the resolve so a hang HERE is attributed to
                  * this file, not to a stale extraction marker. */
                 cbm_index_mark_start(rel);
@@ -3762,4 +3752,67 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_log_info("parallel.resolve.scan_cost", "tail_lookups", tl_buf, "tail_candidates", tc_buf,
                  "per_lookup", tp_buf);
     return 0;
+}
+
+void cbm_parallel_resolve_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                int file_count) {
+    if (!ctx || !files || file_count <= 0) {
+        return;
+    }
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(ctx->gbuf));
+    resolve_ctx_t rc = {
+        .files = files,
+        .file_count = file_count,
+        .project_name = ctx->project_name,
+        .repo_path = ctx->repo_path,
+        .main_gbuf = ctx->gbuf,
+        .registry = ctx->registry,
+        .shared_ids = &shared_ids,
+        .cancelled = ctx->cancelled,
+    };
+    resolve_worker_state_t ws = {
+        .local_edge_buf = cbm_gbuf_new_shared_ids(ctx->project_name, ctx->repo_path, &shared_ids),
+    };
+    if (!ws.local_edge_buf) {
+        return;
+    }
+    for (int i = 0; i < file_count && !cbm_pipeline_check_cancel(ctx); i++) {
+        const cbm_file_info_t *fi = &files[i];
+        int source_len = 0;
+        char *source = read_file(fi->path, &source_len, NULL, NULL);
+        if (!source) {
+            continue;
+        }
+        CBMFileResult *result =
+            cbm_extract_file(source, source_len, fi->language, ctx->project_name, fi->rel_path,
+                             CBM_EXTRACT_BUDGET, NULL, NULL);
+        free_source(source);
+        if (!result) {
+            continue;
+        }
+        if (result->calls.count > 0) {
+            const char **imp_keys = NULL;
+            const char **imp_vals = NULL;
+            int imp_count = 0;
+            build_import_map(ctx->gbuf, ctx->project_name, fi->rel_path, &imp_keys, &imp_vals,
+                             &imp_count);
+            char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, fi->rel_path,
+                                                          pp_module_is_dir(fi->language));
+            resolve_file_calls(&rc, &ws, result, fi->rel_path, module_qn, imp_keys, imp_vals,
+                               imp_count, fi->language);
+            if (fi->language == CBM_LANG_PYTHON) {
+                resolve_file_fastapi_depends(&rc, &ws, result, fi->path, module_qn, imp_keys,
+                                             imp_vals, imp_count);
+            }
+            free(module_qn);
+            free_import_map(imp_keys, imp_vals, imp_count);
+        }
+        cbm_free_result(result);
+    }
+    cbm_gbuf_merge(ctx->gbuf, ws.local_edge_buf);
+    cbm_gbuf_free(ws.local_edge_buf);
+    cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
+    cbm_log_info("parallel.resolve_calls.done", "files", itoa_log(file_count), "calls",
+                 itoa_log(ws.calls_resolved));
 }

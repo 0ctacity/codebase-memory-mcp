@@ -218,8 +218,7 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     /* Note: we do NOT re-target the edge here because modifying edges during
      * iteration is unsafe. The edge stays pointing to the library function.
      * The URL-in-args detection in pass_parallel will create Route→handler HANDLES
-     * edge separately. The caller→Route edge is created by pass_calls for
-     * the sequential path; for the parallel path, the caller→library edge
+     * edge separately. The caller→library edge
      * with url_path in properties is sufficient for query_graph to find
      * the Route via: caller → HTTP_CALLS(url_path="/api/x") + Route("/api/x"). */
 }
@@ -972,7 +971,7 @@ static void create_data_flows(cbm_gbuf_t *gb) {
  *
  * SvelteKit derives REST endpoints and SSR loaders from the filesystem
  * layout under `src/routes/`. No `app.get(...)` style call exists for
- * pass_calls.c to pick up, so we walk File nodes and synthesise Route
+ * the call resolver to pick up, so we walk File nodes and synthesise Route
  * nodes + HANDLES edges directly here.
  *
  * Recognised filenames (TypeScript and JavaScript variants):
@@ -1280,7 +1279,7 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     create_grpc_routes(gb);
 
     /* Phase 5: filesystem-based SvelteKit routes (+server / +page.server /
-     * +layout.server) — no call-site equivalent for pass_calls.c to pick
-     * up, so we walk File nodes directly here. */
+     * +layout.server) — no call-site equivalent for the call resolver to
+     * pick up, so we walk File nodes directly here. */
     create_sveltekit_routes(gb);
 }

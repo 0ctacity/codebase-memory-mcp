@@ -8,7 +8,7 @@
  * emits the correct strategy (lsp_builtin / lsp_builtin_constructor /
  * lsp_builtin_method / lsp_generic_method) with callee_qn = "builtins.<name>".
  *
- * The missing piece is downstream: pass_calls.c only writes a CALLS edge when
+ * The missing piece is downstream: the call resolver only writes a CALLS edge when
  * cbm_pipeline_lsp_target_node() resolves the callee_qn to a graph node
  * (src/pipeline/lsp_resolve.h). There is no "builtins.len" node in the graph,
  * so the resolved call is dropped and the strategy never lands on an edge.

@@ -131,12 +131,6 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e) {
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
-/* Get the basename from a relative path. Returns pointer into rel_path. */
-static const char *path_basename(const char *rel_path) {
-    const char *last = strrchr(rel_path, '/');
-    return last ? last + SKIP_ONE : rel_path;
-}
-
 /* Get the directory part of a relative path (without trailing slash).
  * Returns heap-allocated string. For "foo.json" returns "". */
 static char *path_dirname(const char *rel_path) {
@@ -1328,72 +1322,6 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
     int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
-}
-
-/* Build pkgmap for sequential path (reads manifest files directly) */
-CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
-                                          const char *project_name) {
-    cbm_pkg_entries_t entries;
-    cbm_pkg_entries_init(&entries);
-
-    for (int i = 0; i < file_count; i++) {
-        const char *basename = path_basename(files[i].rel_path);
-        if (!is_pkgmap_manifest_basename(basename)) {
-            continue;
-        }
-
-        /* Read file */
-        int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
-        if (!source) {
-            continue;
-        }
-        cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
-    }
-
-    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
-    cbm_pkg_entries_free(&entries);
-    return map;
-}
-
-/* Variant of cbm_pkgmap_build_from_files that ALSO walks the repo
- * filesystem to pick up manifests filtered out by the main discoverer
- * (the canonical case: package.json, which is in IGNORED_JSON_FILES).
- * Falls back to the files[]-only behaviour if repo_path is NULL. */
-CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count) {
-    cbm_pkg_entries_t entries;
-    cbm_pkg_entries_init(&entries);
-
-    /* Manifests already visible through discovery (Cargo.toml, go.mod,
-     * pyproject.toml, ...). package.json typically isn't, but we still
-     * harvest whatever the discovery filter exposed in case downstream
-     * filters change. */
-    int from_files = 0;
-    for (int i = 0; i < file_count; i++) {
-        const char *basename = path_basename(files[i].rel_path);
-        if (!is_pkgmap_manifest_basename(basename)) {
-            continue;
-        }
-        from_files++;
-        int source_len = 0;
-        char *source = pkgmap_read_file(files[i].path, &source_len);
-        if (!source) {
-            continue;
-        }
-        cbm_pkgmap_try_parse(basename, files[i].rel_path, source, source_len, &entries);
-        free(source);
-    }
-
-    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
-    cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
-                 "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
-                 pkgmap_itoa(entries.count));
-    CBMHashTable *map = cbm_pkgmap_build(&entries, SKIP_ONE, project_name);
-    cbm_pkg_entries_free(&entries);
-    return map;
 }
 
 static void pkgmap_free_entry(const char *key, void *value, void *userdata) {

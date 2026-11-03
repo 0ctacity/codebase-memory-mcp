@@ -662,7 +662,7 @@ void cbm_index_mark_done(const char *rel_path) {
  * next to the other env-driven extract hooks (marker + fault injector), so the
  * single hard guard lives at the one choke point every pass funnels through
  * (cbm_extract_file): whether a pass re-extracts from disk on a cache miss
- * (sequential pass_calls/usages/semantic) or extracts fresh, a quarantined file
+ * or extracts fresh, a quarantined file
  * short-circuits to an empty result and never reaches the parser/crash. The
  * pipeline extract loops separately REPORT the skip as phase="crash" via
  * cbm_index_is_quarantined() so the crasher surfaces in the response skipped[].
@@ -2076,8 +2076,8 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
         bool in_loop = c->loop_depth > 0;
 
         if (strcmp(callee_short, d->name) == 0 && is_self_receiver(c->callee_name, d->receiver)) {
-            // Direct self-recursion. The call graph omits self-edges (pass_calls
-            // skips source==target), so detect it here; seeds "recursive".
+            // Direct self-recursion. The call graph omits self-edges (the call
+            // resolver skips source==target), so detect it here; seeds "recursive".
             d->is_recursive = true;
             if (has_self) {
                 has_self[best] = true;

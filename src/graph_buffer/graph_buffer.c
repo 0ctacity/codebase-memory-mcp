@@ -179,8 +179,8 @@ static uint64_t fnv1a64(const char *s, size_t len) {
  * named imports from the same specifier resolve to the same (source,
  * target) pair but are distinct symbols. Key on local_name too so the
  * second import doesn't dedup-collide with and overwrite the first —
- * every pass that walks IMPORTS edges (pass_calls.c, pass_usages.c,
- * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
+ * every pass that walks IMPORTS edges (the call resolver in pass_parallel.c,
+ * pass_lsp_cross.c) expects one local_name per edge, so
  * losing an edge here silently breaks cross-file call resolution for
  * whichever symbol got dropped, not just "who imports X" queries. Other
  * edge types keep the plain (source,target,type) key: collapsing repeat

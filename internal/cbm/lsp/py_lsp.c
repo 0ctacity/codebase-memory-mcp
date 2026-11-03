@@ -3956,7 +3956,7 @@ bool cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     /* Inject minimal builtin definitions as real graph nodes (builtins.len,
      * builtins.str, builtins.str.upper, ...). The typeshed registry already
      * RESOLVES builtin calls (emitting the strategy + a "builtins.*" callee_qn),
-     * but pass_calls.c only writes the CALLS edge when that callee_qn maps to a
+     * but the call resolver only writes the CALLS edge when that callee_qn maps to a
      * graph node. We run inside cbm_extract_file, before the pipeline mints
      * def nodes from result->defs, so these become the target nodes the
      * builtin/constructor/method edges point at. Upsert dedups by QN. */

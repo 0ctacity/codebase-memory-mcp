@@ -1,8 +1,8 @@
 /*
  * test_parallel.c — Tests for the three-phase parallel pipeline.
  *
- * Validates parity between sequential (4-pass) and parallel (3-phase)
- * pipeline modes on a small Go test fixture.
+ * Validates that one worker and several workers build the same graph on a
+ * small Go test fixture, plus the parallel resolver's regressions.
  *
  * Suite: suite_parallel
  */
@@ -81,33 +81,6 @@ static void teardown_parallel_repo(void) {
     if (g_par_tmpdir[0])
         rm_rf(g_par_tmpdir);
     g_par_tmpdir[0] = '\0';
-}
-
-/* ── Run sequential pipeline on files, returning gbuf ─────────────── */
-
-static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
-                                  cbm_file_info_t *files, int file_count) {
-    cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
-    cbm_registry_t *reg = cbm_registry_new();
-    atomic_int cancelled;
-    atomic_init(&cancelled, 0);
-
-    cbm_pipeline_ctx_t ctx = {
-        .project_name = project,
-        .repo_path = repo_path,
-        .gbuf = gbuf,
-        .registry = reg,
-        .cancelled = &cancelled,
-    };
-
-    cbm_init();
-    cbm_pipeline_pass_definitions(&ctx, files, file_count);
-    cbm_pipeline_pass_calls(&ctx, files, file_count);
-    cbm_pipeline_pass_usages(&ctx, files, file_count);
-    cbm_pipeline_pass_semantic(&ctx, files, file_count);
-
-    cbm_registry_free(reg);
-    return gbuf;
 }
 
 /* ── Run parallel pipeline on files, returning gbuf ───────────────── */
@@ -191,7 +164,7 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
 
 /* ── Parity Tests ─────────────────────────────────────────────────── */
 
-static cbm_gbuf_t *g_seq_gbuf = NULL;
+static cbm_gbuf_t *g_one_gbuf = NULL;
 static cbm_gbuf_t *g_par_gbuf = NULL;
 static int g_parity_setup_done = 0;
 
@@ -211,12 +184,8 @@ static int ensure_parity_setup(void) {
 
     const char *project = "par-test";
 
-    /* Build structure for both (need File/Folder nodes before definitions) */
-    /* For parity, we need the structure pass too. Let's just compare
-     * definition/call/usage/semantic edge counts. */
-
-    /* Run both modes */
-    g_seq_gbuf = run_sequential(project, g_par_tmpdir, files, file_count);
+    /* One worker and two workers must build the same graph. */
+    g_one_gbuf = run_parallel(project, g_par_tmpdir, files, file_count, 1);
     g_par_gbuf = run_parallel(project, g_par_tmpdir, files, file_count, 2);
 
     cbm_discover_free(files, file_count);
@@ -225,9 +194,9 @@ static int ensure_parity_setup(void) {
 }
 
 static void parity_teardown(void) {
-    if (g_seq_gbuf) {
-        cbm_gbuf_free(g_seq_gbuf);
-        g_seq_gbuf = NULL;
+    if (g_one_gbuf) {
+        cbm_gbuf_free(g_one_gbuf);
+        g_one_gbuf = NULL;
     }
     if (g_par_gbuf) {
         cbm_gbuf_free(g_par_gbuf);
@@ -241,10 +210,10 @@ static void parity_teardown(void) {
 TEST(parallel_node_count) {
     if (ensure_parity_setup() != 0)
         FAIL("setup failed");
-    int seq = cbm_gbuf_node_count(g_seq_gbuf);
+    int one = cbm_gbuf_node_count(g_one_gbuf);
     int par = cbm_gbuf_node_count(g_par_gbuf);
-    ASSERT_GT(seq, 0);
-    ASSERT_EQ(seq, par);
+    ASSERT_GT(one, 0);
+    ASSERT_EQ(one, par);
     PASS();
 }
 
@@ -252,10 +221,10 @@ TEST(parallel_node_count) {
 static int assert_edge_type_parity(const char *type) {
     if (ensure_parity_setup() != 0)
         return -1;
-    int seq = cbm_gbuf_edge_count_by_type(g_seq_gbuf, type);
+    int one = cbm_gbuf_edge_count_by_type(g_one_gbuf, type);
     int par = cbm_gbuf_edge_count_by_type(g_par_gbuf, type);
-    if (seq != par) {
-        printf("  FAIL: %s edges: seq=%d par=%d\n", type, seq, par);
+    if (one != par) {
+        printf("  FAIL: %s edges: one=%d par=%d\n", type, one, par);
         return 1;
     }
     return 0;
@@ -320,10 +289,10 @@ TEST(parallel_implements_parity) {
 TEST(parallel_total_edges) {
     if (ensure_parity_setup() != 0)
         FAIL("setup failed");
-    int seq = cbm_gbuf_edge_count(g_seq_gbuf);
+    int one = cbm_gbuf_edge_count(g_one_gbuf);
     int par = cbm_gbuf_edge_count(g_par_gbuf);
-    ASSERT_GT(seq, 0);
-    ASSERT_EQ(seq, par);
+    ASSERT_GT(one, 0);
+    ASSERT_EQ(one, par);
     PASS();
 }
 
@@ -654,8 +623,7 @@ static bool id_env_open(id_env_t *env) {
     env->saved_cache = id_env_save("CBM_CACHE_DIR");
     env->saved_workers = id_env_save("CBM_WORKERS");
     cbm_setenv("CBM_CACHE_DIR", env->cache, 1);
-    /* More than one worker and more files than MIN_FILES_FOR_PARALLEL (50):
-     * the parallel route. */
+    /* More than one worker, so the workers share the id counter. */
     cbm_setenv("CBM_WORKERS", "4", 1);
     return true;
 }
@@ -716,8 +684,7 @@ TEST(parallel_incremental_keeps_edge_ids_unique) {
         FAIL("failed to write the edge-id fixture");
     }
     int first_rc = id_run_pipeline(env.repo, NULL);
-    /* Every file changes, more than MIN_FILES_FOR_PARALLEL_INCR (50): the
-     * parallel incremental route. */
+    /* Every file changes, so the incremental run re-extracts all of them. */
     bool rewritten = write_id_fixture(env.repo, ID_FILES, 1);
     id_sync_probe_t syncs = {.push = true};
     edge_id_probe_t probe = {0};
@@ -828,8 +795,7 @@ TEST(parallel_incremental_keeps_node_ids_unique) {
         FAIL("failed to write the node-id fixture");
     }
     int first_rc = id_run_pipeline(env.repo, NULL);
-    /* Every file changes, more than MIN_FILES_FOR_PARALLEL_INCR (50): the
-     * parallel incremental route. */
+    /* Every file changes, so the incremental run re-extracts all of them. */
     bool rewritten = write_decorator_fixture(env.repo, ID_FILES, 1);
     int shares = 0;
     node_id_probe_t probe = {0};
@@ -851,8 +817,8 @@ TEST(parallel_incremental_keeps_node_ids_unique) {
 }
 
 /* ── Parallel-pipeline LSP-override regression ────────────────────── */
-/* Pin the wiring fix that unified pass_calls.c (sequential) and
- * pass_parallel.c (parallel) on cbm_pipeline_find_lsp_resolution +
+/* Pin the wiring fix that put the old sequential resolver and
+ * pass_parallel.c on cbm_pipeline_find_lsp_resolution +
  * CBM_LSP_CONFIDENCE_FLOOR (lsp_resolve.h). Before the unification, the
  * parallel path carried its own lsp_override_resolution_pp at floor 0.5
  * while the sequential path used find_lsp_resolution at floor 0.6, so a
@@ -1178,8 +1144,8 @@ TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     /* Sanity: extraction produced at least one call edge. */
     ASSERT_GT(c.total_calls, 0);
     /* The parallel pipeline must surface at least one LSP-attributed
-     * CALLS edge. This proves the unified cbm_pipeline_find_lsp_resolution
-     * (shared with pass_calls.c at floor 0.6) is actually consulted in
+     * CALLS edge. This proves cbm_pipeline_find_lsp_resolution
+     * (floor CBM_LSP_CONFIDENCE_FLOOR) is actually consulted in
      * the parallel pipeline, and that the resulting edge is emitted with
      * the LSP strategy intact rather than overwritten by the registry
      * fallback. */
@@ -1620,7 +1586,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_full_index_keeps_node_ids_unique);
     RUN_TEST(parallel_incremental_keeps_node_ids_unique);
 
-    /* Parallel pipeline parity tests */
+    /* One-worker vs two-worker parity tests */
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
