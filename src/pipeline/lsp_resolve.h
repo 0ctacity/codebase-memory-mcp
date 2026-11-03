@@ -1,20 +1,11 @@
 /*
  * lsp_resolve.h — Shared LSP-override resolver for the call-edge pipeline.
  *
- * Both pipeline paths (sequential cbm_pipeline_pass_calls and parallel
- * cbm_parallel_extract → resolve_file_calls) need to look up an
- * LSP-resolved call for a given (caller, callee) pair before falling back
- * to the registry's name-based resolver. Before this header existed, each
- * pipeline carried its own copy of that lookup with divergent confidence
- * floors and slightly different match semantics — most production
- * indexing went through the parallel path with a 0.5 floor while the
- * sequential path used 0.6, so the same project produced different
- * CALLS-edge attributions depending on which pipeline mode kicked in.
- *
- * Centralising the lookup here means both pipelines admit exactly the
- * same set of LSP overrides. Each pipeline still owns its own edge
- * emission (sequential uses emit_classified_edge, parallel uses
- * emit_service_edge) — this header only does the matching.
+ * The call resolver (pass_parallel.c resolve_file_calls) and the tests
+ * look up an LSP-resolved call for a given (caller, callee) pair here
+ * before falling back to the registry's name-based resolver, so every
+ * caller admits the same set of LSP overrides. Edge emission stays with
+ * the caller; this header only does the matching.
  *
  * Inline-only: no .c file needed.
  */

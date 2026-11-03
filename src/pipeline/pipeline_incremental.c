@@ -811,7 +811,7 @@ static void incr_rebuild_snapshot_callers(cbm_pipeline_ctx_t *ctx, const cbm_edg
                                              incr_keep_unless_source_in_set, &set);
     }
     if (caller_count > 0) {
-        cbm_pipeline_pass_calls(ctx, callers, caller_count);
+        cbm_parallel_resolve_calls(ctx, callers, caller_count);
     }
     free(source_ids);
     free(callers);
@@ -863,14 +863,14 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
 
-/* Labels the full-index definition pass seeds into the registry
- * (pass_definitions.c — KEEP IN SYNC). Incremental re-resolution must see the
+/* Labels the full index seeds into the registry
+ * (pass_parallel.c register_and_link_def — KEEP IN SYNC). Incremental re-resolution must see the
  * SAME symbol set, or it diverges from a clean full reindex: seeding extra
  * container nodes (File / Module / Folder / ...) lets a type usage like `Word`
  * resolve to the same-named Module node instead of the Class node. Only
  * callable / declared symbols belong in the registry. */
 static bool incr_label_is_registry_symbol(const char *label) {
-    /* Mirror pass_definitions.c / pass_parallel.c registry seeding EXACTLY:
+    /* Mirror pass_parallel.c registry seeding EXACTLY:
      * callables + every type-like container (Class/Struct/Interface/Enum/Type/
      * Trait) + Variable/Field. Struct included so an incremental re-resolve seeds
      * the same struct type nodes a full reindex would. */
@@ -891,101 +891,67 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     cbm_registry_add(r, node->name, node->qualified_name, node->label);
 }
 
-/* Run parallel or sequential extract+resolve for changed files. */
+/* Extract + resolve the changed files. */
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
 
     /* Per-file LSP always runs (every mode). Cross-file LSP stays disabled in
      * incremental regardless (cbm_parallel_resolve is called with NULL
      * cross_registries below). */
-
-#define MIN_FILES_FOR_PARALLEL_INCR 50
     int worker_count = cbm_default_worker_count(true);
-    bool use_parallel = (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
+    cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf(worker_count),
+                 "changed", itoa_buf(ci));
 
-    if (use_parallel) {
-        cbm_log_info("incremental.mode", "mode", "parallel", "workers", itoa_buf(worker_count),
-                     "changed", itoa_buf(ci));
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(ctx->gbuf));
 
-        _Atomic int64_t shared_ids;
-        atomic_init(&shared_ids, cbm_gbuf_next_id(ctx->gbuf));
-
-        CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
-        if (cache) {
-            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            int rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
-            if (rc == CBM_PIPELINE_ABORT_OVER_BUDGET) {
-                /* Over the memory budget: stop before publication so the
-                 * served generation stays as it was. */
-                for (int j = 0; j < ci; j++) {
-                    if (cache[j]) {
-                        cbm_free_result(cache[j]);
-                    }
-                }
-                free(cache);
-                return rc;
-            }
-            cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
-            cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
-                         itoa_buf((int)elapsed_ms(t)));
-
-            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
-            cbm_pipeline_share_next_id(ctx->gbuf, &shared_ids);
-            cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
-                         itoa_buf((int)elapsed_ms(t)));
-
-            /* Incremental skips cross-file LSP precondition build — it
-             * would need all_defs from the full project, not just the
-             * changed slice. Per-file LSP (run inside cbm_extract_file)
-             * still fires; cross-file resolution is deferred to the
-             * next full re-index. Pass NULL/0/NULL to make the fused
-             * step in resolve_worker a no-op. */
-            cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-            cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0,
-                                 NULL, NULL /* module_def_index */,
-                                 NULL /* cross_registries — incremental skips Tier 2 prebuild */);
-            cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
-            cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
-                         itoa_buf((int)elapsed_ms(t)));
-
-            cbm_pipeline_extract_infra_routes(ctx->gbuf, changed_files, cache, NULL, ci);
-            cbm_pipeline_process_infra_bindings(ctx->gbuf, changed_files, cache, NULL, ci);
+    CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
+    if (cache) {
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        int rc = cbm_parallel_extract(ctx, changed_files, ci, cache, &shared_ids, worker_count);
+        if (rc == CBM_PIPELINE_ABORT_OVER_BUDGET) {
+            /* Over the memory budget: stop before publication so the
+             * served generation stays as it was. */
             for (int j = 0; j < ci; j++) {
                 if (cache[j]) {
                     cbm_free_result(cache[j]);
                 }
             }
             free(cache);
+            return rc;
         }
-    } else {
-        cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf(ci));
-        if (!ctx->pkgmap) {
-            ctx->pkgmap = cbm_pkgmap_build_from_repo(ctx->repo_path, changed_files, ci,
-                                                     ctx->project_name, ctx->excluded_dirs,
-                                                     ctx->excluded_count);
-            cbm_pipeline_set_pkgmap(ctx->pkgmap);
-        }
-        /* Keep extraction results, as the full sequential path does, so the
-         * infra Route passes can read them. */
-        CBMFileResult **cache = ci > 0 ? (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *))
-                                       : NULL;
-        ctx->result_cache = cache;
-        cbm_pipeline_pass_definitions(ctx, changed_files, ci);
-        cbm_pipeline_pass_calls(ctx, changed_files, ci);
-        cbm_pipeline_pass_usages(ctx, changed_files, ci);
-        cbm_pipeline_pass_semantic(ctx, changed_files, ci);
-        ctx->result_cache = NULL;
-        if (cache) {
-            cbm_pipeline_extract_infra_routes(ctx->gbuf, changed_files, cache, NULL, ci);
-            cbm_pipeline_process_infra_bindings(ctx->gbuf, changed_files, cache, NULL, ci);
-            for (int j = 0; j < ci; j++) {
-                if (cache[j]) {
-                    cbm_free_result(cache[j]);
-                }
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
+        cbm_log_info("pass.timing", "pass", "incr_extract", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_build_registry_from_cache(ctx, changed_files, ci, cache);
+        cbm_pipeline_share_next_id(ctx->gbuf, &shared_ids);
+        cbm_log_info("pass.timing", "pass", "incr_registry", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+
+        /* Incremental skips cross-file LSP precondition build — it
+         * would need all_defs from the full project, not just the
+         * changed slice. Per-file LSP (run inside cbm_extract_file)
+         * still fires; cross-file resolution is deferred to the
+         * next full re-index. Pass NULL/0/NULL to make the fused
+         * step in resolve_worker a no-op. */
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count, NULL, 0,
+                             NULL, NULL /* module_def_index */,
+                             NULL /* cross_registries — incremental skips Tier 2 prebuild */);
+        cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
+        cbm_log_info("pass.timing", "pass", "incr_resolve", "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t)));
+
+        cbm_pipeline_extract_infra_routes(ctx->gbuf, changed_files, cache, NULL, ci);
+        cbm_pipeline_process_infra_bindings(ctx->gbuf, changed_files, cache, NULL, ci);
+        for (int j = 0; j < ci; j++) {
+            if (cache[j]) {
+                cbm_free_result(cache[j]);
             }
-            free(cache);
         }
+        free(cache);
     }
     return 0;
 }

@@ -446,9 +446,7 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * `enabled` is the CALLER's per-language gate, deliberately kept OUT of this
  * helper: the guard applies only to the language set each call site enumerates
  * (today Python plus the JS/TS family). Widening it is a
- * per-language decision made at the call sites in pass_calls.c and
- * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
- * them diverges the sequential and parallel resolvers. */
+ * per-language decision made at the call site in pass_parallel.c. */
 /* The weak short-name strategies that actually reach the call-resolution
  * guards: the registry's suffix_match / unique_name and the parallel
  * field_type_hint. "fuzzy" is listed as defensive insurance only —
@@ -503,9 +501,7 @@ bool cbm_suppress_zig_qualified_member(bool is_zig, bool is_method, const char *
  * binding is a fact about THIS file's scope, decidable outright.
  *
  * `enabled` is the caller's per-language gate, kept out of the helper for the
- * same reason as the member guard: the two call sites in pass_calls.c and
- * pass_parallel.c MUST enumerate the identical language set, or the sequential
- * and parallel resolvers diverge. Pure; unit-tested in test_registry.c. */
+ * same reason as the member guard. Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy) {
     if (!enabled || !callee_is_locally_bound) {

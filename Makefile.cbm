@@ -206,10 +206,8 @@ PIPELINE_SRCS = \
     src/pipeline/worker_pool.c \
     src/pipeline/pass_parallel.c \
     src/pipeline/result_spill.c \
-    src/pipeline/pass_definitions.c \
-    src/pipeline/pass_calls.c \
+    src/pipeline/service_bindings.c \
     src/pipeline/pass_lsp_cross.c \
-    src/pipeline/pass_usages.c \
     src/pipeline/pass_semantic.c \
     src/pipeline/pass_tests.c \
     src/pipeline/pass_githistory.c \

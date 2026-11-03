@@ -7,7 +7,7 @@
  * Also creates TESTS_FILE edges from test File nodes to the production
  * File nodes they correspond to (naming convention: _test.go → .go, etc.)
  *
- * Depends on: pass_calls having populated CALLS edges
+ * Depends on: the call resolver having populated CALLS edges
  */
 #include "foundation/constants.h"
 

@@ -101,7 +101,7 @@ TEST(platform_default_workers_env_override) {
     PASS();
 }
 
-TEST(platform_default_workers_env_zero_is_sequential) {
+TEST(platform_default_workers_env_zero_is_one_worker) {
     cbm_setenv("CBM_WORKERS", "0", 1);
     ASSERT_EQ(cbm_default_worker_count(true), 1);
     ASSERT_EQ(cbm_default_worker_count(false), 1);
@@ -381,7 +381,7 @@ SUITE(platform) {
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
     RUN_TEST(platform_default_workers_env_override);
-    RUN_TEST(platform_default_workers_env_zero_is_sequential);
+    RUN_TEST(platform_default_workers_env_zero_is_one_worker);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
     RUN_TEST(platform_env_long_reads_a_clean_number);

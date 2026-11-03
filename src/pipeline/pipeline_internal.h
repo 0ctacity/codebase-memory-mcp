@@ -124,16 +124,10 @@ typedef struct {
                                * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
-    /* Extraction result cache (sequential pipeline optimization).
-     * When non-NULL, pass_definitions stores results here instead of freeing,
-     * and pass_calls/usages/semantic reuse cached results instead of re-extracting.
-     * Indexed by file position in the files[] array. Owned by pipeline.c. */
-    CBMFileResult **result_cache;
-
     /* Parallel extract spill store (F1). When the extract runs over its memory
-     * budget, results are parked here and their result_cache slots go NULL;
+     * budget, results are parked here and their result cache slots go NULL;
      * every later pass reads a slot through cbm_result_cache_acquire. NULL on
-     * the sequential and incremental paths. Owned by run_parallel_pipeline. */
+     * the incremental path. Owned by run_parallel_pipeline. */
     cbm_result_spill_t *spill;
 
     /* Build-tool path aliases (tsconfig/jsconfig today; webpack/vite-style
@@ -142,7 +136,7 @@ typedef struct {
     const cbm_path_alias_collection_t *path_aliases;
 
     /* Package map built from this run's manifests (NULL when none). Owned by
-     * the run: built in run_sequential_pipeline / merge_pkg_entries, freed at
+     * the run: built in merge_pkg_entries, freed at
      * the end of cbm_pipeline_run. Per run, so in-process runs never share it. */
     CBMHashTable *pkgmap;
 
@@ -153,17 +147,6 @@ typedef struct {
     /* Stem collisions of the discovered files: which Module definitions take
      * `qn#ext`. Borrowed for the extraction phase; NULL elsewhere. */
     const cbm_stem_marks_t *stem_marks;
-
-    /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
-     * shared per-language registries here; resolved_calls entries may BORROW
-     * strings owned by these registries, and the later calls pass still
-     * reads them — so the arena is OWNED and destroyed by
-     * run_sequential_pipeline AFTER all passes, never by the lsp_cross pass
-     * itself (destroying at pass end was a use-after-free in pass_calls).
-     * Mirrors the parallel path, where cross_lsp_arena outlives the fused
-     * resolve. */
-    CBMArena seq_cross_arena;
-    bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
@@ -250,7 +233,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  * (`http_client` node property), write the request URL to `out` (the
  * instance's literal `http_base_url` joined with a '/'-leading path, the path
  * unchanged when the base is unknown or the URL is absolute) and return true.
- * Both call resolvers (pass_calls.c, pass_parallel.c) call this before any
+ * The call resolver (pass_parallel.c) calls this before any
  * route-registration or registry fallback, so a wrapper client's `api.get`
  * is never mistaken for an Express `app.get` route registration. */
 bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
@@ -319,14 +302,9 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
 CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_count,
                                const char *project_name);
 
-/* Build pkgmap by reading manifest files from the files array (sequential path). */
+/* Walk the repo for package manifests and add their entries. */
 int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
                          int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name,
-                                         char **excluded_dirs, int excluded_count);
-CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
-                                          const char *project_name);
 
 /* Free pkgmap and all owned strings. */
 void cbm_pkgmap_free(CBMHashTable *pkgmap);
@@ -648,12 +626,6 @@ void cbm_pipeline_set_share_ids_hook_for_tests(void (*hook)(cbm_gbuf_t *, _Atomi
                                                             void *),
                                                void *ctx);
 
-/* Test seam: the sequential CALLS pass's args formatter (pass_calls.c), so a
- * test can hand it an argument longer than its formatting buffer and read the
- * props it leaves behind. `props` is a NUL-terminated JSON object of `cap`
- * bytes; the formatter appends its "args" array in place. */
-void cbm_pipeline_calls_append_args_for_tests(char *props, size_t cap, const CBMCall *call);
-
 /* Phase 3B: Serial registry build from cached extraction results.
  * Creates DEFINES, DEFINES_METHOD, and IMPORTS edges in ctx->gbuf.
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */
@@ -692,6 +664,12 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                           * Typed as void* here to dodge the typedef/tag ordering
                           * problem — pass_parallel.c casts back to CBMCrossLspRegistries*. */
                          void *cross_registries);
+
+/* Re-resolve only CALLS (with their service/CONFIGURES variants and FastAPI
+ * Depends) for files whose definition nodes are already in ctx->gbuf.
+ * Incremental re-links unchanged callers of a purged target this way. */
+void cbm_parallel_resolve_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                int file_count);
 
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.
@@ -736,27 +714,7 @@ int cbm_pipeline_budget_gate(const char *phase);
 
 /* ── Pass function prototypes ────────────────────────────────────── */
 
-int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                  int file_count);
-
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
-
-int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
-
-/* Cross-file LSP type-aware call resolution pass. Augments per-file
- * resolved_calls with cross-file resolutions before call edges are emitted.
- * Implementation: src/pipeline/pass_lsp_cross.c. */
-int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                int file_count, CBMFileResult **cache);
-
-/* Sub-passes called from pass_calls: pattern-based edge extraction */
-void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                       int file_count);
-
-int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
-
-int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                               int file_count);
 
 int cbm_pipeline_pass_tests(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count);
 

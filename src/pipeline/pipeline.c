@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
+enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -738,10 +738,6 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_stem_marks_t *marks,
     return 0;
 }
 
-/* ── Pass 2: Definitions ─────────────────────────────────────────── */
-
-/* Implemented in pass_definitions.c via cbm_pipeline_pass_definitions() */
-
 /* ── Githistory compute thread (for fused post-pass parallelism) ─── */
 
 typedef struct {
@@ -1037,103 +1033,6 @@ static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         cbm_pipeline_log_phase_mem(passes[i].name);
     }
     return 0;
-}
-
-/* Adapter that lets cbm_pipeline_pass_lsp_cross slot into the seq_passes
- * dispatch table. The cross-file LSP needs the per-file CBMFileResult cache
- * to read defs/imports without re-extracting; in the sequential path that
- * cache is ctx->result_cache (set up by run_sequential_pipeline before
- * launching the dispatch loop). When the cache is unavailable (e.g. if the
- * pipeline opted out of caching), the pass becomes a no-op since there are
- * no extracted results to feed cross-file resolution. */
-static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
-                                       int file_count) {
-    if (!ctx || !ctx->result_cache)
-        return 0;
-    /* Cross-file LSP runs in every mode. */
-    return cbm_pipeline_pass_lsp_cross(ctx, files, file_count, ctx->result_cache);
-}
-
-/* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
-static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
-                                   const cbm_file_info_t *files, int file_count,
-                                   struct timespec *t) {
-    cbm_log_info("pipeline.mode", "mode", "sequential", "files", itoa_buf(file_count));
-
-    /* Build package map from manifest files (sequential: read manifests directly).
-     * Use the repo-walking variant so manifests filtered out by the main
-     * discoverer (package.json, composer.json) still feed pkgmap and let
-     * workspace imports like `@my/pkg` resolve to their target Module. */
-    ctx->pkgmap = cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count, ctx->project_name,
-                                             ctx->excluded_dirs, ctx->excluded_count);
-    cbm_pipeline_set_pkgmap(ctx->pkgmap);
-
-    CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
-    if (seq_cache) {
-        ctx->result_cache = seq_cache;
-    }
-    typedef int (*seq_pass_fn)(cbm_pipeline_ctx_t *, const cbm_file_info_t *, int);
-    static const struct {
-        seq_pass_fn fn;
-        const char *name;
-        bool ignore_err;
-    } seq_passes[] = {
-        {cbm_pipeline_pass_definitions, "definitions", false},
-        {cbm_pipeline_pass_k8s, "k8s", true},
-        {seq_pass_lsp_cross_dispatch, "lsp_cross", true},
-        {cbm_pipeline_pass_calls, "calls", false},
-        {cbm_pipeline_pass_usages, "usages", false},
-        {cbm_pipeline_pass_semantic, "semantic", false},
-    };
-    int rc = 0;
-    for (int si = 0; si < PL_SEQ_PASSES && rc == 0; si++) {
-        /* #49: definitions is the extract step; every later pass re-reads the
-         * whole cache/graph. Gate each one so an over-budget run stops before
-         * stacking another pass's working set. */
-        if (si > 0) {
-            char phase[CBM_SZ_64];
-            snprintf(phase, sizeof(phase), "before_%s", seq_passes[si].name);
-            rc = cbm_pipeline_budget_gate(phase);
-            if (rc != 0) {
-                break;
-            }
-        }
-        cbm_clock_gettime(CLOCK_MONOTONIC, t);
-        int pr = seq_passes[si].fn(ctx, files, file_count);
-        if (pr != 0 && !seq_passes[si].ignore_err) {
-            rc = pr;
-        }
-        cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
-                     itoa_buf((int)elapsed_ms(*t)));
-        cbm_pipeline_log_phase_mem(seq_passes[si].name);
-        if (check_cancel(p)) {
-            rc = CBM_NOT_FOUND;
-        }
-    }
-    /* Consume infra bindings (YAML/HCL topic/queue/scheduler → endpoint) so
-     * INFRA_MAPS edges also form on the sequential path, not just the parallel
-     * one. process_one_infra_binding self-creates the topic Route node when no
-     * code-side dispatch created it (e.g. a standalone scheduler manifest). */
-    if (seq_cache && rc == 0) {
-        cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, NULL, file_count);
-        cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, NULL, file_count);
-    }
-    if (seq_cache) {
-        for (int i = 0; i < file_count; i++) {
-            if (seq_cache[i]) {
-                cbm_free_result(seq_cache[i]);
-            }
-        }
-        free(seq_cache);
-        ctx->result_cache = NULL;
-    }
-    /* Release the lsp_cross pass's shared registries only now: resolved_calls
-     * borrowed registry-owned strings that the calls pass read above. */
-    if (ctx->seq_cross_arena_live) {
-        cbm_arena_destroy(&ctx->seq_cross_arena);
-        ctx->seq_cross_arena_live = false;
-    }
-    return rc;
 }
 
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
@@ -1735,9 +1634,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-#define MIN_FILES_FOR_PARALLEL 50
-
-/* Run structure + extraction passes (parallel or sequential). */
+/* Run structure + extraction passes. */
 static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                         const cbm_file_info_t *files, int file_count) {
     struct timespec t;
@@ -1752,9 +1649,7 @@ static int run_structure_and_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *c
 
     int worker_count = cbm_default_worker_count(true);
     CBM_PROF_START(t_extract_total);
-    int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
-                 ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
-                 : run_sequential_pipeline(p, ctx, files, file_count, &t);
+    int rc = run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t);
     CBM_PROF_END_N("pipeline", "2_extraction_total", t_extract_total, file_count);
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;

@@ -83,8 +83,7 @@ static const char *k8s_basename(const char *path) {
 
 /* ── Kustomize handler ───────────────────────────────────────────── */
 
-static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
-                             CBMFileResult *result) {
+static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path) {
     /* Emit Module node for this kustomize overlay file */
     char *mod_qn = cbm_infra_qn(ctx->project_name, rel_path, "kustomize", NULL);
     if (!mod_qn) {
@@ -99,22 +98,15 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
         return;
     }
 
-    /* If we have a cached extraction result, emit IMPORTS edges for
-     * resources/bases/patches/components entries */
+    /* Emit IMPORTS edges for resources/bases/patches/components entries */
     int import_count = 0;
-    CBMFileResult *res = result;
-    bool allocated = false;
-
-    if (!res) {
-        /* Fall back to re-extraction */
-        int src_len = 0;
-        char *source = k8s_read_file(path, &src_len);
-        if (source) {
-            res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
-                                   CBM_EXTRACT_BUDGET, NULL, NULL);
-            free(source);
-            allocated = true;
-        }
+    CBMFileResult *res = NULL;
+    int src_len = 0;
+    char *source = k8s_read_file(path, &src_len);
+    if (source) {
+        res = cbm_extract_file(source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
+                               CBM_EXTRACT_BUDGET, NULL, NULL);
+        free(source);
     }
 
     if (res) {
@@ -140,10 +132,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
                 import_count++;
             }
         }
-
-        if (allocated) {
-            cbm_free_result(res);
-        }
+        cbm_free_result(res);
     }
 
     cbm_log_info("pass.k8s.kustomize", "file", rel_path, "imports", itoa_k8s(import_count));
@@ -647,9 +636,6 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         CBMLanguage lang = files[i].language;
         const char *base = k8s_basename(rel);
 
-        CBMFileResult *cached =
-            (ctx->result_cache && ctx->result_cache[i]) ? ctx->result_cache[i] : NULL;
-
         if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
             int dep_len = 0;
             char *dep_src = k8s_read_file(path, &dep_len);
@@ -659,7 +645,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                 free(dep_src);
             }
         } else if (cbm_is_kustomize_file(base)) {
-            handle_kustomize(ctx, path, rel, cached);
+            handle_kustomize(ctx, path, rel);
             kustomize_count++;
         } else if (lang == CBM_LANG_YAML || lang == CBM_LANG_K8S) {
             /* Read source once to classify (and reuse for uncached extraction). */
@@ -670,11 +656,9 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                     handle_helm_chart(ctx, rel, source);
                     helm_count++;
                 } else if (cbm_is_k8s_manifest(base, source)) {
-                    /* Always re-extract with CBM_LANG_K8S regardless of any cached
-                     * result: cached results were produced during the parallel YAML
-                     * pass and contain no "Resource" definitions.  Pass the already-
-                     * read source buffer so handle_k8s_manifest does not re-read. */
-                    (void)cached; /* cached YAML result intentionally discarded */
+                    /* Extract with CBM_LANG_K8S: the YAML extraction has no
+                     * "Resource" definitions. Pass the already-read source
+                     * buffer so handle_k8s_manifest does not re-read. */
                     k8s_record_t *rec = (recs.count < recs.cap) ? &recs.items[recs.count] : NULL;
                     handle_k8s_manifest(ctx, path, rel, source, src_len, rec);
                     if (rec && rec->node_id > 0) {

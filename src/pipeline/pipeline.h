@@ -380,8 +380,7 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * (is_method), and only when the match used a weak short-name strategy
  * (suffix_match / unique_name / field_type_hint / fuzzy).
  * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
- * The language set lives at the call sites (pass_calls.c / pass_parallel.c) and
- * must be identical in both, or the sequential and parallel resolvers diverge.
+ * The language set lives at the call site (pass_parallel.c).
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
@@ -398,8 +397,7 @@ bool cbm_suppress_zig_qualified_member(bool is_zig, bool is_method, const char *
  * (`def f(run): run()` must not bind an unrelated `SatoriLive.run`). Shares the
  * member guard's drop-list, so lsp_* / import / same-module matches are kept.
  * Deliberately keyed on the SCOPE FACT, not on the callee's spelling. The
- * language set lives at the call sites (pass_calls.c / pass_parallel.c) and must
- * be identical in both, or the sequential and parallel resolvers diverge.
+ * language set lives at the call site (pass_parallel.c).
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);

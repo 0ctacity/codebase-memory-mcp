@@ -7,7 +7,7 @@
  * strategy (kotlin_lsp.c, kt_emit_resolved). Any is the supertype of every
  * Kotlin reference, so this is the same target the fwcd LSP resolves to.
  *
- * The missing piece is downstream: pass_calls.c only writes a CALLS edge when
+ * The missing piece is downstream: the call resolver only writes a CALLS edge when
  * cbm_pipeline_lsp_target_node() resolves the callee_qn to a graph node
  * (src/pipeline/lsp_resolve.h). There is no "kotlin.Any" node in the graph, so
  * the resolved call is dropped and the strategy never lands on an edge
