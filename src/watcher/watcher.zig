@@ -289,9 +289,10 @@ fn gitDirtySignature(root_path: Str) u64 {
         // each submodule's porcelain output with paths re-rooted at the
         // superproject so they stat correctly. Line mode here (foreach output
         // is line-oriented); rename lines fail the stat and degrade to text-only.
-        if (popenGit(&cmd, "git --no-optional-locks -C '{s}' submodule foreach --quiet --recursive " ++
+        const submodule_status = "git --no-optional-locks -C '{s}' submodule foreach --quiet --recursive " ++
             "'git status --porcelain -uall 2>/dev/null | " ++
-            "sed -e \"s@^\\(..\\) @\\1 $displaypath/@\"' 2>/dev/null", .{std.mem.span(root_path)})) |sub| {
+            "sed -e \"s@^\\(..\\) @\\1 $displaypath/@\"' 2>/dev/null";
+        if (popenGit(&cmd, submodule_status, .{std.mem.span(root_path)})) |sub| {
             var line_buf: [PATH_MAX]u8 = undefined;
             while (c.fgets(&line_buf, line_buf.len, sub) != null) {
                 const line = trimLineEnd(&line_buf);
