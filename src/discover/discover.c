@@ -16,9 +16,6 @@
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "git/git_context.h" // cbm_git_ls_files
-#ifdef _WIN32
-#include "foundation/win_utf8.h"
-#endif
 #include <ctype.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -780,54 +777,6 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     return lang;
 }
 
-/* UTF-8-safe stat: wide API on Windows, regular stat on POSIX. */
-static int wide_stat(const char *path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(path);
-    if (!wpath) {
-        return CBM_NOT_FOUND;
-    }
-    struct _stat64 wst;
-    int ret = _wstat64(wpath, &wst);
-    free(wpath);
-    if (ret != 0) {
-        return CBM_NOT_FOUND;
-    }
-    st->st_mode = wst.st_mode;
-    st->st_size = wst.st_size;
-    st->st_mtime = wst.st_mtime;
-    return 0;
-#else
-    return stat(path, st);
-#endif
-}
-
-/* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
- * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
- * discovery from walking through a junction that points outside the project
- * root, mirroring the POSIX S_ISLNK skip. */
-static int safe_stat(const char *abs_path, struct stat *st) {
-#ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
-    if (wpath) {
-        DWORD attr = GetFileAttributesW(wpath);
-        free(wpath);
-        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
-            return CBM_NOT_FOUND;
-        }
-    }
-    return wide_stat(abs_path, st);
-#else
-    if (lstat(abs_path, st) != 0) {
-        return CBM_NOT_FOUND;
-    }
-    if (S_ISLNK(st->st_mode)) {
-        return CBM_NOT_FOUND;
-    }
-    return 0;
-#endif
-}
-
 /* Process a single regular file entry during directory walk. */
 static void walk_dir_process_file(const char *abs_path, const char *rel_path, const char *name,
                                   const cbm_discover_opts_t *opts,
@@ -876,7 +825,7 @@ static cbm_gitignore_t *try_load_nested_gitignore(const walk_frame_t *frame) {
     char gi_path[CBM_SZ_4K];
     snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", frame->dir);
     struct stat gi_st;
-    if (wide_stat(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
+    if (cbm_stat_utf8(gi_path, &gi_st) == 0 && S_ISREG(gi_st.st_mode)) {
         return cbm_gitignore_load(gi_path);
     }
     return NULL;
@@ -930,7 +879,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     struct stat st;
-    if (safe_stat(abs_path, &st) != 0) {
+    if (cbm_stat_no_follow(abs_path, &st) != 0) {
         return;
     }
 
@@ -1095,7 +1044,7 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
     char dot_git[CBM_SZ_4K];
     snprintf(dot_git, sizeof(dot_git), "%s/.git", repo_path);
     struct stat st;
-    if (wide_stat(dot_git, &st) != 0) {
+    if (cbm_stat_utf8(dot_git, &st) != 0) {
         return false;
     }
     if (S_ISDIR(st.st_mode)) {
@@ -1387,7 +1336,7 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
 
     /* Verify directory exists */
     struct stat st;
-    if (wide_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    if (cbm_stat_utf8(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         return CBM_NOT_FOUND;
     }
 
@@ -1424,11 +1373,7 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     char canonical_repo[CBM_SZ_4K];
     bool has_enclosing_repo = false;
     if (!is_git_repo) {
-#ifdef _WIN32
-        if (!_fullpath(canonical_repo, repo_path, sizeof(canonical_repo))) {
-#else
-        if (!realpath(repo_path, canonical_repo)) {
-#endif
+        if (!cbm_canonical_path(repo_path, canonical_repo, sizeof(canonical_repo))) {
             (void)snprintf(canonical_repo, sizeof(canonical_repo), "%s", repo_path);
         }
         cbm_normalize_path_sep(canonical_repo);
@@ -1444,7 +1389,7 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
         path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
-        has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
+        has_git_config = cbm_stat_utf8(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
 
         char exc_path[CBM_SZ_4K];
         path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
@@ -1489,19 +1434,16 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     file_list_t fl = {0};
     const char *cache = cbm_resolve_cache_dir();
     if (cache && cache[0]) {
-#ifdef _WIN32
-        if (!_fullpath(fl.cache_tree, cache, sizeof(fl.cache_tree))) {
+        if (!cbm_canonical_path(cache, fl.cache_tree, sizeof(fl.cache_tree))) {
             snprintf(fl.cache_tree, sizeof(fl.cache_tree), "%s", cache);
         }
-#else
-        if (!realpath(cache, fl.cache_tree)) {
-            snprintf(fl.cache_tree, sizeof(fl.cache_tree), "%s", cache);
-        }
+#ifndef _WIN32
         /* The walk builds paths from repo_path as given. When that path goes
          * through a symlink (macOS /tmp -> /private/tmp), re-express a cache
          * that lives inside the repository in the walk's own spelling. */
         char root_real[CBM_SZ_4K];
-        if (realpath(repo_path, root_real) && dir_is_cache_tree(fl.cache_tree, root_real)) {
+        if (cbm_canonical_path(repo_path, root_real, sizeof(root_real)) &&
+            dir_is_cache_tree(fl.cache_tree, root_real)) {
             char inside[CBM_SZ_4K];
             snprintf(inside, sizeof(inside), "%s", fl.cache_tree + strlen(root_real));
             snprintf(fl.cache_tree, sizeof(fl.cache_tree), "%s%s", repo_path, inside);
