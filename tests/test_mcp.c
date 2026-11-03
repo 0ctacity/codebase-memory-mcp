@@ -3834,9 +3834,10 @@ TEST(index_repository_over_budget_reports_named_reason) {
     /* Generation 2 at 1 MiB over a changed repo fails whole. */
     files_ok = files_ok && budget_fixture_write(repo, 2);
     size_t saved_budget = cbm_mem_budget();
-    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    bool saved_explicit = cbm_mem_budget_explicit();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024, true);
     char *second = srv && files_ok ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
-    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_mem_set_budget_for_tests(saved_budget, saved_explicit);
     bool named = response_contains_json_fragment(second, "\"status\":\"error\"") &&
                  response_contains_json_fragment(second, "\"reason\":\"over_memory_budget\"") &&
                  response_contains_json_fragment(second, "\"previous_index\":\"preserved\"") &&

@@ -35,6 +35,10 @@
 static size_t g_budget;          /* budget in bytes */
 static atomic_int g_initialized; /* init guard */
 static atomic_int g_was_over;    /* pressure hysteresis */
+/* 1 = the user set CBM_MEM_BUDGET_MB, 0 = RAM-fraction detection chose it.
+ * Post-extraction phases only hard-fail on an explicit budget: the detected
+ * default is a soft target that extraction already handles with spill. */
+static atomic_int g_budget_explicit;
 
 #define MB_DIVISOR ((size_t)(CBM_SZ_1K * CBM_SZ_1K))
 
@@ -160,6 +164,7 @@ void cbm_mem_init(double ram_fraction) {
         }
         if (mb > 0) {
             g_budget = (size_t)mb * MB_DIVISOR;
+            atomic_store(&g_budget_explicit, 1);
             char ovr_mb[CBM_SZ_32];
             snprintf(ovr_mb, sizeof(ovr_mb), "%ld", mb);
             cbm_log_info("mem.init", "budget_mb", ovr_mb, "source", "CBM_MEM_BUDGET_MB");
@@ -238,8 +243,13 @@ size_t cbm_mem_budget(void) {
     return g_budget;
 }
 
-void cbm_mem_set_budget_for_tests(size_t bytes) {
+void cbm_mem_set_budget_for_tests(size_t bytes, bool explicit_budget) {
     g_budget = bytes;
+    atomic_store(&g_budget_explicit, explicit_budget ? 1 : 0);
+}
+
+bool cbm_mem_budget_explicit(void) {
+    return atomic_load(&g_budget_explicit) != 0;
 }
 
 bool cbm_mem_over_budget(void) {

@@ -5649,10 +5649,16 @@ static char *index_repository_run(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_int(doc, root, "budget_mb", budget_mb);
         yyjson_mut_obj_add_int(doc, root, "peak_rss_mb", peak_rss_mb);
         yyjson_mut_obj_add_str(doc, root, "hint",
-                               "Indexing stopped: resident memory stayed above the budget after "
-                               "backpressure; no partial graph was published and the previous "
-                               "index still serves. Raise CBM_MEM_BUDGET_MB, lower CBM_WORKERS, "
-                               "or exclude large subtrees.");
+                               cbm_mem_budget_explicit()
+                                   ? "Indexing stopped: resident memory stayed above "
+                                     "CBM_MEM_BUDGET_MB after backpressure; no partial graph was "
+                                     "published and the previous index still serves. Raise "
+                                     "CBM_MEM_BUDGET_MB or exclude large subtrees."
+                                   : "Indexing stopped: resident memory stayed above the detected "
+                                     "RAM budget after backpressure; no partial graph was "
+                                     "published and the previous index still serves. Raise "
+                                     "CBM_MEM_BUDGET_MB, lower CBM_WORKERS, or exclude large "
+                                     "subtrees.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
