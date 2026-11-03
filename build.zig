@@ -391,7 +391,7 @@ fn addNativeSources(
         module.addObject(bridge);
     }
 
-    const cbm_zig = addCbmZigLibrary(b, cfg);
+    const cbm_zig = addCbmZigLibrary(b, cfg, kind);
     module.linkLibrary(cbm_zig);
 }
 
@@ -402,13 +402,20 @@ fn addZovaRuntimeArchive(b: *std.Build, module: *std.Build.Module, cfg: Config) 
     });
 }
 
-fn addCbmZigLibrary(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
+fn addCbmZigLibrary(b: *std.Build, cfg: Config, kind: BuildKind) *std.Build.Step.Compile {
     // Zig modules implement C headers; they see the C declarations through a
     // translate-c module of src/cbm_zig_c.h (Zig has no @cImport).
+    // Test builds keep Zig's runtime safety checks: the sanitizers do not
+    // instrument Zig code, so bounds and overflow bugs would otherwise go
+    // unseen in tests.
+    const optimize: std.builtin.OptimizeMode = switch (kind) {
+        .prod => .ReleaseFast,
+        .tests => .ReleaseSafe,
+    };
     const c_decls = b.addTranslateC(.{
         .root_source_file = b.path("src/cbm_zig_c.h"),
         .target = cfg.target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
     });
     c_decls.defineCMacro("_DEFAULT_SOURCE", null);
     c_decls.defineCMacro("_GNU_SOURCE", null);
@@ -424,7 +431,7 @@ fn addCbmZigLibrary(b: *std.Build, cfg: Config) *std.Build.Step.Compile {
     const module = b.createModule(.{
         .root_source_file = b.path("src/cbm_zig.zig"),
         .target = cfg.target,
-        .optimize = .ReleaseFast,
+        .optimize = optimize,
         .link_libc = true,
     });
     module.addImport("c", c_decls.createModule());
