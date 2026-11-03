@@ -12,6 +12,9 @@ const c = @import("c");
 
 comptime {
     _ = @import("cli_zig/cbm_cli_zig.zig");
+    checkExports(@import("discover/gitignore.zig"));
+    checkExports(@import("discover/language.zig"));
+    checkExports(@import("discover/userconfig.zig"));
     checkExports(@import("git/git_context.zig"));
     checkExports(@import("simhash/minhash.zig"));
     checkExports(@import("watcher/watcher.zig"));

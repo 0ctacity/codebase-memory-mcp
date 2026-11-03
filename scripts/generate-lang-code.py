@@ -5,7 +5,7 @@ Reads scripts/new-languages.json and generates:
 1. Grammar wrapper .c files (written directly)
 2. Enum entries for cbm.h
 3. Lang spec entries for lang_specs.c (designated initializer + factory)
-4. Extension/filename/name entries for language.c
+4. Extension/filename/name entries for language.zig
 """
 import json
 import os
@@ -30,7 +30,7 @@ def main():
     if mode in ("all", "specs"):
         generate_specs(langs)
     if mode in ("all", "language"):
-        generate_language_c(langs)
+        generate_language_zig(langs)
 
 
 def generate_wrappers(langs):
@@ -90,27 +90,27 @@ def generate_specs(langs):
         print()
 
 
-def generate_language_c(langs):
-    """Print extension table and name entries for language.c."""
-    print("\n=== EXT_TABLE Entries (paste into language.c, sorted by ext) ===")
+def generate_language_zig(langs):
+    """Print extension table and name entries for language.zig."""
+    print("\n=== EXT_TABLE Entries (paste into language.zig, sorted by ext) ===")
     ext_entries = []
     for lang in langs:
         for ext in lang["extensions"]:
             ext_entries.append((ext, lang["enum"], lang["display"]))
     for ext, enum, display in sorted(ext_entries, key=lambda x: x[0].lower()):
-        print(f'    /* {display} */')
-        print(f'    {{"{ext}", CBM_LANG_{enum}}},')
+        print(f'    // {display}')
+        print(f'    .{{ "{ext}", c.CBM_LANG_{enum} }},')
         print()
 
     print("\n=== FILENAME_TABLE Entries ===")
     for lang in langs:
         for fn in lang["filenames"]:
-            print(f'    {{"{fn}", CBM_LANG_{lang["enum"]}}},')
+            print(f'    .{{ "{fn}", c.CBM_LANG_{lang["enum"]} }},')
 
-    print("\n=== LANG_NAMES Entries ===")
+    print("\n=== LANG_NAME_LIST Entries ===")
     for lang in langs:
         print(
-            f'    [CBM_LANG_{lang["enum"]}] = "{lang["display"]}",'
+            f'    .{{ c.CBM_LANG_{lang["enum"]}, "{lang["display"]}" }},'
         )
 
 

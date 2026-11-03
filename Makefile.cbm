@@ -194,11 +194,8 @@ CYPHER_SRCS = src/cypher/cypher.c
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
 
 # Discover module (new)
-DISCOVER_SRCS = \
-    src/discover/language.c \
-    src/discover/userconfig.c \
-    src/discover/gitignore.c \
-    src/discover/discover.c
+# language, userconfig and gitignore are Zig: see CBM_ZIG_SRC.
+DISCOVER_SRCS = src/discover/discover.c
 
 # Graph buffer module (new)
 GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
@@ -499,6 +496,8 @@ endif
 # into the "c" module they use for C declarations.
 CBM_ZIG_SRC = src/cbm_zig.zig
 CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cli/cli_zig.h \
+               src/discover/gitignore.zig src/discover/language.zig src/discover/userconfig.zig \
+               src/discover/discover.h src/discover/userconfig.h \
                src/git/git_context.zig src/git/git_context.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/watcher/watcher.zig src/watcher/watcher.h
