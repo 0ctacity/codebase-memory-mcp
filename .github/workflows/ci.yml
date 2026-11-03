@@ -23,6 +23,8 @@ jobs:
         run: bash scripts/check-no-test-skips.sh
       - name: Check whitespace
         run: git diff --check
+      - name: Check build source lists
+        run: bash scripts/check-build-sources.sh
       - name: Validate GitHub Actions contract
         run: bash tests/test_github_workflows.sh
       - name: Test pinned-SDK workflow

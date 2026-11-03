@@ -532,7 +532,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-cli test-mcp test-repro test-foundation test-tsan cbm check-zova test-zova test-zova-c-sql-functions test-zova-bridge zova-test-runner clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-cli test-mcp test-repro test-foundation test-tsan cbm check-zova test-zova test-zova-c-sql-functions test-zova-bridge zova-test-runner clean-c print-build-sources lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -802,6 +802,17 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 
 cbm:
 	$(ZIG) build cbm $(ZIG_CBM_ARGS)
+
+# Sources this Makefile builds, one "<group> <path>" line each, for
+# scripts/check-build-sources.sh to compare with build.zig. The vendored LZ4
+# and zstd paths are written out because their object rules name them directly.
+print-build-sources:
+	@printf 'prod %s\n' $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+		$(MIMALLOC_SRC) $(SQLITE3_SRC) $(TRE_SRC) $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(LSP_SRCS) \
+		$(PREPROCESSOR_SRC) $(UNIXCODER_BLOB_SRC) \
+		$(CBM_DIR)/vendored/lz4/lz4.c $(CBM_DIR)/vendored/lz4/lz4hc.c $(CBM_DIR)/vendored/zstd/zstd.c
+	@printf 'test %s\n' $(ALL_TEST_SRCS)
+	@printf 'zig %s\n' $(filter %.zig,$(CBM_ZIG_SRCS) $(CBM_ZOVA_BRIDGE_ZIG_SRC))
 
 clean-c:
 	rm -rf $(BUILD_DIR)
