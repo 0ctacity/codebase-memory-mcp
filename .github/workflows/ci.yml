@@ -38,6 +38,8 @@ jobs:
       - uses: ./.github/actions/setup-zova
         with:
           cpu: baseline
+      - name: Check Zig formatting
+        run: zig fmt --check build.zig src
 
   build:
     needs: [checks, sdk]
