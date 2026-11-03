@@ -12,9 +12,9 @@
  * TS type-param USAGE, Dart/Groovy CALLS.
  *
  * This probe covers FRESH areas NOT yet probed:
- *   AREA A — CONFIGURES (sequential): getenv/os.environ/process.env (Go,
+ *   AREA A — CONFIGURES: getenv/os.environ/process.env (Go,
  *             Python, TS/JS, C#, Rust)
- *   AREA B — READS/WRITES (sequential path via pass_usages.c): variable
+ *   AREA B — READS/WRITES: variable
  *             access patterns for Python, Go, Java, C#
  *   AREA C — GRAPHQL_CALLS / GRPC_CALLS / TRPC_CALLS (parallel path,
  *             additional language fixtures beyond lang_contract.c baseline):
@@ -60,9 +60,9 @@
  *     the match relies on the qualified call "env::var" carrying "env" in
  *     the callee chain.  May not fire.
  *
- * AREA B — READS/WRITES (sequential via pass_usages.c):
- *   Sequential path: pass_usages.c cbm_resolve_file_read_writes runs for
- *     each file.  It resolves var reads/writes to registered Variable nodes.
+ * AREA B — READS/WRITES:
+ *   The read/write resolver runs for each file.  It resolves var
+ *     reads/writes to registered Variable nodes.
  *   Python: UNCERTAIN — Variable nodes are only created when Variable is a
  *     recognized label.  If the pipeline doesn't emit "Variable" label nodes
  *     for Python global assignments, READS/WRITES will be 0.  We check.
@@ -72,7 +72,7 @@
  *   C#: UNCERTAIN — same question for class fields.
  *
  * AREA C — Parallel service edges (additional fixtures):
- *   These require the PARALLEL path (>50 files).  The baseline in
+ *   These use padded fixtures.  The baseline in
  *   test_lang_contract.c already covers Go GRPC, Python GRAPHQL, TS TRPC,
  *   and pubsub INFRA_MAPS.  We probe additional variants:
  *   Go GRPC with a different service suffix: GREEN (already confirmed).
@@ -287,8 +287,7 @@ static void cp_diag(cbm_store_t *store, const char *project, const char *label) 
     fprintf(stderr, "  [CP] %s edges=[%s]\n", label, line[0] ? line : "(none)");
 }
 
-/* Helper: index N meaningful files plus enough Python pad files to force
- * the parallel pipeline path (MIN_FILES_FOR_PARALLEL = 50). */
+/* Helper: index N meaningful files plus CP_PARALLEL_PAD Python pad files. */
 enum { CP_PARALLEL_PAD = 52, CP_PAD_MAX = 80 };
 
 static cbm_store_t *cp_index_parallel(CP_Proj *lp, const CP_File *meaningful, int n_mean) {
@@ -310,7 +309,7 @@ static cbm_store_t *cp_index_parallel(CP_Proj *lp, const CP_File *meaningful, in
 /* ══════════════════════════════════════════════════════════════════
  * AREA A — CONFIGURES edges
  *
- * Sequential path: pass_calls.c emits CONFIGURES when the resolved
+ * The resolver emits CONFIGURES when the resolved
  * callee QN is classified as CBM_SVC_CONFIG (callee_name matches
  * service-pattern for env-var accessors like getenv / os.Getenv /
  * GetEnvironmentVariable / env::var).
@@ -447,10 +446,10 @@ TEST(cp_configures_rust_env_var) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- * AREA B — READS / WRITES (sequential path via pass_usages.c)
+ * AREA B — READS / WRITES
  *
- * pass_usages.c cbm_resolve_file_read_writes() runs on every file
- * in both sequential and parallel paths.  It emits READS/WRITES
+ * The read/write resolver (resolve_file_rw in pass_parallel.c) runs on
+ * every file.  It emits READS/WRITES
  * edges from a Function/Method to a Variable node — but only when
  * (a) a Variable node exists in the graph for that symbol, AND
  * (b) the file's extracted rw_accesses[] resolves to that node.
@@ -564,8 +563,8 @@ TEST(cp_reads_writes_cs_static_field) {
 /* ══════════════════════════════════════════════════════════════════
  * AREA C — Parallel-path service edges (additional fixtures)
  *
- * GRAPHQL_CALLS, GRPC_CALLS, TRPC_CALLS require >50 files (parallel
- * pipeline path).  We add NEW language/wrapper variants not in the
+ * We add NEW GRAPHQL_CALLS, GRPC_CALLS and TRPC_CALLS language/wrapper
+ * variants not in the
  * lang_contract.c baseline to probe for coverage gaps.
  * ══════════════════════════════════════════════════════════════════ */
 

@@ -787,8 +787,8 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * same-package file happened to be processed LAST (worker-order
          * dependent) — the nondeterministic file attribution behind #787 — and
          * left the Folder node exposed to delete-nodes-by-file on incremental
-         * reindex of that file. Skip the update entirely. (Both the sequential
-         * upsert and the parallel local-gbuf merge route through this function.) */
+         * reindex of that file. Skip the update entirely. (Both direct
+         * upserts and the parallel local-gbuf merge route through this function.) */
         if (existing->label && label && strcmp(label, "Module") == 0 &&
             (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
             return existing->id;

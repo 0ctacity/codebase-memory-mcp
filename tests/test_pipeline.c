@@ -494,10 +494,8 @@ TEST(pipeline_def_props_valid_json_when_oversized) {
      * buffer margin as the param_types array starts — the array is then cut
      * mid-item (`"param_types":["enum`), exactly the kernel failure shape.
      * Sweeping 10..69 params deterministically hits the window (pre-fix:
-     * sweep_fn_30 -> 2047-byte malformed properties). ONE FUNCTION PER FILE so
-     * the file count exceeds MIN_FILES_FOR_PARALLEL (50) and the test covers
-     * the PARALLEL pipeline's duplicated props builder (pass_parallel.c) — the
-     * path large repos take; the serial twin lives in pass_definitions.c. */
+     * sweep_fn_30 -> 2047-byte malformed properties). One function per file,
+     * through the props builder in pass_parallel.c. */
     for (int n = 10; n < 70; n++) {
         char path[512];
         snprintf(path, sizeof(path), "%s/sweep_%02d.c", g_tmpdir, n);
@@ -797,7 +795,7 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
  * resolve (a regex literal `re.test()`) must NOT be bound to a same-named
  * project method by a weak short-name strategy — that fabricates a CALLS edge.
  * Type-resolved receivers (`c.test()` on a typed SalesforceRestClient) and bare
- * local calls must still resolve. < 50 files → sequential path (pass_calls.c).
+ * local calls must still resolve.
  * RED before the fix: checkFormat->test exists via unique_name/suffix_match. */
 static void write_temp_file(const char *dir, const char *name, const char *content);
 
@@ -986,9 +984,9 @@ static void populate_axios_wrapper_repo(const char *dir, const char *client_code
  * pattern. The call must become HTTP_CALLS to GET /api/orders — before the
  * fix the `.get` suffix made it an Express route REGISTRATION (a CALLS edge
  * to a phantom server route /orders) and cross-repo matching found nothing.
- * 52 fillers put the default run on the parallel resolver; the
- * single-thread run is the sequential oracle; a same-DB reindex after the
- * wrapper's base changes must converge with the fresh index. */
+ * The fixture has 52 fillers; a 1-worker run must match a 4-worker run edge
+ * for edge, and a same-DB reindex after the wrapper's base changes must
+ * converge with the fresh index. */
 TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_axios_wrapper_XXXXXX");
@@ -1129,7 +1127,7 @@ TEST(pipeline_axios_wrapper_baseurl_composes_http_calls_issue1916) {
     ASSERT_EQ(par.env_configures, 1);
     ASSERT_EQ(par.env_http, 1);
 
-    /* Sequential and parallel resolvers agree edge for edge. */
+    /* One worker and four agree edge for edge. */
     ASSERT_MEM_EQ(&seq, &par, sizeof(seq));
 
     /* Reindex after the base moved converges with a fresh index for both importers. */
@@ -1295,8 +1293,8 @@ static int route_registrations_from(cbm_store_t *s, const char *project, const c
     return matches;
 }
 
-/* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
- * pass_parallel.c's resolve_file_calls). The guard must not drop a weak member
+/* Padded regression for the TS/JS receiver guard in pass_parallel.c's
+ * resolve_file_calls. The guard must not drop a weak member
  * match before the service classification runs — it suppresses ONLY the plain
  * CALLS fall-through, so every service edge (HTTP_CALLS via the #523 callee
  * bypass or emit_service_edge's unconditional detect_url_in_args, Route via the
@@ -1373,7 +1371,7 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
                     "export function checkFormat(s: string): boolean {\n"
                     "  return re.test(s);\n"
                     "}\n");
-    /* Pad past MIN_FILES_FOR_PARALLEL (50) so the parallel resolver runs. */
+    /* Filler files, as in the other padded twins. */
     for (int i = 0; i < 52; i++) {
         char name[64];
         char body[128];
@@ -1434,7 +1432,7 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
 }
 
 /* Python counterpart to the TS/JS receiver guard (upstream b6a22843, #1276),
- * sequential path. NEGATIVE: an attribute call on an unknown receiver (a
+ * small fixture. NEGATIVE: an attribute call on an unknown receiver (a
  * parameter) must not bind the lone same-named project method through
  * unique_name. POSITIVE: an import-bound receiver (helper.compute) and a bare
  * local call keep their CALLS edges. */
@@ -1484,10 +1482,8 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
-/* Fixture for the #1928 cross-language reference-guard probes (sequential and
- * parallel twins). pad_files > 0 adds filler files to push the index over the
- * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
- * path and both must consult the guard. */
+/* Fixture for the #1928 cross-language reference-guard probes (small and
+ * padded twins). pad_files > 0 adds filler files. */
 static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "go.mod", "module example.com/fxguard\n\ngo 1.22\n");
     /* The C probe: a local named `event` and a file-scope function `handle`,
@@ -1548,7 +1544,7 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
      * one produced an edge into the C file — 31.5% of all WRITES on the
      * measured repo crossed the Go/C boundary. Go code cannot write a C
      * automatic variable, so every edge in that class is false. This is the
-     * SEQUENTIAL-path twin; the parallel twin follows. */
+     * small-fixture twin; the padded twin follows. */
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_go_rw_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(tmp)) {
@@ -1583,12 +1579,10 @@ TEST(pipeline_go_rw_usage_never_cross_into_c) {
 }
 
 TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
-    /* Parallel twin of the test above: USAGE and WRITES/READS each have a
-     * second, independent resolver in pass_parallel.c (resolve_file_usages /
-     * resolve_file_rw) that must consult the same guard — the field census
-     * that motivated this caught the sequential-only fix leaving 344 Go→C
-     * WRITES alive on a ~1150-file repo. >= 50 files forces the parallel
-     * pipeline. */
+    /* Padded twin of the test above. The field census that motivated it
+     * caught a fix to the since-deleted sequential resolver leaving 344 Go→C
+     * WRITES alive in pass_parallel.c (resolve_file_usages / resolve_file_rw)
+     * on a ~1150-file repo. */
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_go_rwp_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(tmp)) {
@@ -1671,7 +1665,7 @@ TEST(pipeline_go_bare_ref_never_binds_field) {
      * nodes — so every Go local `err := …` bound whichever struct field was
      * named err (21308 USAGE / 5191 WRITES onto Go fields on the measured
      * repo, top target a test struct's field collecting 3013 edges).
-     * Sequential-path twin; the parallel twin follows. */
+     * Small-fixture twin; the padded twin follows. */
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_go_bare_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(tmp)) {
@@ -1693,8 +1687,8 @@ TEST(pipeline_go_bare_ref_never_binds_field) {
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
-    /* #1962 parallel twin: resolve_file_rw / resolve_file_usages must honour
-     * the member-access signal exactly like the sequential resolvers. */
+    /* #1962: resolve_file_rw / resolve_file_usages must honour the
+     * member-access signal. */
     ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
     ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
 
@@ -1738,8 +1732,7 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
-
-/* Python bare-call local-binding suppression, sequential path. The bare-call
+/* Python bare-call local-binding suppression, small fixture. The bare-call
  * counterpart of the receiver guard above: `run` is a PARAMETER, so `run()`
  * cannot be the module-level `run` and must not bind SatoriLive.run.
  *
@@ -1791,11 +1784,9 @@ TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
     PASS();
 }
 
-/* Parallel counterpart. >= 50 files forces pass_parallel.c, which is wired with
- * the same gate: a guard wired on only one resolver produces an edge on the
- * sequential path and not the parallel one, breaking MT determinism. #1386
- * wired both and tested only the sequential path, and the `parallel` suite is
- * exactly what catches that. Same both-directions pin as the sequential test. */
+/* Padded counterpart. When a sequential resolver still existed, #1386 wired
+ * the gate into both resolvers but tested only the sequential one; this twin
+ * pinned the parallel one. Same both-directions pin as the test above. */
 TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_py_bare_par_XXXXXX", cbm_tmpdir());
@@ -1976,10 +1967,10 @@ static int inbound_calls_to_qn(cbm_store_t *s, const char *project, const char *
 }
 
 /* Zig member calls bind by the receiver's inferred type, across files and
- * relative `@import` paths, on both the sequential and the parallel (>= 50
- * files) path. The same-named deinit() calls in run() reach their own
- * targets; tmp.cleanup() on a std value gets no edge although exactly one
- * project function is named cleanup. app/ sees the library only as the
+ * relative `@import` paths, with and without filler files. The same-named
+ * deinit() calls in run() reach their own targets; tmp.cleanup() on a std
+ * value gets no edge although exactly one project function is named
+ * cleanup. app/ sees the library only as the
  * build.zig module "zova", whose root re-exports it, and db.zig spells a
  * return type through its own import (`!sqlite.Statement`); a Python package
  * of the same name must not capture the Zig import. */
@@ -2374,7 +2365,7 @@ TEST(pipeline_zig_member_calls_bind_by_receiver_type) {
     PASS();
 }
 
-/* Parallel path of the same guard (>= 50 files, CBM_WORKERS=4): the
+/* Padded run of the same guard (CBM_WORKERS=4): the
  * field-type heuristic and suffix matching must not bind accelerator.print(),
  * accelerator.backward() or trainer.lr_scheduler.step() to project methods,
  * while the import-bound and bare local calls stay. */
@@ -2546,9 +2537,9 @@ TEST(pipeline_url_constant_folding_http_calls_issue706_1147) {
     PASS();
 }
 
-/* Run the same identities through both service resolvers. An import alias is
+/* Run the same identities with one worker and with four. An import alias is
  * deliberately absent from the callee-name pattern table until resolution. */
-TEST(pipeline_folded_topics_preserve_identity_sequential_parallel) {
+TEST(pipeline_folded_topics_preserve_identity_one_and_four_workers) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_topicfold_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
@@ -2780,8 +2771,8 @@ static int xi_imports_binding(cbm_store_t *s, const char *project, const char *l
  *     shadows `... as relay`;
  *   - `httpx` is a PROJECT package here: its import is materialized (the
  *     precondition is asserted), so the call stays off the external httpx.post.
- * Both resolvers: CBM_WORKERS=1 is sequential, 4 with > 50 files parallel. */
-TEST(pipeline_external_import_binding_sequential_parallel) {
+ * Runs with CBM_WORKERS=1 and with 4. */
+TEST(pipeline_external_import_binding_one_and_four_workers) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_extimport_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(tmp)) {
@@ -3377,7 +3368,8 @@ static void teardown_usages_repo(void) {
 }
 
 /* #54: a C/C++ or Python LSP walk that stops on its depth or memo limit is
- * reported on the pipeline's per-file error list, by both drivers. A failed
+ * reported on the pipeline's per-file error list, with one worker and with
+ * four. A failed
  * per-file walk surfaces through extraction (phase "extract"); a failed
  * cross-file walk as phase "lsp_incomplete". The failure is forced with the
  * process-wide test hook so that it also reaches the parallel workers. */
@@ -3401,14 +3393,13 @@ static int pipeline_lsp_failure_case(bool parallel, bool cross, bool python, boo
         FAIL("failed to create LSP failure fixture");
     char path[512];
     if (parallel) {
-        /* The parallel driver runs above MIN_FILES_FOR_PARALLEL files. */
+        /* Pad so the files spread across the four workers. */
         for (int i = 0; i < 51; i++) {
             snprintf(path, sizeof(path), "%s/walk_pad_%02d.%s", g_usages_tmpdir, i,
                      python ? "py" : "cpp");
-            if (th_write_file(path, python ? "# inert parallel routing fixture\n"
-                                           : "// inert parallel routing fixture\n") != 0) {
+            if (th_write_file(path, python ? "# inert pad file\n" : "// inert pad file\n") != 0) {
                 teardown_usages_repo();
-                FAIL("failed to create parallel routing fixture");
+                FAIL("failed to create pad files");
             }
         }
     }
@@ -3459,49 +3450,49 @@ static int pipeline_lsp_failure_case(bool parallel, bool cross, bool python, boo
     PASS();
 }
 
-TEST(pipeline_issue54_c_file_memo_failure_sequential) {
+TEST(pipeline_issue54_c_file_memo_failure_one_worker) {
     return pipeline_lsp_failure_case(false, false, false, false);
 }
 TEST(pipeline_issue54_c_file_memo_failure_parallel) {
     return pipeline_lsp_failure_case(true, false, false, false);
 }
-TEST(pipeline_issue54_c_cross_memo_failure_sequential) {
+TEST(pipeline_issue54_c_cross_memo_failure_one_worker) {
     return pipeline_lsp_failure_case(false, true, false, false);
 }
 TEST(pipeline_issue54_c_cross_memo_failure_parallel) {
     return pipeline_lsp_failure_case(true, true, false, false);
 }
-TEST(pipeline_issue54_c_file_depth_failure_sequential) {
+TEST(pipeline_issue54_c_file_depth_failure_one_worker) {
     return pipeline_lsp_failure_case(false, false, false, true);
 }
 TEST(pipeline_issue54_c_file_depth_failure_parallel) {
     return pipeline_lsp_failure_case(true, false, false, true);
 }
-TEST(pipeline_issue54_c_cross_depth_failure_sequential) {
+TEST(pipeline_issue54_c_cross_depth_failure_one_worker) {
     return pipeline_lsp_failure_case(false, true, false, true);
 }
 TEST(pipeline_issue54_c_cross_depth_failure_parallel) {
     return pipeline_lsp_failure_case(true, true, false, true);
 }
-TEST(pipeline_issue54_python_file_memo_failure_sequential) {
+TEST(pipeline_issue54_python_file_memo_failure_one_worker) {
     return pipeline_lsp_failure_case(false, false, true, false);
 }
 TEST(pipeline_issue54_python_file_memo_failure_parallel) {
     return pipeline_lsp_failure_case(true, false, true, false);
 }
-TEST(pipeline_issue54_python_cross_memo_failure_sequential) {
+TEST(pipeline_issue54_python_cross_memo_failure_one_worker) {
     return pipeline_lsp_failure_case(false, true, true, false);
 }
 TEST(pipeline_issue54_python_cross_memo_failure_parallel) {
     return pipeline_lsp_failure_case(true, true, true, false);
 }
-TEST(pipeline_issue54_python_file_depth_failure_sequential) {
+TEST(pipeline_issue54_python_file_depth_failure_one_worker) {
     return pipeline_lsp_failure_case(false, false, true, true);
 }
 TEST(pipeline_issue54_python_file_depth_failure_parallel) {
     return pipeline_lsp_failure_case(true, false, true, true);
 }
-TEST(pipeline_issue54_python_cross_depth_failure_sequential) {
+TEST(pipeline_issue54_python_cross_depth_failure_one_worker) {
     return pipeline_lsp_failure_case(false, true, true, true);
 }
 TEST(pipeline_issue54_python_cross_depth_failure_parallel) {
@@ -3908,10 +3899,10 @@ TEST(pipeline_imports_multi_symbol_edges) {
     PASS();
 }
 
-/* Regression for the sequential path used by supervised recovery. Rust
+/* Regression for single-worker runs (CBM_WORKERS=0). Rust
  * grouped imports preserve the whole brace list as local_name, including
  * embedded newlines; IMPORTS properties must still be valid JSON. */
-TEST(pipeline_rust_grouped_import_properties_valid_json_sequential) {
+TEST(pipeline_rust_grouped_import_properties_valid_json_one_worker) {
     const char *files[] = {"temporary.rs", "app_state.rs"};
     const char *contents[] = {
         "use crate::app_state::{\n"
@@ -8775,9 +8766,8 @@ static void stem_repo(const char *tmp, int fillers) {
  * spelled `genproto/` -- unless the directory is a Go package: it IS that
  * package's module and Go imports land on it, so the file's Module yields as
  * `goapi.api#sh`. Rust's foo.rs beside foo/ keeps its symbol QNs, and C's
- * foo.h/foo.c stem pair still shares one Module. Run small (sequential
- * extraction) and past MIN_FILES_FOR_PARALLEL (parallel workers), which
- * insert Modules on separate paths. */
+ * foo.h/foo.c stem pair still shares one Module. Run small and with filler
+ * files. */
 static int check_stem_collision(int fillers) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_stem_XXXXXX", cbm_tmpdir());
@@ -8987,7 +8977,7 @@ static int count_edges_with_url_path(cbm_store_t *s, const char *project, const 
     return matches;
 }
 
-/* Distilled from PR #1245: detect_url_in_args (parallel resolver, >= 50 files)
+/* Distilled from PR #1245: detect_url_in_args (parallel resolver)
  * runs for EVERY resolved call with no callee gating, so a filesystem path
  * with a document/log extension passed to a project-defined open/read/write
  * helper passed normalize_url_arg (second slash, no space) and the route
@@ -9423,7 +9413,7 @@ TEST(pipeline_typed_http_call_has_no_arg_url_twin) {
     return typed_http_no_url_twin_case(52);
 }
 
-TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential) {
+TEST(pipeline_typed_http_call_has_no_arg_url_twin_small) {
     return typed_http_no_url_twin_case(0);
 }
 
@@ -9471,8 +9461,7 @@ TEST(pipeline_unresolved_route_suffix_call_adds_no_self_loop) {
  * fallback and became route REGISTRATIONS: on
  * microsoft/Game-Control-Puzzle-Event-Administration-Tools all 69 client
  * calls masqueraded as server Routes. A real Express registration in the same
- * project stays a registration. `fillers` > 0 forces the parallel resolver,
- * 0 keeps the sequential one; both classify through the same table. */
+ * project stays a registration. Run with and without filler files. */
 static int capitalized_axios_case(int fillers) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "%s/cbm_axios_cap_XXXXXX", cbm_tmpdir());
@@ -9549,7 +9538,7 @@ TEST(pipeline_capitalized_axios_import_is_http_client) {
     return capitalized_axios_case(52);
 }
 
-TEST(pipeline_capitalized_axios_import_is_http_client_sequential) {
+TEST(pipeline_capitalized_axios_import_is_http_client_small) {
     return capitalized_axios_case(0);
 }
 
@@ -9705,8 +9694,7 @@ TEST(pipeline_swift_http_call_makes_route_issue1892) {
  * method: 'GET'})`. The template literal itself already canonicalizes to
  * "/api/customers/{}"; what was lost is the object wrapper: the arg-url
  * heuristic only read bare string/template arguments, so the call produced
- * no HTTP_CALLS edge and cross-repo matching had nothing to join. Parallel
- * resolver (> 50 files), where the arg-url heuristic lives. A config object
+ * no HTTP_CALLS edge and cross-repo matching had nothing to join. A config object
  * without a `url` key must not mint a route. */
 TEST(pipeline_ts_config_object_url_http_calls_issue2235) {
     char tmp[256];
@@ -10990,13 +10978,11 @@ TEST(pipeline_committed_counts_match_persisted) {
  * RED on the unfixed gate: cycles == file count (64) > cores+2.
  * The counter (cbm_pp_bp_nap_cycles) makes this deterministic — no timing.
  *
- * The gate lives ONLY in the parallel extract path, so the fixture MUST exceed
- * MIN_FILES_FOR_PARALLEL (50) — else the run routes sequential, the gate never
- * fires, and the test would pass vacuously (cycles==0). The engagement assert
- * below (cycles >= 1) is a hard guard against that regressing silently. */
-/* Shared fixture for the back-pressure tests: 64 tiny Go files, above
- * MIN_FILES_FOR_PARALLEL (50) so the parallel extract path — the only phase
- * with a memory gate — is the one that runs. */
+ * The gate lives ONLY in parallel extraction. The engagement assert below
+ * (cycles >= 1) guards against it never firing, which would let the test pass
+ * vacuously (cycles==0). */
+/* Shared fixture for the back-pressure tests: 64 tiny Go files. Extraction is
+ * the only phase with a memory gate. */
 static bool write_backpressure_fixture(void) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "%s/cbm_test_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(g_tmpdir)) {
@@ -11131,8 +11117,7 @@ TEST(pipeline_post_extract_gate_aborts_before_publication) {
 }
 
 TEST(pipeline_backpressure_futile_nap_disengages) {
-    /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
-     * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
+    /* 64 tiny files: old-code cycles (~64) >> the bound. */
     if (!write_backpressure_fixture()) {
         FAIL("failed to create fixture");
     }
@@ -11181,11 +11166,11 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
      * code (rc==0 was the advisory era). */
     ASSERT_EQ(rc, CBM_PIPELINE_ABORT_OVER_BUDGET);
     /* Engagement guard (anti-vacuous): the gate must have actually run — the
-     * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
-     * means the fixture routed sequential (or the gate was compiled out) and
-     * this test proved NOTHING; fail loudly rather than pass vacuously. */
+     * 1 MB budget exceeded on every pull. cycles==0 means the gate never ran
+     * (or was compiled out) and this test proved NOTHING; fail loudly rather
+     * than pass vacuously. */
     if (cycles < 1) {
-        FAIL("back-pressure gate never engaged (cycles==0) — fixture routed sequential?");
+        FAIL("back-pressure gate never engaged (cycles==0)");
     }
     /* Futile napping must disengage: never one cycle per file (64). The first
      * latch engages the spill store (F1) and re-arms the gate once, so each
@@ -11307,7 +11292,7 @@ TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_generation) {
     /* Engagement guard: fail-whole needs the latching cycle AND the
      * confirmation cycle; fewer means the gate never decided anything. */
     if (cycles < 2) {
-        FAIL("back-pressure gate never confirmed futility (cycles<2) — fixture routed sequential?");
+        FAIL("back-pressure gate never confirmed futility (cycles<2)");
     }
     /* The served generation is untouched. */
     ASSERT_EQ(info_after_rc, 0);
@@ -11500,8 +11485,7 @@ TEST(result_spill_store_parks_and_loads) {
 #if CBM_WITH_ZOVA
 /* 61 files across Go, Python, Java (no package line, so the JVM namespace is
  * inferred from the source root), TypeScript, Rust and YAML, with
- * cross-file calls, inheritance and config URLs: above
- * MIN_FILES_FOR_PARALLEL so the parallel path runs. */
+ * cross-file calls, inheritance and config URLs. */
 static bool write_spill_fixture(void) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "%s/cbm_test_XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(g_tmpdir)) {
@@ -11660,8 +11644,8 @@ TEST(pipeline_forced_spill_matches_in_memory_graph) {
 extern long cbm_ts_full_registry_builds(void);
 extern void cbm_ts_full_registry_builds_reset(void);
 
-/* Reproduce-first (ms-typescript finding, 2026-07-07): the SEQUENTIAL
- * cross-LSP driver must resolve TS files through the SHARED prebuilt
+/* Reproduce-first (ms-typescript finding, 2026-07-07): the cross-LSP
+ * driver must resolve TS files through the SHARED prebuilt
  * registry, never a full per-file build. cbm_run_ts_lsp_cross registers
  * stdlib + EVERY cross-file def + finalizes once PER FILE — O(files x defs).
  * On an 81k-file TS corpus that ground one core for hours (74% of stack
@@ -11669,13 +11653,12 @@ extern void cbm_ts_full_registry_builds_reset(void);
  * killed the crawl mid-pass, the stale extraction marker blamed innocent
  * files, quarantining four of them one 15-minute retry at a time.
  *
- * The fixture stays UNDER MIN_FILES_FOR_PARALLEL (50) so the pipeline
- * routes through the sequential driver — the path that lacked the
- * shared-registry prepare.
+ * The test was written for the since-deleted sequential driver, which lacked
+ * the shared-registry prepare.
  * RED on the unfixed driver: full builds == TS file count (40).
  * GREEN: full builds == 0 AND the cross-file TS call still resolves
  * (quality guard — the shared path must not lose the edge). */
-TEST(pipeline_seq_ts_cross_uses_shared_registry) {
+TEST(pipeline_ts_cross_uses_shared_registry) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
     if (!cbm_mkdtemp(g_tmpdir)) {
         FAIL("failed to create temp dir");
@@ -11720,7 +11703,7 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
 
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(linked);
-    /* The point: ZERO full per-file registry builds on the sequential path. */
+    /* The point: ZERO full per-file registry builds. */
     ASSERT_EQ(builds, 0);
     PASS();
 }
@@ -11998,14 +11981,12 @@ static c1_variants_obs_t c1_observe_variants(const char *repo) {
     return obs;
 }
 
-/* `variants` reaches the node on BOTH execution paths. The property is computed per
- * file at extraction; the sequential pass (pass_definitions.c) and the parallel one
- * (pass_parallel.c) each serialize it, and the properties buffer is sized for the
- * list, so a path that forgot either would publish a node without it. One fixture,
- * two runs: CBM_WORKERS=1 forces the sequential path, the 55 fillers plus
- * CBM_WORKERS=4 select the parallel one. A JSON file with a repeated key rides along:
+/* `variants` reaches the node with one worker and with four. The property is computed
+ * per file at extraction and serialized by pass_parallel.c, and the properties buffer is
+ * sized for the list. One fixture with 55 fillers, two runs: CBM_WORKERS=1 and
+ * CBM_WORKERS=4. A JSON file with a repeated key rides along:
  * no language outside the C preprocessor ones gets the property. */
-TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1) {
+TEST(pipeline_c_variants_with_one_and_four_workers_c1) {
     const char *td = th_mktempdir("cbm_c1_variants");
     if (!td) {
         FAIL("tmpdir");
@@ -12045,10 +12026,10 @@ TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1) {
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
 
     cbm_setenv("CBM_WORKERS", "1", 1);
-    c1_variants_obs_t sequential = c1_observe_variants(tmp);
+    c1_variants_obs_t one_worker = c1_observe_variants(tmp);
 
     cbm_setenv("CBM_WORKERS", "4", 1);
-    c1_variants_obs_t parallel = c1_observe_variants(tmp);
+    c1_variants_obs_t four_workers = c1_observe_variants(tmp);
 
     if (saved_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
@@ -12058,16 +12039,15 @@ TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1) {
     }
     th_rmtree(tmp);
 
-    const c1_variants_obs_t *runs[] = {&sequential, &parallel};
+    const c1_variants_obs_t *runs[] = {&one_worker, &four_workers};
     for (int i = 0; i < 2; i++) {
         if (!runs[i]->pick_lists_both || !runs[i]->limit_has_list || runs[i]->once_has_list ||
             runs[i]->other_lang_lists != 0) {
             fprintf(
                 stderr,
-                "  [c1-variants] path=%s pick=%d limit=%d once=%d json_nodes=%d json_lists=%d\n",
-                i == 0 ? "sequential" : "parallel", runs[i]->pick_lists_both,
-                runs[i]->limit_has_list, runs[i]->once_has_list, runs[i]->other_lang_nodes,
-                runs[i]->other_lang_lists);
+                "  [c1-variants] workers=%s pick=%d limit=%d once=%d json_nodes=%d json_lists=%d\n",
+                i == 0 ? "1" : "4", runs[i]->pick_lists_both, runs[i]->limit_has_list,
+                runs[i]->once_has_list, runs[i]->other_lang_nodes, runs[i]->other_lang_lists);
         }
     }
     /* the property on each path first, the language limit second: one concern must
@@ -12131,21 +12111,21 @@ TEST(pipeline_cpp_overloads_are_listed_as_variants_c1) {
 }
 
 SUITE(pipeline) {
-    RUN_TEST(pipeline_issue54_c_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_memo_failure_one_worker);
     RUN_TEST(pipeline_issue54_c_file_memo_failure_parallel);
-    RUN_TEST(pipeline_issue54_c_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_memo_failure_one_worker);
     RUN_TEST(pipeline_issue54_c_cross_memo_failure_parallel);
-    RUN_TEST(pipeline_issue54_c_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_file_depth_failure_one_worker);
     RUN_TEST(pipeline_issue54_c_file_depth_failure_parallel);
-    RUN_TEST(pipeline_issue54_c_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_c_cross_depth_failure_one_worker);
     RUN_TEST(pipeline_issue54_c_cross_depth_failure_parallel);
-    RUN_TEST(pipeline_issue54_python_file_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_memo_failure_one_worker);
     RUN_TEST(pipeline_issue54_python_file_memo_failure_parallel);
-    RUN_TEST(pipeline_issue54_python_cross_memo_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_memo_failure_one_worker);
     RUN_TEST(pipeline_issue54_python_cross_memo_failure_parallel);
-    RUN_TEST(pipeline_issue54_python_file_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_file_depth_failure_one_worker);
     RUN_TEST(pipeline_issue54_python_file_depth_failure_parallel);
-    RUN_TEST(pipeline_issue54_python_cross_depth_failure_sequential);
+    RUN_TEST(pipeline_issue54_python_cross_depth_failure_one_worker);
     RUN_TEST(pipeline_issue54_python_cross_depth_failure_parallel);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
@@ -12166,8 +12146,8 @@ SUITE(pipeline) {
     RUN_TEST(result_spill_decode_rejects_truncated_buffers);
     RUN_TEST(result_spill_store_parks_and_loads);
     RUN_TEST(pipeline_forced_spill_matches_in_memory_graph);
-    /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
-    RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
+    /* Cross-LSP shared registry (ms-typescript quadratic) */
+    RUN_TEST(pipeline_ts_cross_uses_shared_registry);
     /* File persistence */
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
@@ -12204,10 +12184,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_zig_dependency_modules_resolve_through_build_zig_zon);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
-    RUN_TEST(pipeline_external_import_binding_sequential_parallel);
+    RUN_TEST(pipeline_external_import_binding_one_and_four_workers);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     RUN_TEST(pipeline_url_constant_folding_http_calls_issue706_1147);
-    RUN_TEST(pipeline_folded_topics_preserve_identity_sequential_parallel);
+    RUN_TEST(pipeline_folded_topics_preserve_identity_one_and_four_workers);
     RUN_TEST(pipeline_relative_folded_wrapper_url_candidates);
     /* Git history pass */
     RUN_TEST(githistory_is_trackable);
@@ -12231,7 +12211,7 @@ SUITE(pipeline) {
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
-    RUN_TEST(pipeline_rust_grouped_import_properties_valid_json_sequential);
+    RUN_TEST(pipeline_rust_grouped_import_properties_valid_json_one_worker);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
@@ -12400,10 +12380,10 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_arg_url_skips_client_navigation);
     RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin);
-    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_sequential);
+    RUN_TEST(pipeline_typed_http_call_has_no_arg_url_twin_small);
     RUN_TEST(pipeline_unresolved_route_suffix_call_adds_no_self_loop);
     RUN_TEST(pipeline_capitalized_axios_import_is_http_client);
-    RUN_TEST(pipeline_capitalized_axios_import_is_http_client_sequential);
+    RUN_TEST(pipeline_capitalized_axios_import_is_http_client_small);
     RUN_TEST(pipeline_python_websocket_decorators_register_routes);
     RUN_TEST(pipeline_incremental_shared_infra_url_survives_owner_change);
     RUN_TEST(pipeline_incremental_handler_change_rematches_infra_route);
@@ -12474,6 +12454,6 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_c_definitions_own_their_qn_c1);
     RUN_TEST(pipeline_c_call_targets_definition_before_macro_c1);
     RUN_TEST(pipeline_c_enum_inside_struct_reference_resolves_c1);
-    RUN_TEST(pipeline_c_variants_on_sequential_and_parallel_paths_c1);
+    RUN_TEST(pipeline_c_variants_with_one_and_four_workers_c1);
     RUN_TEST(pipeline_cpp_overloads_are_listed_as_variants_c1);
 }

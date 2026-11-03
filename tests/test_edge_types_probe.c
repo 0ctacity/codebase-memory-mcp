@@ -18,22 +18,19 @@
  *   RAISES     — function raises a runtime error/panic (Python, Kotlin, TypeScript,
  *                C#, PHP). Unchecked = name contains "Error"/"Panic".
  *   WRITES     — variable assignment resolved across function boundary (Python, Go, Rust,
- *                Java, C#, Kotlin). WRITES/READS are parallel-path only (>50 files).
+ *                Java, C#, Kotlin).
  *   DEFINES_METHOD — class→method across languages (Go, Rust, Java, C#, PHP, Ruby,
  *                    Kotlin, TypeScript, Scala).
  *   OVERRIDE   — Go interface satisfaction (method overrides interface method).
- *                Parallel-path only (>50 files).
  *
  * Edge types that do NOT exist in the schema and are explicitly not probed:
  *   RETURNS / RETURNS_TYPE — no such edge type in the production schema (confirmed
  *     by searching ALL_EDGE_TYPES in test_lang_contract.c and the cli.c edge list).
  *   DATA_FLOWS — already guarded in test_lang_contract.c (contract_edge_data_flows).
  *
- * Path notes:
- *   SEQUENTIAL path (< 50 files): HANDLES, HTTP_CALLS, ASYNC_CALLS, DEFINES_METHOD,
- *     THROWS, RAISES are produced in pass_calls.c / pass_usages.c.
- *   PARALLEL path (≥ 50 files via index_parallel_fixture): WRITES, OVERRIDE and the
- *     parallel variants of THROWS/RAISES/USAGE are exercised here.
+ * Path notes: every index runs the parallel pipeline (pass_parallel.c). The
+ *   WRITES and OVERRIDE tests and the padded THROWS/RAISES/USAGE variants add
+ *   filler files (et_index_parallel).
  *
  * Registration: NOT registered in test_main.c (per task specification).
  * Run standalone: link the suite and call suite_edge_types_probe() from a main().
@@ -139,8 +136,7 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
 /* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
  * Spring paths such as "/orders" when the real route is "/api/orders", and a
  * presence-only assertion would still allow stale partial Route nodes to leak.
- * parallel pads the fixture past MIN_FILES_FOR_PARALLEL so the parallel
- * resolver mints the routes; must_qn (optional) is a Route qualified_name that
+ * parallel adds filler files; must_qn (optional) is a Route qualified_name that
  * must exist — the identity cross-repo HTTP matching joins on. */
 static int et_routes_exact_mode(const EtFile *files, int nfiles, const char **routes,
                                 bool parallel, const char *must_qn) {
@@ -214,8 +210,7 @@ static int et_routes_exact(const EtFile *files, int nfiles, const char **routes)
     return et_routes_exact_mode(files, nfiles, routes, false, NULL);
 }
 
-/* Index meaningful[] plus PARALLEL_PAD_FILES trivial pad files to force the
- * parallel pipeline path (MIN_FILES_FOR_PARALLEL = 50). */
+/* Index meaningful[] plus ET_PARALLEL_PAD trivial pad files. */
 enum { ET_PARALLEL_PAD = 52, ET_PAD_MAX = 68 /* 52 pad + 16 meaningful */ };
 
 static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int n_mean) {
@@ -364,14 +359,14 @@ TEST(graphql_operation_identity_parser_issue598) {
     PASS();
 }
 
-/* #1085: count CALLS edges whose target node has `name`, indexing via the
- * PARALLEL path (et_index_parallel pads to >50 files). The parallel resolver
+/* #1085: count CALLS edges whose target node has `name`, indexing with
+ * et_index_parallel's filler files. The parallel resolver
  * used to drop the edge whenever the LSP resolved a callee but its target QN
  * wasn't a gbuf node (JSX component imported through a tsconfig `paths` alias:
  * the TS LSP resolves the element ref to an alias-path QN that never matches a
- * def node) — sequential kept the edge via the registry import_map fallback,
- * so the two pipelines disagreed and ~21% of a Next.js call graph vanished on
- * the default (parallel) path. Needs >50 files to reproduce. */
+ * def node) — the since-deleted sequential resolver kept the edge via the
+ * registry import_map fallback, so the two pipelines disagreed and ~21% of a
+ * Next.js call graph vanished on the default (parallel) path. */
 static int et_calls_to_name_parallel(const EtFile *meaningful, int n_mean, const char *name) {
     EtProj lp;
     cbm_store_t *store = et_index_parallel(&lp, meaningful, n_mean);
@@ -410,7 +405,7 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
          "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
          "export function DashboardB() {\n  return <KpiCard label=\"b\" />;\n}\n"}};
     /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: both renders
-     * resolve, exactly as the sequential path already does. */
+     * resolve. */
     int hits = et_calls_to_name_parallel(f, 4, "KpiCard");
     if (hits < 2) {
         fprintf(stderr, "  [1085] FAIL CALLS->KpiCard on parallel path = %d (expected >= 2); "
@@ -427,11 +422,11 @@ TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
  *  Strategy: the route_path is extracted from decorators (Python Flask/FastAPI/
  *  Django, Java Spring) or from the resolved QN matching a framework library id
  *  (Express, Fastify, Gin, ASP.NET MapGet/MapPost, Laravel).  Each fixture uses a
- *  LOCAL wrapper whose QN carries the framework substring so the sequential-path
- *  resolver (pass_calls.c → cbm_service_pattern_match → CBM_SVC_ROUTE_REG) fires.
+ *  LOCAL wrapper whose QN carries the framework substring so the resolver's
+ *  cbm_service_pattern_match → CBM_SVC_ROUTE_REG classification fires.
  *  Decorator-based frameworks (Flask, FastAPI, Django, Spring @RequestMapping) are
  *  handled via extract_route_from_decorators which sets def.route_path in the
- *  extraction result and creates Route+HANDLES during pass_definitions.
+ *  extraction result, from which the pipeline creates Route+HANDLES.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Flask (Python) — already covered in test_lang_contract.c:contract_edge_handles.
@@ -479,7 +474,7 @@ TEST(handles_drf_action_python) {
  * inline-object method, which is never registered as a resolvable node).  We use
  * top-level wrapper functions defined in an "express"-pathed module so the
  * resolved QN (project.express.router.expressGet) carries the substring → the
- * sequential resolver classifies the call as CBM_SVC_ROUTE_REG and emits
+ * resolver classifies the call as CBM_SVC_ROUTE_REG and emits
  * Route + HANDLES (mirrors the working handles_gin_go pattern). */
 TEST(handles_express_ts) {
     static const EtFile f[] = {
@@ -579,7 +574,7 @@ static const char *et_fiber_groups_issue686_routes[] = {
     "/health",      "/api/v1/users/:id", "/admin/customers/:id", "/api/shop/orders",
     "/internal/ping", "/reports/daily",  "/dyn",                 NULL};
 
-TEST(handles_fiber_group_prefix_sequential_issue686) {
+TEST(handles_fiber_group_prefix_small_issue686) {
     ASSERT_TRUE(et_routes_exact_mode(et_fiber_groups_issue686, 1, et_fiber_groups_issue686_routes,
                                      false, NULL));
     PASS();
@@ -919,8 +914,8 @@ static int et_route_set_exact(const EtFile *files, int nfiles, const char **want
         }
     }
     if (!ok) {
-        fprintf(stderr, "  [ET-ROUTESET] FAIL (%s path) expected=%d actual=%d\n",
-                parallel ? "parallel" : "sequential", wanted, node_count);
+        fprintf(stderr, "  [ET-ROUTESET] FAIL (%s fixture) expected=%d actual=%d\n",
+                parallel ? "padded" : "small", wanted, node_count);
     }
     cbm_store_free_nodes(nodes, node_count);
     et_cleanup(&lp, store);
@@ -1135,7 +1130,7 @@ TEST(routes_laravel_withrouting_nonliteral_prefix_issue1146) {
     PASS();
 }
 
-/* Same contract on the PARALLEL resolver (> 50 files), with the Laravel app
+/* Same contract with filler files, with the Laravel app
  * in a monorepo subdirectory: the nearest ancestor bootstrap/app.php owns it. */
 TEST(routes_laravel_withrouting_parallel_subdir_issue1146) {
     static const char *routes[] = {"/api/users/me", "/api/orders", NULL};
@@ -1224,8 +1219,8 @@ static int et_handles_exact_routes(const EtFile *files, int nfiles, const EtHand
         }
     }
     if (!ok) {
-        fprintf(stderr, "  [ET-HANDLES] FAIL (%s path) expected=%d actual=%d\n",
-                parallel ? "parallel" : "sequential", wanted, n);
+        fprintf(stderr, "  [ET-HANDLES] FAIL (%s fixture) expected=%d actual=%d\n",
+                parallel ? "padded" : "small", wanted, n);
     }
     if (edges) cbm_store_free_edges(edges, n);
     et_cleanup(&lp, store);
@@ -1306,8 +1301,7 @@ TEST(handles_laravel_class_handlers_issue1146) {
     PASS();
 }
 
-/* Same fixture through the parallel pipeline (> MIN_FILES_FOR_PARALLEL),
- * whose route emitter (pass_parallel.c) is a separate code path. */
+/* Same fixture with filler files. */
 TEST(handles_laravel_class_handlers_parallel_issue1146) {
     ASSERT_TRUE(et_handles_exact(et_laravel_class_handlers, ET_LARAVEL_CLASS_FILES,
                                  et_laravel_class_handles, 1));
@@ -1432,7 +1426,7 @@ TEST(handles_laravel_psr4_absent_class_incremental_issue1146) {
     fputs("\n// touched\n", fp);
     fclose(fp);
 
-    /* Second run takes sequential incremental path */
+    /* Second run is incremental */
     p = cbm_pipeline_new(lp.tmpdir, NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
@@ -1817,7 +1811,7 @@ TEST(async_calls_bullmq_js) {
 /* ══════════════════════════════════════════════════════════════════
  *  THROWS — checked exceptions (no "Error"/"Panic" in name)
  *
- *  Parallel-path only (> 50 files). THROWS/RAISES require:
+ *  THROWS/RAISES require:
  *    1. The exception CLASS is defined as a node in the registry.
  *    2. The throw is extracted (throw_node_types or throws_clause_field).
  *    3. pass_parallel resolves the enclosing_func_qn + exception_name.
@@ -2152,7 +2146,6 @@ TEST(raises_php) {
 /* ══════════════════════════════════════════════════════════════════
  *  WRITES — variable assignment: function writes to a named var
  *  that resolves to a Variable node in the same or adjacent file.
- *  Parallel-path only (> 50 files).
  *
  *  REAL BUG (all five WRITES below — single shared root cause):
  *    Variable nodes ARE created (cbm_gbuf_upsert_node, "Variable" label) but are
@@ -2284,7 +2277,7 @@ TEST(writes_csharp) {
 /* ══════════════════════════════════════════════════════════════════
  *  DEFINES_METHOD — Class/Struct→Method (structural)
  *
- *  Sequential path. A Class node with methods must produce DEFINES_METHOD
+ *  A Class node with methods must produce DEFINES_METHOD
  *  edges when the method's parent_class_qn resolves to the Class node.
  *  The P6 contract in test_lang_contract.c only uses Python; we broaden
  *  to Go (via pass_semantic.c receiver methods), Rust, Java, C#, PHP,
@@ -2436,7 +2429,6 @@ TEST(defines_method_scala) {
 /* ══════════════════════════════════════════════════════════════════
  *  OVERRIDE — Go implicit interface satisfaction.
  *  Produced by pass_semantic.c:cbm_pipeline_implements_go().
- *  Parallel-path only (> 50 files).
  *
  *  REAL BUG (same root cause as defines_method_go): cbm_pipeline_implements_go
  *  (src/pipeline/pass_semantic.c:276-301) discovers interface methods AND struct
@@ -2629,7 +2621,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_express_ts);
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
-    RUN_TEST(handles_fiber_group_prefix_sequential_issue686);
+    RUN_TEST(handles_fiber_group_prefix_small_issue686);
     RUN_TEST(handles_fiber_group_prefix_parallel_issue686);
     RUN_TEST(handles_gin_group_prefix_issue686);
     RUN_TEST(handles_spring_java);
@@ -2703,7 +2695,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(writes_rust);
     RUN_TEST(writes_csharp);
 
-    /* DEFINES_METHOD — class→method (9 languages, sequential path) */
+    /* DEFINES_METHOD — class→method (9 languages) */
     RUN_TEST(defines_method_go);
     RUN_TEST(defines_method_rust);
     RUN_TEST(defines_method_java);

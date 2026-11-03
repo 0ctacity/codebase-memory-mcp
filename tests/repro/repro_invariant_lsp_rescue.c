@@ -13,8 +13,6 @@
  *               continue;
  *
  *   Consumed by:
- *     - src/pipeline/pass_calls.c:369 (sequential pipeline,
- *       resolve_single_call → emit_classified_edge)
  *     - src/pipeline/pass_parallel.c:1797 (parallel pipeline)
  *
  *   When tree-sitter's enclosing-func walk FAILS, cbm_enclosing_func_qn

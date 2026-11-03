@@ -8,9 +8,6 @@
  * MCP `skipped[]` + `skipped_count` + per-run logfile).
  *
  * These indexes run through the full production MCP `index_repository` flow.
- * With only a handful of files the pipeline takes the SEQUENTIAL path
- * (pass_definitions.c), so this exercises the sequential recording branch on
- * every platform regardless of core count.
  */
 #include "test_framework.h"
 #include "repro_harness.h" /* RProj, rh_to_fwd_slashes, rh_count_label, rh_cleanup */

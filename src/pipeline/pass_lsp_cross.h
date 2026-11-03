@@ -207,8 +207,8 @@ CBMZigArgType *cbm_pxc_collect_zig_args(const cbm_pipeline_ctx_t *ctx, CBMFileRe
 /* Does a function of module module_qn take collected `anytype` argument types? */
 bool cbm_pxc_zig_args_in_module(const CBMCrossLspRegistries *r, const char *module_qn);
 
-/* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
- * sequential driver (one path = one semantics): module-def-index filter →
+/* Per-file cross-LSP dispatch for the parallel resolve worker:
+ * module-def-index filter →
  * shared prebuilt registry (overlay pattern, no per-file registry build) →
  * per-file fallback with FILTERED defs for languages without a shared
  * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust

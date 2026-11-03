@@ -176,13 +176,12 @@ TEST(repro_parallel_edge_determinism) {
     PASS();
 }
 
-/* RED (open bug, fix deferred): the SEQUENTIAL pipeline and the PARALLEL
- * pipeline are different code paths that produce SYSTEMATICALLY different
- * graphs — on the xfs corpus they disagree on ~3459 USAGE, ~1666 WRITES and
- * ~60 CALLS sorted-edge lines, consistently (each mode is internally
- * deterministic after the race fixes above; the modes just don't agree).
- * GREEN when both pipelines emit the same graph for the same corpus. */
-TEST(repro_seq_parallel_equivalence) {
+/* One worker (CBM_WORKERS=0) and the default worker count must emit the same
+ * graph for the same corpus. When one worker meant a separate sequential
+ * pipeline, the two disagreed on the xfs corpus on ~3459 USAGE, ~1666 WRITES
+ * and ~60 CALLS sorted-edge lines. Both now run the parallel pipeline; this
+ * has not been re-measured since, because the corpus is not checked in. */
+TEST(repro_one_and_many_workers_equivalence) {
     struct stat st;
     if (stat(RPD_CORPUS, &st) != 0 || !S_ISDIR(st.st_mode)) {
         SKIP("real-repo tier: corpus " RPD_CORPUS " absent");
@@ -206,5 +205,5 @@ TEST(repro_seq_parallel_equivalence) {
 
 void suite_repro_parallel_determinism(void) {
     RUN_TEST(repro_parallel_edge_determinism);
-    RUN_TEST(repro_seq_parallel_equivalence);
+    RUN_TEST(repro_one_and_many_workers_equivalence);
 }

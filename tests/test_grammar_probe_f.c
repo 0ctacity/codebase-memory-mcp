@@ -162,8 +162,8 @@ static GpfMetrics gpf_metrics(const char *filename, const char *content) {
  * The extractor models HCL as a single Module node plus a Class node for
  * the file-level scope.  Individual `resource` / `module` blocks are NOT
  * yet extracted as separate nodes (grammar-only path).
- * INFRA_MAPS is produced only by the parallel-path pipeline (>50 files);
- * single-file fixture tests it as RED.
+ * INFRA_MAPS: a single-file fixture produces it, since every index runs the
+ * parallel pipeline.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* HCL: minimal resource block → at least 1 node (Module) and 1 Class node. */
@@ -223,8 +223,7 @@ TEST(probe_hcl_module_block_node) {
 }
 
 /* HCL: INFRA_MAPS edge (module.source URL → Route node).
- * RED: INFRA_MAPS is produced only by the parallel-path pipeline (>50 files);
- *      single-file fixture never crosses the threshold. */
+ * A single-file fixture gets it too: every index runs the parallel pipeline. */
 TEST(probe_hcl_infra_maps_edge) {
     GpfMetrics m = gpf_metrics("sched.tf",
         "resource \"google_cloud_scheduler_job\" \"cron\" {\n"
@@ -235,8 +234,7 @@ TEST(probe_hcl_infra_maps_edge) {
         "  }\n"
         "}\n");
     ASSERT_TRUE(m.ok);
-    /* RED: INFRA_MAPS requires parallel-path (>50 files) — not triggered here. */
-    ASSERT_TRUE(m.infra_maps >= 1); /* expected RED — parallel path only */
+    ASSERT_TRUE(m.infra_maps >= 1);
     PASS();
 }
 

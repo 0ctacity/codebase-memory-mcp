@@ -224,9 +224,9 @@ typedef struct {
 
 /* Record a skipped file. path/reason/phase are copied. NULL-safe on p.
  *
- * NOT thread-safe: call it from the sequential extraction pass, or from the
- * parallel merge step (never from inside a parallel worker — workers collect
- * into per-worker lists and merge sequentially). */
+ * NOT thread-safe: call it from the parallel merge step, never from inside a
+ * parallel worker (workers collect into per-worker lists and merge
+ * sequentially). */
 /* True for the phases that mean "indexed, but with unrecovered parse-error
  * regions" ("parse_partial", "parse_unusable"), as opposed to a skip. */
 bool cbm_pipeline_phase_is_partial(const char *phase);
