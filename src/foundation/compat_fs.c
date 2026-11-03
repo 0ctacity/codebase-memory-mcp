@@ -920,3 +920,14 @@ int cbm_exec_no_shell(const char *const *argv) {
 }
 
 #endif /* _WIN32 */
+
+int64_t cbm_stat_mtime_ns(const struct stat *st) {
+    const int64_t ns_per_sec = (int64_t)CBM_NSEC_PER_SEC;
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * ns_per_sec) + (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * ns_per_sec;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * ns_per_sec) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}

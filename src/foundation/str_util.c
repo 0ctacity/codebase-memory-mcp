@@ -96,6 +96,14 @@ const char *cbm_path_ext(const char *path) {
     return dot + SKIP_ONE;
 }
 
+const char *cbm_path_last_dot(const char *path) {
+    if (!path) {
+        return "";
+    }
+    const char *dot = strrchr(path, '.');
+    return dot ? dot : "";
+}
+
 const char *cbm_path_base(const char *path) {
     if (!path) {
         return "";

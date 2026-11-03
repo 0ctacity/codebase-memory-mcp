@@ -18,6 +18,7 @@
 
 #include "foundation/profile.h"
 #include "foundation/platform.h"
+#include "foundation/str_util.h"
 
 enum {
     SIM_EDGE_INIT_CAP = 256,
@@ -33,15 +34,6 @@ enum {
 enum { FP_KEY_PREFIX_LEN = 6, MIN_FP_ENTRIES = 2 }; /* strlen("\"fp\":\"") */
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
-
-/* Extract file extension from a path (including the dot). */
-static const char *file_ext(const char *path) {
-    if (!path) {
-        return "";
-    }
-    const char *dot = strrchr(path, '.');
-    return dot ? dot : "";
-}
 
 /* Parse "fp" hex string from a node's properties_json.
  * Returns true if found and decoded successfully. */
@@ -67,17 +59,6 @@ static bool parse_fp_from_props(const char *props_json, cbm_minhash_t *out) {
     memcpy(hex_buf, hex_start, (size_t)hex_len);
     hex_buf[hex_len] = '\0';
     return cbm_minhash_from_hex(hex_buf, out);
-}
-
-/* Log helper for integer-to-string in log calls. */
-static const char *itoa_log(int val) {
-    enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
-    static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & RING_BUF_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
 }
 
 /* ── Internal types ──────────────────────────────────────────────── */
@@ -143,7 +124,7 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
                 .node_id = n->id,
                 .fp = fp,
                 .file_path = n->file_path,
-                .ext = file_ext(n->file_path),
+                .ext = cbm_path_last_dot(n->file_path),
                 .qn = n->qualified_name,
             };
         }
@@ -288,7 +269,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     int entry_count = collect_fp_entries(gbuf, &entries);
     CBM_PROF_END_N("similarity", "1_collect_fp", t_collect, entry_count);
 
-    cbm_log_info("pass.similarity.collected", "nodes_with_fp", itoa_log(entry_count));
+    cbm_log_info("pass.similarity.collected", "nodes_with_fp", cbm_log_itoa(entry_count));
 
     if (entry_count < MIN_FP_ENTRIES) {
         free(entries);
@@ -345,7 +326,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     int total_edges = merge_sim_edges(gbuf, worker_bufs, worker_count);
     CBM_PROF_END_N("similarity", "4_edge_merge_seq", t_merge, total_edges);
 
-    cbm_log_info("pass.done", "pass", "similarity", "edges", itoa_log(total_edges));
+    cbm_log_info("pass.done", "pass", "similarity", "edges", cbm_log_itoa(total_edges));
 
     free(edge_counts);
     free(lsh_entries);

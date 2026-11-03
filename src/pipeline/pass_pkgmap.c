@@ -63,7 +63,6 @@ enum {
     PKGMAP_PATH_BUF = 1024,
     PKGMAP_LINE_BUF = 512,
     PKGMAP_HT_INIT = 64,
-    PKGMAP_ITOA_BUF = 16,
     /* Hard ceiling on recursive directory descent. This is the
      * non-negotiable termination guarantee for the manifest walk: even
      * if the filesystem contains directory junctions / symlink cycles
@@ -80,13 +79,6 @@ enum {
     XML_GROUP_OPEN = 9,     /* strlen("<groupId>") */
     XML_ARTIFACT_OPEN = 12, /* strlen("<artifactId>") */
 };
-
-/* Thread-local int→string for log key-value pairs */
-static const char *pkgmap_itoa(int val) {
-    static _Thread_local char buf[PKGMAP_ITOA_BUF];
-    snprintf(buf, sizeof(buf), "%d", val);
-    return buf;
-}
 
 /* Check if src at position p starts with literal str of known length. */
 static bool at_prefix(const char *p, const char *end, const char *prefix, int prefix_len) {
@@ -173,16 +165,6 @@ static char *join_and_strip(const char *dir, const char *entry) {
         snprintf(buf, sizeof(buf), "%s/%s", dir, entry);
     }
     return strip_extension(buf);
-}
-
-/* Check if a string ends with a suffix. */
-static bool ends_with(const char *s, const char *suffix) {
-    size_t slen = strlen(s);
-    size_t suflen = strlen(suffix);
-    if (suflen > slen) {
-        return false;
-    }
-    return strcmp(s + slen - suflen, suffix) == 0;
 }
 
 /* Find a line starting with a prefix in source. Returns pointer to first char
@@ -728,7 +710,7 @@ static char *bz_root_source(const char *p, const char *end) {
     const char *call = r ? bz_find(r, stop, ".path(") : NULL;
     const char *after = NULL;
     char *path = call ? bz_quoted(call + strlen(".path("), stop, &after) : NULL;
-    if (path && (!ends_with(path, ".zig") || strstr(path, ".."))) {
+    if (path && (!cbm_str_ends_with(path, ".zig") || strstr(path, ".."))) {
         free(path);
         path = NULL;
     }
@@ -1025,7 +1007,7 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
         parse_mix_exs(source, source_len, rel_path, entries);
         return true;
     }
-    if (ends_with(basename, ".gemspec")) {
+    if (cbm_str_ends_with(basename, ".gemspec")) {
         parse_gemspec(source, source_len, rel_path, entries);
         return true;
     }
@@ -1145,7 +1127,7 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
         cbm_ht_free(map);
         return NULL;
     }
-    cbm_log_info("pkgmap.build", "entries", pkgmap_itoa(merged));
+    cbm_log_info("pkgmap.build", "entries", cbm_log_itoa(merged));
     return map;
 }
 
@@ -1164,7 +1146,7 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
         strcmp(basename, "build.zig") == 0 || strcmp(basename, "build.zig.zon") == 0) {
         return true;
     }
-    return ends_with(basename, ".gemspec");
+    return cbm_str_ends_with(basename, ".gemspec");
 }
 
 /* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip.
@@ -1320,7 +1302,7 @@ int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char
         return 0;
     }
     int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
-    cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
+    cbm_log_info("pkgmap.scan_repo", "manifests", cbm_log_itoa(parsed));
     return parsed;
 }
 
@@ -1482,7 +1464,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
 
     /* 2b. Zig: a named `@import("name")` is a build.zig module, never another
      *     ecosystem's package of the same name. */
-    if (source_rel && ends_with(source_rel, ".zig")) {
+    if (source_rel && cbm_str_ends_with(source_rel, ".zig")) {
         char key[PKGMAP_PATH_BUF];
         snprintf(key, sizeof(key), "zig:%s", module_path);
         const char *zig_qn = (const char *)cbm_ht_get(pkgmap, key);

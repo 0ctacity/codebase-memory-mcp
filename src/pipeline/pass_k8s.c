@@ -21,6 +21,7 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 
 #include <stdlib.h>
@@ -64,23 +65,6 @@ static char *k8s_read_file(const char *path, int *out_len) {
     return buf;
 }
 
-/* Format int to string for logging. Thread-safe via TLS. */
-static const char *itoa_k8s(int val) {
-    enum { RING_BUF_COUNT = 4, RING_BUF_MASK = 3 };
-    static CBM_TLS char bufs[RING_BUF_COUNT][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & RING_BUF_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
-
-/* Extract the basename of a path (pointer into the string; no allocation). */
-static const char *k8s_basename(const char *path) {
-    const char *p = strrchr(path, '/');
-    return p ? p + SKIP_ONE : path;
-}
-
 /* ── Kustomize handler ───────────────────────────────────────────── */
 
 static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path) {
@@ -90,7 +74,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
         return;
     }
 
-    int64_t mod_id = cbm_gbuf_upsert_node(ctx->gbuf, "Module", k8s_basename(rel_path), mod_qn,
+    int64_t mod_id = cbm_gbuf_upsert_node(ctx->gbuf, "Module", cbm_path_base(rel_path), mod_qn,
                                           rel_path, SKIP_ONE, 0, "{\"source\":\"kustomize\"}");
     free(mod_qn);
 
@@ -135,7 +119,7 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
         cbm_free_result(res);
     }
 
-    cbm_log_info("pass.k8s.kustomize", "file", rel_path, "imports", itoa_k8s(import_count));
+    cbm_log_info("pass.k8s.kustomize", "file", rel_path, "imports", cbm_log_itoa(import_count));
 }
 
 /* ── K8s cross-manifest label-selector matching ──────────────────────
@@ -351,7 +335,7 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
         }
     }
     if (edges > 0) {
-        cbm_log_info("pass.k8s.selectors", "linked", itoa_k8s(edges));
+        cbm_log_info("pass.k8s.selectors", "linked", cbm_log_itoa(edges));
     }
 }
 
@@ -410,7 +394,7 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
         k8s_scan_labels(source, rec);
     }
 
-    cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", itoa_k8s(resource_count));
+    cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", cbm_log_itoa(resource_count));
 }
 
 /* ── Helm chart handler ──────────────────────────────────────────── */
@@ -427,7 +411,7 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
         return;
     }
 
-    const char *cname = hc.chart_name[0] ? hc.chart_name : k8s_basename(rel_path);
+    const char *cname = hc.chart_name[0] ? hc.chart_name : cbm_path_base(rel_path);
     char *chart_qn = cbm_infra_qn(ctx->project_name, rel_path, "helm-chart", NULL);
     if (!chart_qn) {
         return;
@@ -457,7 +441,7 @@ static void handle_helm_chart(cbm_pipeline_ctx_t *ctx, const char *rel_path, con
             dep_edges++;
         }
     }
-    cbm_log_info("pass.k8s.helm", "file", rel_path, "deps", itoa_k8s(dep_edges));
+    cbm_log_info("pass.k8s.helm", "file", rel_path, "deps", cbm_log_itoa(dep_edges));
 }
 
 /* ── Dependency-manifest handler (go.mod / requirements.txt) ──────── */
@@ -606,13 +590,13 @@ static void handle_dep_manifest(cbm_pipeline_ctx_t *ctx, const char *rel_path, c
     int dep_edges = strcmp(ecosystem, "gomod") == 0
                         ? parse_gomod_deps(ctx, src, rel_path, source)
                         : parse_requirements_deps(ctx, src, rel_path, source);
-    cbm_log_info("pass.k8s.depmanifest", "file", rel_path, "deps", itoa_k8s(dep_edges));
+    cbm_log_info("pass.k8s.depmanifest", "file", rel_path, "deps", cbm_log_itoa(dep_edges));
 }
 
 /* ── Pass entry point ────────────────────────────────────────────── */
 
 int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
-    cbm_log_info("pass.start", "pass", "k8s", "files", itoa_k8s(file_count));
+    cbm_log_info("pass.start", "pass", "k8s", "files", cbm_log_itoa(file_count));
 
     cbm_init();
 
@@ -634,7 +618,7 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
         const char *path = files[i].path;
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
-        const char *base = k8s_basename(rel);
+        const char *base = cbm_path_base(rel);
 
         if (is_gomod_file(base) || lang == CBM_LANG_GOMOD || is_requirements_file(base)) {
             int dep_len = 0;
@@ -675,8 +659,8 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     k8s_link_selectors(ctx, &recs);
     free(recs.items);
 
-    cbm_log_info("pass.done", "pass", "k8s", "kustomize", itoa_k8s(kustomize_count), "manifests",
-                 itoa_k8s(manifest_count));
+    cbm_log_info("pass.done", "pass", "k8s", "kustomize", cbm_log_itoa(kustomize_count),
+                 "manifests", cbm_log_itoa(manifest_count));
     (void)helm_count;
     return 0;
 }

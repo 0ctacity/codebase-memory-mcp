@@ -64,6 +64,15 @@ TEST(path_ext) {
     PASS();
 }
 
+TEST(path_last_dot) {
+    ASSERT_STR_EQ(cbm_path_last_dot("src/main.go"), ".go");
+    ASSERT_STR_EQ(cbm_path_last_dot("a.tar.gz"), ".gz");
+    ASSERT_STR_EQ(cbm_path_last_dot("Makefile"), "");
+    ASSERT_STR_EQ(cbm_path_last_dot("conf.d/Makefile"), ".d/Makefile");
+    ASSERT_STR_EQ(cbm_path_last_dot(NULL), "");
+    PASS();
+}
+
 TEST(path_base) {
     ASSERT_STR_EQ(cbm_path_base("src/main.c"), "main.c");
     ASSERT_STR_EQ(cbm_path_base("main.c"), "main.c");
@@ -488,6 +497,7 @@ SUITE(str_util) {
     RUN_TEST(path_join_empty_name);
     RUN_TEST(path_join_n);
     RUN_TEST(path_ext);
+    RUN_TEST(path_last_dot);
     RUN_TEST(path_base);
     RUN_TEST(path_dir);
     RUN_TEST(str_starts_with);

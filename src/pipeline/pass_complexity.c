@@ -30,17 +30,6 @@
 
 enum { CBM_TLD_MAX_DEPTH = 256 }; /* recursion-depth cap (cycle/stack guard) */
 
-/* Int → string for structured logging (thread-safe ring buffer). */
-static const char *itoa_cx(int val) {
-    enum { RING = 2, MASK = 1 };
-    static CBM_TLS char bufs[RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + 1) & MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
-
 /* Parse an integer "key":N from a flat JSON object. Returns def if absent. */
 static int json_get_int(const char *json, const char *key, int dflt) {
     if (!json) {
@@ -286,7 +275,7 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
         append_complexity_props(ordered[i], tld[id], recursive[id]);
     }
 
-    cbm_log_info("pass.complexity", "functions", itoa_cx(ordered_count));
+    cbm_log_info("pass.complexity", "functions", cbm_log_itoa(ordered_count));
 
     free(ordered);
     free(loop_depth);

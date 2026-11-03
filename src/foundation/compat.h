@@ -17,11 +17,20 @@
  * it those calls become implicit declarations that conflict with the real
  * stdlib.h types and fail to compile on native ARM64 Windows. */
 #include <stdlib.h>
+#include <string.h>
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).
  * __declspec(thread) is MSVC-only and doesn't work on MinGW GCC. */
 #define CBM_TLS _Thread_local
+
+/* ── intptr_t to pointer ──────────────────────────────────────── */
+/* Convert intptr_t to void* without triggering performance-no-int-to-ptr. */
+static inline void *cbm_intptr_to_ptr(intptr_t v) {
+    void *p;
+    memcpy(&p, &v, sizeof(p));
+    return p;
+}
 
 /* ── Sleep ────────────────────────────────────────────────────── */
 #ifdef _WIN32
@@ -44,6 +53,9 @@ char *cbm_strndup(const char *s, size_t n);
 #define cbm_strdup strdup
 #define cbm_strndup strndup
 #endif
+
+/* Duplicate a string onto the heap. Returns NULL for NULL. Implemented in compat.c */
+char *cbm_heap_strdup(const char *s);
 
 /* ── getline (Windows lacks it) ───────────────────────────────── */
 #ifdef _WIN32
@@ -105,6 +117,9 @@ static inline int cbm_nanosleep(const struct timespec *req, struct timespec *rem
 #define cbm_clock_gettime clock_gettime
 #define cbm_nanosleep nanosleep
 #endif
+
+/* Milliseconds elapsed on CLOCK_MONOTONIC since start. Implemented in compat.c */
+double cbm_elapsed_ms(struct timespec start);
 
 /* Per-CALLING-THREAD CPU time in nanoseconds. Unlike cbm_clock_gettime, which
  * measures wall time on every platform (QueryPerformanceCounter on Windows),

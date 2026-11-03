@@ -12,8 +12,6 @@
 #include "foundation/constants.h"
 
 enum {
-    PT_RING = 4,
-    PT_RING_MASK = 3,
     PT_TEST_LEN = 4,      /* strlen("Test") */
     PT_DESCRIBE_LEN = 9,  /* strlen("Describe") + 1... actually strlen("describe_") */
     PT_CONTEXT_LEN = 7,   /* strlen("context") */
@@ -34,15 +32,6 @@ enum {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[PT_RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & PT_RING_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
 
 /* Check if a node has is_test:true in its properties JSON. */
 static bool node_is_test(const cbm_gbuf_node_t *n) {
@@ -291,7 +280,7 @@ int cbm_pipeline_pass_tests(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     int tests_count = create_tests_edges(ctx);
     int tests_file_count = create_tests_file_edges(ctx);
 
-    cbm_log_info("pass.done", "pass", "tests", "tests", itoa_log(tests_count), "tests_file",
-                 itoa_log(tests_file_count));
+    cbm_log_info("pass.done", "pass", "tests", "tests", cbm_log_itoa(tests_count), "tests_file",
+                 cbm_log_itoa(tests_file_count));
     return 0;
 }

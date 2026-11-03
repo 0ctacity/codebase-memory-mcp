@@ -221,19 +221,6 @@ static const char *safe_props(const char *s) {
     return (s && s[0]) ? s : "{}";
 }
 
-/* Duplicate a string onto the heap. */
-static char *heap_strdup(const char *s) {
-    if (!s) {
-        return NULL;
-    }
-    size_t len = strlen(s);
-    char *d = malloc(len + SKIP_ONE);
-    if (d) {
-        memcpy(d, s, len + SKIP_ONE);
-    }
-    return d;
-}
-
 /* Prepare a statement (cached). If already prepared, reset+clear. */
 static sqlite3_stmt *prepare_cached(cbm_store_t *s, sqlite3_stmt **slot, const char *sql) {
     if (!s || !s->db) {
@@ -671,7 +658,7 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     }
 
     if (path && !in_memory) {
-        s->db_path = heap_strdup(path);
+        s->db_path = cbm_heap_strdup(path);
     }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection.
@@ -844,7 +831,7 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         }
     }
 
-    s->db_path = heap_strdup(db_path);
+    s->db_path = cbm_heap_strdup(db_path);
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -1130,9 +1117,9 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
     bind_text(stmt, SKIP_ONE, name);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        out->name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        out->indexed_at = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        out->root_path = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
@@ -1157,9 +1144,9 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_project_t));
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].indexed_at = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].root_path = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
         n++;
     }
     if (scan_rc1 != SQLITE_DONE) { /* SCANCHK:1:stmt */
@@ -1229,14 +1216,14 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
 /* Scan a node from current row of stmt. Heap-allocates strings. */
 static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
     n->id = sqlite3_column_int64(stmt, 0);
-    n->project = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-    n->label = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
-    n->name = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_3));
-    n->qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
-    n->file_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_5));
+    n->project = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+    n->label = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+    n->name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_3));
+    n->qualified_name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+    n->file_path = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_5));
     n->start_line = sqlite3_column_int(stmt, CBM_SZ_6);
     n->end_line = sqlite3_column_int(stmt, CBM_SZ_7);
-    n->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
+    n->properties_json = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
 }
 
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
@@ -1681,9 +1668,9 @@ int cbm_store_get_file_outline(cbm_store_t *s, const char *project, const char *
     rc = page && !rows ? CBM_STORE_ERR : CBM_STORE_OK;
     for (int i = 0; rc == CBM_STORE_OK && i < page; i++) {
         const cbm_node_t *n = kept[first + i];
-        rows[i].name = heap_strdup(n->name ? n->name : "");
-        rows[i].label = heap_strdup(n->label ? n->label : "");
-        rows[i].qualified_name = heap_strdup(n->qualified_name ? n->qualified_name : "");
+        rows[i].name = cbm_heap_strdup(n->name ? n->name : "");
+        rows[i].label = cbm_heap_strdup(n->label ? n->label : "");
+        rows[i].qualified_name = cbm_heap_strdup(n->qualified_name ? n->qualified_name : "");
         rows[i].start_line = n->start_line;
         rows[i].end_line = n->end_line;
         if (!rows[i].name || !rows[i].label || !rows[i].qualified_name) {
@@ -1965,7 +1952,9 @@ static int store_legacy_scope(cbm_store_t *s, const char **project) {
             row.name, s->zova_graph_workspace_id);
         int rc = sql ? sqlite3_exec(s->db, sql, NULL, NULL, NULL) : SQLITE_NOMEM;
         sqlite3_free(sql);
-        if (rc == SQLITE_OK) s->zova_legacy_project = heap_strdup(row.name);
+        if (rc == SQLITE_OK) {
+            s->zova_legacy_project = cbm_heap_strdup(row.name);
+        }
         cbm_project_free_fields(&row);
         if (!s->zova_legacy_project) {
             store_set_error_sqlite(s, "zova legacy nodes");
@@ -2189,11 +2178,11 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
 /* Scan an edge from current row of stmt. */
 static void scan_edge(sqlite3_stmt *stmt, cbm_edge_t *e) {
     e->id = sqlite3_column_int64(stmt, 0);
-    e->project = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+    e->project = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
     e->source_id = sqlite3_column_int64(stmt, CBM_SZ_2);
     e->target_id = sqlite3_column_int64(stmt, CBM_SZ_3);
-    e->type = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
-    e->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_5));
+    e->type = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+    e->properties_json = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_5));
 }
 
 /* Generic: find multiple edges by a filter. */
@@ -2514,9 +2503,9 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_file_hash_t));
         }
-        arr[n].project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].sha256 = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].project = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].rel_path = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].sha256 = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
         arr[n].mtime_ns = sqlite3_column_int64(stmt, CBM_SZ_3);
         arr[n].size = sqlite3_column_int64(stmt, CBM_SZ_4);
         n++;
@@ -2815,7 +2804,7 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
             cap *= ST_GROWTH;
             files = safe_realloc(files, cap * sizeof(char *));
         }
-        files[n++] = heap_strdup(fp);
+        files[n++] = cbm_heap_strdup(fp);
     }
     if (scan_rc9 != SQLITE_DONE) { /* SCANCHK:9:stmt */
         store_set_error_sqlite(s, "row scan aborted");
@@ -2909,7 +2898,7 @@ static int store_zova_neighbor_names(cbm_store_t *s, const char *stable_id, bool
         const char *name =
             sqlite3_step(stmt) == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
         if (name) {
-            names[count++] = heap_strdup(name);
+            names[count++] = cbm_heap_strdup(name);
         }
     }
     sqlite3_finalize(stmt);
@@ -3755,13 +3744,14 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
             ecap *= ST_GROWTH;
             edges = safe_realloc(edges, ecap * sizeof(cbm_edge_info_t));
         }
-        edges[en].from_name = heap_strdup((const char *)sqlite3_column_text(estmt, 0));
-        edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
-        edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_2));
+        edges[en].from_name = cbm_heap_strdup((const char *)sqlite3_column_text(estmt, 0));
+        edges[en].to_name = cbm_heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
+        edges[en].type = cbm_heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_2));
         edges[en].confidence = (double)SKIP_ONE;
         edges[en].source_id = sqlite3_column_int64(estmt, ST_COL_3);
         edges[en].target_id = sqlite3_column_int64(estmt, ST_COL_4);
-        edges[en].properties_json = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_5));
+        edges[en].properties_json =
+            cbm_heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_5));
         en++;
     }
     if (scan_rc14 != SQLITE_DONE) { /* SCANCHK:14:estmt */
@@ -3851,7 +3841,7 @@ static int store_zova_workspace_bfs(cbm_store_t *s, int64_t start_id, const char
     if (count && !items) { cbm_zova_graph_visits_free(visits, count); return CBM_STORE_ERR; }
     for (int i = 0; i < count; ++i) {
         items[i].node.id = store_stable_numeric_id(visits[i].node_id);
-        items[i].node.project = heap_strdup(out->root.project ? out->root.project : "");
+        items[i].node.project = cbm_heap_strdup(out->root.project ? out->root.project : "");
         items[i].node.label = visits[i].label; visits[i].label = NULL;
         items[i].node.name = visits[i].name; visits[i].name = NULL;
         items[i].node.qualified_name = visits[i].qualified_name; visits[i].qualified_name = NULL;
@@ -3958,8 +3948,8 @@ static int store_zova_workspace_bfs_typed(cbm_store_t *s, int64_t start_id,
         if ((si < 0 && seen[e].source_id != start_id) ||
             (ti < 0 && seen[e].target_id != start_id)) continue;
         cbm_edge_info_t *info = &infos[info_count++];
-        info->from_name = heap_strdup(si < 0 ? out->root.name : hops[si].node.name);
-        info->to_name = heap_strdup(ti < 0 ? out->root.name : hops[ti].node.name);
+        info->from_name = cbm_heap_strdup(si < 0 ? out->root.name : hops[si].node.name);
+        info->to_name = cbm_heap_strdup(ti < 0 ? out->root.name : hops[ti].node.name);
         info->type = seen[e].type;
         seen[e].type = NULL;
         info->confidence = (double)SKIP_ONE;
@@ -4280,12 +4270,12 @@ int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
         if (prior >= 0) {
             const cbm_node_t *p = &hops[prior].node;
             node = *p;
-            node.project = heap_strdup(p->project);
-            node.label = heap_strdup(p->label);
-            node.name = heap_strdup(p->name);
-            node.qualified_name = heap_strdup(p->qualified_name);
-            node.file_path = heap_strdup(p->file_path);
-            node.properties_json = heap_strdup(p->properties_json);
+            node.project = cbm_heap_strdup(p->project);
+            node.label = cbm_heap_strdup(p->label);
+            node.name = cbm_heap_strdup(p->name);
+            node.qualified_name = cbm_heap_strdup(p->qualified_name);
+            node.file_path = cbm_heap_strdup(p->file_path);
+            node.properties_json = cbm_heap_strdup(p->properties_json);
         }
         int hop = hops[i].hop;
         hops[kept].node = node;
@@ -4448,7 +4438,7 @@ static void schema_discover_props(sqlite3 *db, const char *sql, const char *proj
     int pn = 0;
 
     for (int b = 0; b < base_col_count; b++) {
-        props[pn++] = heap_strdup(base_cols[b]);
+        props[pn++] = cbm_heap_strdup(base_cols[b]);
     }
 
     sqlite3_stmt *pstmt = NULL;
@@ -4456,7 +4446,7 @@ static void schema_discover_props(sqlite3 *db, const char *sql, const char *proj
         bind_text(pstmt, SKIP_ONE, project);
         bind_text(pstmt, PAIR_LEN, filter);
         while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
-            props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+            props[pn++] = cbm_heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
         }
         sqlite3_finalize(pstmt);
     }
@@ -4621,7 +4611,7 @@ static int store_zova_edge_type_counts(cbm_store_t *s, bool scoped, const int64_
         if (counts[t] == 0) {
             continue;
         }
-        arr[n].type = heap_strdup(s->zova_edge_types[t]);
+        arr[n].type = cbm_heap_strdup(s->zova_edge_types[t]);
         arr[n].count = counts[t];
         if (!arr[n].type) {
             for (int i = 0; i < n; i++) {
@@ -4692,7 +4682,7 @@ static int store_edge_keys_visit(int64_t source_key, int64_t target_key, const c
                 context->keys[t] = grown;
                 context->key_caps[t] = cap;
             }
-            char *copy = heap_strdup(k);
+            char *copy = cbm_heap_strdup(k);
             if (!copy) {
                 context->failed = true;
                 break;
@@ -4739,7 +4729,7 @@ static int store_zova_edge_property_keys(cbm_store_t *s, cbm_schema_info_t *sche
             if (props) {
                 int pn = 0;
                 for (int b = 0; b < base_col_count; b++) {
-                    props[pn++] = heap_strdup(base_cols[b]);
+                    props[pn++] = cbm_heap_strdup(base_cols[b]);
                 }
                 for (int k = 0; k < take; k++) {
                     props[pn++] = keys[k];
@@ -4896,7 +4886,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                 arr = tmp;
                 cap = new_cap;
             }
-            arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+            arr[n].label = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
             arr[n].properties = NULL;
             arr[n].property_count = 0;
@@ -4978,7 +4968,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                 arr = tmp;
                 cap = new_cap;
             }
-            arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+            arr[n].type = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
             arr[n].properties = NULL;
             arr[n].property_count = 0;
@@ -5087,7 +5077,7 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
                 arr = tmp;
                 cap = new_cap;
             }
-            arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+            arr[n].label = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
             arr[n].properties = NULL;
             arr[n].property_count = 0;
@@ -5162,7 +5152,7 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
                 arr = tmp;
                 cap = new_cap;
             }
-            arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+            arr[n].type = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
             arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
             arr[n].properties = NULL;
             arr[n].property_count = 0;
@@ -5330,13 +5320,10 @@ static const char *ext_to_lang(const char *ext) {
     return NULL;
 }
 
-/* Get lowercase file extension from path */
-static const char *file_ext(const char *path) {
-    if (!path) {
-        return NULL;
-    }
-    const char *dot = strrchr(path, '.');
-    if (!dot) {
+/* Get lowercase file extension from path, dot included. NULL if none or too long. */
+static const char *file_ext_lower(const char *path) {
+    const char *dot = cbm_path_last_dot(path);
+    if (!dot[0]) {
         return NULL;
     }
     static CBM_TLS char buf[CBM_SZ_16];
@@ -5383,7 +5370,7 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
     int scan_rc20;
     while ((scan_rc20 = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *fp = (const char *)sqlite3_column_text(stmt, 0);
-        const char *ext = file_ext(fp);
+        const char *ext = file_ext_lower(fp);
         const char *lang = ext_to_lang(ext);
         if (!lang) {
             continue;
@@ -5430,7 +5417,7 @@ static int arch_languages(cbm_store_t *s, const char *project, const char *path,
     out->languages = (nlang > 0) ? calloc(nlang, sizeof(cbm_language_count_t)) : NULL;
     out->language_count = nlang;
     for (int i = 0; i < nlang; i++) {
-        out->languages[i].language = heap_strdup(lang_names[i]);
+        out->languages[i].language = cbm_heap_strdup(lang_names[i]);
         out->languages[i].file_count = lang_counts[i];
     }
     return CBM_STORE_OK;
@@ -5471,9 +5458,9 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_entry_point_t));
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].file = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].qualified_name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].file = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
         n++;
     }
     if (scan_rc21 != SQLITE_DONE) { /* SCANCHK:21:stmt */
@@ -5510,7 +5497,7 @@ static char *extract_json_string_prop(const char *json, const char *key, int key
     char vbuf[CBM_SZ_256];
     memcpy(vbuf, m, end - m);
     vbuf[end - m] = '\0';
-    return heap_strdup(vbuf);
+    return cbm_heap_strdup(vbuf);
 }
 
 static int arch_routes(cbm_store_t *s, const char *project, const char *path,
@@ -5554,9 +5541,9 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
             arr = safe_realloc(arr, cap * sizeof(cbm_route_info_t));
         }
 
-        arr[n].method = heap_strdup("");
-        arr[n].path = heap_strdup(name);
-        arr[n].handler = heap_strdup("");
+        arr[n].method = cbm_heap_strdup("");
+        arr[n].path = cbm_heap_strdup(name);
+        arr[n].handler = cbm_heap_strdup("");
 
         char *val;
         val = extract_json_string_prop(props, "\"method\"", ST_METHOD_PROP_LEN);
@@ -5727,8 +5714,8 @@ static int arch_hotspots_zova(cbm_store_t *s, const char *project, const char *n
             at--;
         }
         arr[at] = (cbm_hotspot_t){
-            .name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE)),
-            .qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2)),
+            .name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE)),
+            .qualified_name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2)),
             .fan_in = fan_in,
         };
     }
@@ -5787,8 +5774,8 @@ static int arch_hotspots(cbm_store_t *s, const char *project, const char *path,
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_hotspot_t));
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].qualified_name = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].qualified_name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         arr[n].fan_in = sqlite3_column_int(stmt, CBM_SZ_2);
         n++;
     }
@@ -5839,8 +5826,8 @@ static void accum_boundary(const char *src_pkg, const char *tgt_pkg, char **bfro
     if (found >= 0) {
         bcounts[found]++;
     } else if (*bn < bcap) {
-        bfroms[*bn] = heap_strdup(src_pkg);
-        btos[*bn] = heap_strdup(tgt_pkg);
+        bfroms[*bn] = cbm_heap_strdup(src_pkg);
+        btos[*bn] = cbm_heap_strdup(tgt_pkg);
         bcounts[*bn] = SKIP_ONE;
         (*bn)++;
     }
@@ -5885,7 +5872,7 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         int64_t nid = sqlite3_column_int64(nstmt, 0);
         nids[nn] = nid;
         const char *qn = (const char *)sqlite3_column_text(nstmt, SKIP_ONE);
-        npkgs[nn] = heap_strdup(cbm_qn_to_package(qn));
+        npkgs[nn] = cbm_heap_strdup(cbm_qn_to_package(qn));
         nn++;
     }
     if (scan_rc24 != SQLITE_DONE) { /* SCANCHK:24:nstmt */
@@ -6020,7 +6007,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         if (found >= 0) {
             pcounts[found]++;
         } else if (np < CBM_SZ_64) {
-            pnames[np] = heap_strdup(pkg);
+            pnames[np] = cbm_heap_strdup(pkg);
             pcounts[np] = SKIP_ONE;
             np++;
         }
@@ -6100,7 +6087,7 @@ static int arch_packages(cbm_store_t *s, const char *project, const char *path,
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_package_summary_t));
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].name = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         arr[n].node_count = sqlite3_column_int(stmt, SKIP_ONE);
         n++;
     }
@@ -6171,7 +6158,7 @@ static int find_or_add_pkg(char **all_pkgs, int *npkgs, int max_pkgs, const char
     }
     if (*npkgs < max_pkgs) {
         int idx = *npkgs;
-        all_pkgs[idx] = heap_strdup(pkg);
+        all_pkgs[idx] = cbm_heap_strdup(pkg);
         (*npkgs)++;
         return idx;
     }
@@ -6214,7 +6201,7 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
     int count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW && count < max_pkgs) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
-        pkgs[count++] = heap_strdup(cbm_qn_to_package(qn));
+        pkgs[count++] = cbm_heap_strdup(cbm_qn_to_package(qn));
     }
     sqlite3_finalize(stmt);
     return count;
@@ -6279,8 +6266,8 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
         const char *reason;
         classify_layer(all_pkgs[i], fan_in[i], fan_out[i], has_route, has_entry, &layer, &reason);
         out->layers[i].name = all_pkgs[i]; /* transfer ownership */
-        out->layers[i].layer = heap_strdup(layer);
-        out->layers[i].reason = heap_strdup(reason);
+        out->layers[i].layer = cbm_heap_strdup(layer);
+        out->layers[i].reason = cbm_heap_strdup(reason);
     }
 
     /* Sort layers by name */
@@ -6321,7 +6308,7 @@ static void dir_add_child(char ***children, int *child_count, int *child_cap, co
         *child_cap = *child_cap ? *child_cap * PAIR_LEN : ST_INIT_CAP_4;
         *children = realloc(*children, *child_cap * sizeof(char *));
     }
-    (*children)[(*child_count)++] = heap_strdup(child);
+    (*children)[(*child_count)++] = cbm_heap_strdup(child);
 }
 
 /* Find or create a directory entry by path. Returns its index, or -1 if full. */
@@ -6334,7 +6321,7 @@ static int dir_find_or_create(char **dir_paths, int *dir_child_counts, char ***d
     }
     if (*dn < dcap) {
         int idx = *dn;
-        dir_paths[idx] = heap_strdup(dir);
+        dir_paths[idx] = cbm_heap_strdup(dir);
         dir_child_counts[idx] = 0;
         dir_children[idx] = NULL;
         dir_children_caps[idx] = 0;
@@ -6349,7 +6336,7 @@ static cbm_file_tree_entry_t make_tree_entry(const char *path, char **files, int
                                              char **dir_paths, const int *dir_child_counts,
                                              int dn) {
     cbm_file_tree_entry_t e = {0};
-    e.path = heap_strdup(path);
+    e.path = cbm_heap_strdup(path);
     bool is_file = false;
     for (int f = 0; f < fn; f++) {
         if (strcmp(files[f], path) == 0) {
@@ -6357,7 +6344,7 @@ static cbm_file_tree_entry_t make_tree_entry(const char *path, char **files, int
             break;
         }
     }
-    e.type = heap_strdup(is_file ? "file" : "dir");
+    e.type = cbm_heap_strdup(is_file ? "file" : "dir");
     for (int d = 0; d < dn; d++) {
         if (strcmp(dir_paths[d], path) == 0) {
             e.children = dir_child_counts[d];
@@ -6550,7 +6537,7 @@ static int arch_file_tree(cbm_store_t *s, const char *project, const char *path,
             fcap *= ST_GROWTH;
             files = safe_realloc(files, fcap * sizeof(char *));
         }
-        files[fn++] = heap_strdup(fp);
+        files[fn++] = cbm_heap_strdup(fp);
         arch_register_file_dirs(fp, dir_paths, dir_child_counts, dir_children, dir_children_caps,
                                 &dn, dcap);
     }
@@ -7150,7 +7137,7 @@ static void cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap,
         }
     }
     if (*count < cap) {
-        pkgs[*count] = heap_strdup(pkg);
+        pkgs[*count] = cbm_heap_strdup(pkg);
         counts[*count] = 1;
         (*count)++;
     }
@@ -7194,7 +7181,7 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
     if (tn > 0) {
         ci->top_nodes = malloc((size_t)tn * sizeof(char *));
         for (int i = 0; i < tn; i++) {
-            ci->top_nodes[i] = heap_strdup(names[top_idx[i]]);
+            ci->top_nodes[i] = cbm_heap_strdup(names[top_idx[i]]);
         }
         ci->top_node_count = tn;
     }
@@ -7213,23 +7200,23 @@ static void cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *c
         ci->packages = malloc((size_t)pc * sizeof(char *));
         int best = 0;
         for (int i = 0; i < pc; i++) {
-            ci->packages[i] = heap_strdup(pkgs[i]);
+            ci->packages[i] = cbm_heap_strdup(pkgs[i]);
             if (pkg_counts[i] > pkg_counts[best]) {
                 best = i;
             }
         }
         ci->package_count = pc;
-        ci->label = heap_strdup(pkgs[best]);
+        ci->label = cbm_heap_strdup(pkgs[best]);
         for (int i = 0; i < pc; i++) {
             safe_str_free(&pkgs[i]);
         }
     }
     if (!ci->label) {
-        ci->label = heap_strdup(ci->top_node_count > 0 ? ci->top_nodes[0] : "cluster");
+        ci->label = cbm_heap_strdup(ci->top_node_count > 0 ? ci->top_nodes[0] : "cluster");
     }
 
     ci->edge_types = malloc(sizeof(char *));
-    ci->edge_types[0] = heap_strdup("CALLS");
+    ci->edge_types[0] = cbm_heap_strdup("CALLS");
     ci->edge_type_count = 1;
 }
 
@@ -7283,8 +7270,8 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             qns = safe_realloc(qns, (size_t)cap * sizeof(char *));
         }
         ids[n] = sqlite3_column_int64(st, 0);
-        names[n] = heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
-        qns[n] = heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
+        names[n] = cbm_heap_strdup((const char *)sqlite3_column_text(st, SKIP_ONE));
+        qns[n] = cbm_heap_strdup((const char *)sqlite3_column_text(st, CBM_SZ_2));
         n++;
     }
     if (scan_rc29 != SQLITE_DONE) { /* SCANCHK:29:st */
@@ -7619,10 +7606,10 @@ int cbm_store_project_summary_export(cbm_store_t *s, const char *project,
         store_set_error_sqlite(s, "project_summary_export_step");
         return CBM_STORE_ERR;
     }
-    out->summary = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-    out->source_hash = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
-    out->created_at = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
-    out->updated_at = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+    out->summary = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->source_hash = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 1));
+    out->created_at = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+    out->updated_at = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 3));
     sqlite3_finalize(stmt);
     if (!out->summary || !out->source_hash || !out->created_at || !out->updated_at) {
         cbm_store_project_summary_export_free(out);
@@ -7665,7 +7652,7 @@ int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char *
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(char *));
         }
-        arr[n++] = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n++] = cbm_heap_strdup((const char *)sqlite3_column_text(stmt, 0));
     }
     if (scan_rc31 != SQLITE_DONE) { /* SCANCHK:31:stmt */
         store_set_error_sqlite(s, "row scan aborted");
@@ -8101,7 +8088,7 @@ static cbm_zova_vector_session_t *vs_get_zova_vector_session(cbm_store_t *s,
     }
     store_close_zova_vector_session(s);
     cbm_zova_vector_session_t *session = cbm_zova_vector_session_open(zova_path);
-    char *path_copy = session ? heap_strdup(zova_path) : NULL;
+    char *path_copy = session ? cbm_heap_strdup(zova_path) : NULL;
     if (!session || !path_copy) {
         cbm_zova_vector_session_close(session);
         return NULL;

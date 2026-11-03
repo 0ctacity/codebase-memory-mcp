@@ -13,8 +13,7 @@
 #include "foundation/constants.h"
 
 enum {
-    PP_RING = 4,
-    PP_RING_MASK = 3,
+    PP_RESOLVE_COUNTERS = 5, /* int fields of resolve_worker_state_t */
     PP_JSON_MARGIN = 10,
     PP_ESC_MARGIN = 3,
     PP_ESC_SPACE = 2,
@@ -341,15 +340,6 @@ static void pp_err_add(pp_err_list_t *list, const char *path, const char *reason
 /* Free source buffer. */
 static void free_source(char *buf) {
     free(buf);
-}
-
-static const char *itoa_log(int val) {
-    static CBM_TLS char bufs[PP_RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & PP_RING_MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
 }
 
 /* Append a JSON-escaped string value to buf at position *pos. */
@@ -818,15 +808,15 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_stem_mark
 
 static void log_extract_fail(int pos, uint64_t ms, const char *path) {
     if (pos < PP_LOG_THRESH) {
-        cbm_log_warn("parallel.extract.file.fail", "pos", itoa_log(pos), "elapsed_ms",
-                     itoa_log((int)ms), "path", path);
+        cbm_log_warn("parallel.extract.file.fail", "pos", cbm_log_itoa(pos), "elapsed_ms",
+                     cbm_log_itoa((int)ms), "path", path);
     }
 }
 
 static void log_extract_done(int pos, uint64_t ms, int defs, const char *path) {
     if (pos < PP_LOG_THRESH || ms > PP_TIMER_THRESH) {
-        cbm_log_info("parallel.extract.file.done", "pos", itoa_log(pos), "elapsed_ms",
-                     itoa_log((int)ms), "defs", itoa_log(defs), "path", path);
+        cbm_log_info("parallel.extract.file.done", "pos", cbm_log_itoa(pos), "elapsed_ms",
+                     cbm_log_itoa((int)ms), "defs", cbm_log_itoa(defs), "path", path);
     }
 }
 
@@ -855,8 +845,8 @@ static bool pp_backpressure_cycle_still_over(extract_ctx_t *ec) {
 static void pp_fail_whole_over_budget(extract_ctx_t *ec) {
     if (atomic_exchange_explicit(&ec->over_budget_abort, 1, memory_order_relaxed) == 0) {
         cbm_log_error("mem.budget.exceeded", "rss_mb",
-                      itoa_log((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
-                      itoa_log((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
+                      cbm_log_itoa((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
+                      cbm_log_itoa((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
                       "parallel_extract", "action", "fail_whole");
     }
 }
@@ -888,8 +878,8 @@ static void pp_spill_backlog(extract_ctx_t *ec, int worker_id) {
 static void pp_backpressure_futile(extract_ctx_t *ec, int worker_id) {
     if (ec->spill && atomic_exchange_explicit(&ec->spilling, 1, memory_order_relaxed) == 0) {
         cbm_log_warn("mem.spill.engaged", "rss_mb",
-                     itoa_log((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
-                     itoa_log((int)(cbm_mem_budget() / (1024 * 1024))));
+                     cbm_log_itoa((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
+                     cbm_log_itoa((int)(cbm_mem_budget() / (1024 * 1024))));
         pp_spill_backlog(ec, worker_id);
         atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
         return;
@@ -1009,8 +999,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 if (atomic_fetch_add_explicit(&ec->oversized_warned, SKIP_ONE,
                                               memory_order_relaxed) < PP_OVERSIZED_WARN_MAX) {
                     cbm_log_warn("index.file_oversized", "path", fi->rel_path, "size_mb",
-                                 itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
-                                 itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
+                                 cbm_log_itoa((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
+                                 cbm_log_itoa((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
                 }
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 pp_err_add(errs, fi->rel_path, "read failed", "read");
@@ -1022,8 +1012,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Per-file start log: shows which file each worker is processing.
          * Critical for diagnosing stuck workers on large vendored files. */
         if (sort_pos < PP_LOG_THRESH) { /* first 2 rounds of workers = most interesting */
-            cbm_log_info("parallel.extract.file.start", "pos", itoa_log(sort_pos), "size_kb",
-                         itoa_log(source_len / CBM_SZ_1K), "path", fi->rel_path);
+            cbm_log_info("parallel.extract.file.start", "pos", cbm_log_itoa(sort_pos), "size_kb",
+                         cbm_log_itoa(source_len / CBM_SZ_1K), "path", fi->rel_path);
         }
 
         uint64_t file_t0 = extract_now_ns();
@@ -1116,7 +1106,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             if (dropped &&
                 atomic_exchange_explicit(&ec->retain_cap_warned, 1, memory_order_relaxed) == 0) {
                 cbm_log_warn("index.retain_capped", "path", fi->rel_path ? fi->rel_path : "?",
-                             "bytes", itoa_log((int)source_len));
+                             "bytes", cbm_log_itoa((int)source_len));
             }
         }
 
@@ -1136,8 +1126,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         /* Progress logging: log every 10 files (atomic read, no contention) */
         if ((sort_pos + SKIP_ONE) % PP_LOG_INTERVAL == 0 || sort_pos + SKIP_ONE == ec->file_count) {
-            cbm_log_info("parallel.extract.progress", "done", itoa_log(sort_pos + SKIP_ONE),
-                         "total", itoa_log(ec->file_count));
+            cbm_log_info("parallel.extract.progress", "done", cbm_log_itoa(sort_pos + SKIP_ONE),
+                         "total", cbm_log_itoa(ec->file_count));
         }
 
         /* Reclaim all slab + tier2 memory between files.
@@ -1183,10 +1173,10 @@ static void merge_pkg_entries(cbm_pipeline_ctx_t *ctx, cbm_pkg_entries_t *pkg_en
 static void log_extract_mem_stats(int worker_count) {
     if (cbm_mem_budget() > 0) {
         size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
-        cbm_log_info("parallel.extract.mem", "rss_mb", itoa_log((int)(cbm_mem_rss() / mb)),
-                     "peak_mb", itoa_log((int)(cbm_mem_peak_rss() / mb)), "budget_mb",
-                     itoa_log((int)(cbm_mem_budget() / mb)), "per_worker_mb",
-                     itoa_log((int)(cbm_mem_worker_budget(worker_count) / mb)));
+        cbm_log_info("parallel.extract.mem", "rss_mb", cbm_log_itoa((int)(cbm_mem_rss() / mb)),
+                     "peak_mb", cbm_log_itoa((int)(cbm_mem_peak_rss() / mb)), "budget_mb",
+                     cbm_log_itoa((int)(cbm_mem_budget() / mb)), "per_worker_mb",
+                     cbm_log_itoa((int)(cbm_mem_worker_budget(worker_count) / mb)));
     }
 }
 
@@ -1199,23 +1189,24 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         return 0;
     }
 
-    cbm_log_info("parallel.extract.start", "files", itoa_log(file_count), "workers",
-                 itoa_log(worker_count));
+    cbm_log_info("parallel.extract.start", "files", cbm_log_itoa(file_count), "workers",
+                 cbm_log_itoa(worker_count));
     {
         size_t mb = (size_t)CBM_SZ_1K * CBM_SZ_1K;
         cbm_log_info("parallel.extract.retention", "retain_sources",
                      resolved_opts.retain_sources ? "true" : "false", "total_mb",
-                     itoa_log((int)(resolved_opts.retain_total_budget_bytes / mb)), "per_file_mb",
-                     itoa_log((int)(resolved_opts.retain_per_file_max_bytes / mb)));
+                     cbm_log_itoa((int)(resolved_opts.retain_total_budget_bytes / mb)),
+                     "per_file_mb",
+                     cbm_log_itoa((int)(resolved_opts.retain_per_file_max_bytes / mb)));
     }
 
     /* Log per-worker memory budget */
     if (cbm_mem_budget() > 0) {
         size_t worker_budget = cbm_mem_worker_budget(worker_count);
         cbm_log_info("parallel.mem.budget", "total_mb",
-                     itoa_log((int)(cbm_mem_budget() / ((size_t)CBM_SZ_1K * CBM_SZ_1K))),
+                     cbm_log_itoa((int)(cbm_mem_budget() / ((size_t)CBM_SZ_1K * CBM_SZ_1K))),
                      "per_worker_mb",
-                     itoa_log((int)(worker_budget / ((size_t)CBM_SZ_1K * CBM_SZ_1K))));
+                     cbm_log_itoa((int)(worker_budget / ((size_t)CBM_SZ_1K * CBM_SZ_1K))));
     }
 
     /* Sub-phase: Ensure extraction library is initialized */
@@ -1351,8 +1342,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     log_extract_mem_stats(worker_count);
 
-    cbm_log_info("parallel.extract.done", "nodes", itoa_log(total_nodes), "errors",
-                 itoa_log(total_errors));
+    cbm_log_info("parallel.extract.done", "nodes", cbm_log_itoa(total_nodes), "errors",
+                 cbm_log_itoa(total_errors));
     return 0;
 }
 
@@ -1522,7 +1513,7 @@ static void create_env_configures(cbm_pipeline_ctx_t *ctx, const CBMFileResult *
 
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache) {
-    cbm_log_info("parallel.registry.start", "files", itoa_log(file_count));
+    cbm_log_info("parallel.registry.start", "files", cbm_log_itoa(file_count));
 
     int reg_entries = 0;
     int defines_edges = 0;
@@ -1569,8 +1560,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
     cbm_pipeline_namespace_map_free(namespace_map);
 
-    cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
-                 itoa_log(defines_edges), "imports", itoa_log(imports_edges));
+    cbm_log_info("parallel.registry.done", "entries", cbm_log_itoa(reg_entries), "defines",
+                 cbm_log_itoa(defines_edges), "imports", cbm_log_itoa(imports_edges));
     return 0;
 }
 
@@ -1587,7 +1578,7 @@ typedef struct __attribute__((aligned(CBM_CACHE_LINE))) {
      * registry's textual matcher. Surfaced in the parallel.resolve.done
      * log line so divergence between pipelines becomes observable. */
     int lsp_overrides;
-    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - ((PP_RING + 1) * sizeof(int))];
+    char _pad[CBM_CACHE_LINE - sizeof(cbm_gbuf_t *) - (PP_RESOLVE_COUNTERS * sizeof(int))];
 } resolve_worker_state_t;
 
 typedef struct {
@@ -3397,7 +3388,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                 uint64_t lsp_elapsed_ms = lsp_elapsed_ns / PP_USEC_PER_MS;
                 if (lsp_elapsed_ms > PP_TIMER_THRESH) {
                     cbm_log_info("parallel.resolve.lsp_cross.slow", "elapsed_ms",
-                                 itoa_log((int)lsp_elapsed_ms), "path", rel);
+                                 cbm_log_itoa((int)lsp_elapsed_ms), "path", rel);
                 }
                 atomic_fetch_add_explicit(&rc->lsp_cross_processed, SKIP_ONE, memory_order_relaxed);
             } else {
@@ -3485,8 +3476,8 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
         return 0;
     }
 
-    cbm_log_info("parallel.resolve.start", "files", itoa_log(file_count), "workers",
-                 itoa_log(worker_count));
+    cbm_log_info("parallel.resolve.start", "files", cbm_log_itoa(file_count), "workers",
+                 cbm_log_itoa(worker_count));
 
     resolve_worker_state_t *workers = NULL;
     if (cbm_aligned_alloc((void **)&workers, CBM_CACHE_LINE,
@@ -3611,10 +3602,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
      * were not retained at extract time due to the per-file/total cap). */
     cbm_log_info(
         "parallel.resolve.lsp_cross_done", "files_processed",
-        itoa_log(atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed)),
+        cbm_log_itoa(atomic_load_explicit(&rc.lsp_cross_processed, memory_order_relaxed)),
         "files_skipped_no_source",
-        itoa_log(atomic_load_explicit(&rc.lsp_cross_skipped_no_source, memory_order_relaxed)),
-        "defs_total", itoa_log(def_count));
+        cbm_log_itoa(atomic_load_explicit(&rc.lsp_cross_skipped_no_source, memory_order_relaxed)),
+        "defs_total", cbm_log_itoa(def_count));
 
     /* Cross-LSP cost normalised per file (upstream f6e3af43/cffb4e37). Wall
      * time cannot tell "big repo" from "superlinear pass"; us_per_file can:
@@ -3640,7 +3631,7 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                                                            (uint64_t)def_count)
                                                     : 0ULL));
         cbm_log_info("parallel.resolve.cross_lsp_cost", "cross_lsp_ms", cu_buf, "files", nf_buf,
-                     "us_per_file", cf_buf, "defs_total", itoa_log(def_count),
+                     "us_per_file", cf_buf, "defs_total", cbm_log_itoa(def_count),
                      "us_per_file_per_kdef", pk_buf);
 
         uint64_t reg_defs = 0;
@@ -3655,21 +3646,18 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
             snprintf(rd_buf, sizeof(rd_buf), "%llu", (unsigned long long)(reg_defs / reg_files));
             snprintf(ff_buf, sizeof(ff_buf), "%llu", (unsigned long long)flt_failed);
             snprintf(fp_buf, sizeof(fp_buf), "%llu", (unsigned long long)flt_files);
-            cbm_log_info("parallel.resolve.perfile_registry", "defs_per_file", rd_buf,
-                         "defs_total", itoa_log(def_count), "filtered_files", fp_buf,
-                         "filter_failed", ff_buf);
+            cbm_log_info("parallel.resolve.perfile_registry", "defs_per_file", rd_buf, "defs_total",
+                         cbm_log_itoa(def_count), "filtered_files", fp_buf, "filter_failed",
+                         ff_buf);
         }
     }
 
-    cbm_log_info("parallel.resolve.done", "calls", itoa_log(total_calls), "usages",
-                 itoa_log(total_usages), "semantic", itoa_log(total_semantic + go_impl),
-                 "lsp_overrides", itoa_log(total_lsp_overrides));
+    cbm_log_info("parallel.resolve.done", "calls", cbm_log_itoa(total_calls), "usages",
+                 cbm_log_itoa(total_usages), "semantic", cbm_log_itoa(total_semantic + go_impl),
+                 "lsp_overrides", cbm_log_itoa(total_lsp_overrides));
 
     /* Per-sub-phase breakdown so we stop guessing about hot paths.
-     * Numbers are summed across workers (total CPU-ms, not wall-time).
-     * Split into multiple log lines because itoa_log uses a 4-slot TLS
-     * ring buffer — more than 4 values per log_info call would alias
-     * each other (we hit that bug in the first profiling run). */
+     * Numbers are summed across workers (total CPU-ms, not wall-time). */
     char loop_buf[32], visits_buf[32];
     snprintf(
         loop_buf, sizeof(loop_buf), "%llu",
@@ -3815,6 +3803,6 @@ void cbm_parallel_resolve_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     cbm_gbuf_merge(ctx->gbuf, ws.local_edge_buf);
     cbm_gbuf_free(ws.local_edge_buf);
     cbm_pipeline_sync_next_id(ctx->gbuf, &shared_ids);
-    cbm_log_info("parallel.resolve_calls.done", "files", itoa_log(file_count), "calls",
-                 itoa_log(ws.calls_resolved));
+    cbm_log_info("parallel.resolve_calls.done", "files", cbm_log_itoa(file_count), "calls",
+                 cbm_log_itoa(ws.calls_resolved));
 }

@@ -22,13 +22,6 @@ enum { ENRICH_ATTR_SKIP = 2, ENRICH_MAX_CAMEL = 16 };
 #include <stdlib.h>
 #include <string.h>
 
-/* Convert intptr_t to void* without triggering performance-no-int-to-ptr. */
-static inline void *intptr_to_ptr(intptr_t v) {
-    void *p;
-    memcpy(&p, &v, sizeof(p));
-    return p;
-}
-
 static bool is_decorator_stopword(const char *w) {
     static const char *stopwords[] = {"get",   "set",  "new",   "class",  "method", "function",
                                       "value", "type", "param", "return", "public", "private",
@@ -219,7 +212,7 @@ static int extract_decorator_words(const char *json, char ***out_words) {
         int tc = cbm_tokenize_decorator(decorators[i], tokens, CBM_SZ_32);
         for (int j = 0; j < tc; j++) {
             if (!cbm_ht_get(seen, tokens[j]) && total < CBM_SZ_256) {
-                cbm_ht_set(seen, tokens[j], intptr_to_ptr(SKIP_ONE));
+                cbm_ht_set(seen, tokens[j], cbm_intptr_to_ptr(SKIP_ONE));
                 all_words[total++] = tokens[j];
             } else {
                 free(tokens[j]);
@@ -326,7 +319,7 @@ static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
             tn->word_count = wc;
             for (int w = 0; w < wc; w++) {
                 intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, words[w]);
-                cbm_ht_set(word_counts, words[w], intptr_to_ptr(cnt + SKIP_ONE));
+                cbm_ht_set(word_counts, words[w], cbm_intptr_to_ptr(cnt + SKIP_ONE));
             }
         }
     }
@@ -393,7 +386,7 @@ int cbm_pipeline_pass_decorator_tags(cbm_gbuf_t *gbuf, const char *project) {
             const char *word = nodes[n].words[w];
             intptr_t cnt = (intptr_t)cbm_ht_get(word_counts, word);
             if (cnt >= PAIR_LEN && !cbm_ht_get(candidates, word)) {
-                cbm_ht_set(candidates, word, intptr_to_ptr(SKIP_ONE));
+                cbm_ht_set(candidates, word, cbm_intptr_to_ptr(SKIP_ONE));
                 candidate_count++;
             }
         }

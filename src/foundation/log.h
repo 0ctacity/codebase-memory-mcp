@@ -76,6 +76,10 @@ void cbm_log(CBMLogLevel level, const char *msg, ...);
 /* Log with integer value (avoids sprintf for common case). */
 void cbm_log_int(CBMLogLevel level, const char *msg, const char *key, int64_t value);
 
+/* Format an int for a cbm_log key/value argument. The result lives in a
+ * thread-local ring of 16 buffers, so one log call can use up to 16 of them. */
+const char *cbm_log_itoa(int value);
+
 /* Operational event helpers. They deliberately avoid request bodies, headers,
  * arguments, and query strings. */
 void cbm_log_mcp_request(const char *method, const char *tool_name, bool is_error,

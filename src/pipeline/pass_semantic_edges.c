@@ -26,6 +26,7 @@
 #include "pipeline/worker_pool.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
+#include "foundation/str_util.h"
 
 #include <stdatomic.h>
 #include <stddef.h>
@@ -289,24 +290,6 @@ enum {
     FW_PATH = 5,       /* ×0.5 */
     FW_SCALE = 10,     /* divisor */
 };
-
-static const char *itoa_log(int val) {
-    enum { RING = 4, MASK = 3 };
-    static CBM_TLS char bufs[RING][CBM_SZ_32];
-    static CBM_TLS int idx = 0;
-    int i = idx;
-    idx = (idx + SKIP_ONE) & MASK;
-    snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
-    return bufs[i];
-}
-
-static const char *file_ext(const char *path) {
-    if (!path) {
-        return "";
-    }
-    const char *dot = strrchr(path, '.');
-    return dot ? dot : "";
-}
 
 /* Extract a JSON string value by key (simple strstr-based, no full parse). */
 static const char *json_str_value(const char *json, const char *key, char *buf, int bufsize) {
@@ -979,7 +962,7 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
             memset(&funcs[func_count], 0, sizeof(cbm_sem_func_t));
             funcs[func_count].node_id = nodes[i]->id;
             funcs[func_count].file_path = nodes[i]->file_path;
-            funcs[func_count].file_ext = file_ext(nodes[i]->file_path);
+            funcs[func_count].file_ext = cbm_path_last_dot(nodes[i]->file_path);
             node_ptrs[func_count] = nodes[i];
             func_count++;
         }
@@ -998,7 +981,7 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
     for (int k = 0; k < func_count; k++) {
         funcs[k].node_id = node_ptrs[k]->id;
         funcs[k].file_path = node_ptrs[k]->file_path;
-        funcs[k].file_ext = file_ext(node_ptrs[k]->file_path);
+        funcs[k].file_ext = cbm_path_last_dot(node_ptrs[k]->file_path);
     }
     *out_funcs = funcs;
     *out_nodes = node_ptrs;
@@ -1125,7 +1108,7 @@ static void phase3c_export_token_vectors(cbm_gbuf_t *gbuf, cbm_sem_corpus_t *cor
         }
         cbm_gbuf_store_token_vector(gbuf, tok, qvec, CBM_SEM_DIM, idf);
     }
-    cbm_log_info("pass.semantic.token_vectors", "count", itoa_log(tv_count));
+    cbm_log_info("pass.semantic.token_vectors", "count", cbm_log_itoa(tv_count));
 }
 
 /* Phase 5a: generate NUM_HYPERPLANES × CBM_SEM_DIM deterministic random
@@ -1379,7 +1362,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_phase1b);
     phase1b_decode_and_build(funcs, node_ptrs, gbuf, func_count, cbm_default_worker_count(false));
     CBM_PROF_END_N("semantic_edges", "1b_decode_build_parallel", t_phase1b, func_count);
-    cbm_log_info("pass.semantic.collected", "functions", itoa_log(func_count));
+    cbm_log_info("pass.semantic.collected", "functions", cbm_log_itoa(func_count));
 
     if (func_count < PSE_MIN_FUNCS_FOR_PAIR) {
         free(funcs);
@@ -1414,7 +1397,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
                                    worker_count);
     CBM_PROF_END_N("semantic_edges", "4_build_and_store_vec", t_phase4, func_count);
 
-    cbm_log_info("pass.semantic.vectors_stored", "count", itoa_log(func_count));
+    cbm_log_info("pass.semantic.vectors_stored", "count", cbm_log_itoa(func_count));
 
     /* Phase 5: LSH hyperplanes → signatures → buckets. */
     CBM_PROF_START(t_phase5);
@@ -1423,8 +1406,8 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     phase5_lsh_build(funcs, func_count, worker_count, &signatures, &band_buckets);
     CBM_PROF_END_N("semantic_edges", "5_lsh_build", t_phase5, func_count);
 
-    cbm_log_info("pass.semantic.lsh_built", "functions", itoa_log(func_count), "bands",
-                 itoa_log(SEM_LSH_BANDS));
+    cbm_log_info("pass.semantic.lsh_built", "functions", cbm_log_itoa(func_count), "bands",
+                 cbm_log_itoa(SEM_LSH_BANDS));
 
     /* Phase 6: Parallel scoring + sequential edge merge. */
     int total_edges =
@@ -1434,7 +1417,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     CBM_PROF_START(t_phase7);
     free_lsh_buckets(band_buckets);
     free(signatures);
-    cbm_log_info("pass.done", "pass", "semantic_edges", "edges", itoa_log(total_edges));
+    cbm_log_info("pass.done", "pass", "semantic_edges", "edges", cbm_log_itoa(total_edges));
     free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools, worker_count);
     free(token_counts);
     cbm_sem_corpus_free(corpus);
