@@ -63,16 +63,16 @@ fn isOneOf(kind: []const u8, comptime names: []const []const u8) bool {
 fn normaliseNodeType(kind: Token) Token {
     const k = std.mem.span(kind);
     if (isOneOf(k, &.{
-        "identifier",                    "field_identifier",           "property_identifier",
-        "type_identifier",               "shorthand_property_identifier", "shorthand_field_identifier",
-        "variable_name",                 "name",
+        "identifier",      "field_identifier",              "property_identifier",
+        "type_identifier", "shorthand_property_identifier", "shorthand_field_identifier",
+        "variable_name",   "name",
     })) return "I";
     if (isOneOf(k, &.{
-        "string",             "string_literal",  "interpreted_string_literal", "raw_string_literal",
-        "template_string",    "string_content",  "escape_sequence",
+        "string",          "string_literal", "interpreted_string_literal", "raw_string_literal",
+        "template_string", "string_content", "escape_sequence",
     })) return "S";
     if (isOneOf(k, &.{
-        "number",        "integer",     "float",        "integer_literal",
+        "number",        "integer",     "float",          "integer_literal",
         "float_literal", "int_literal", "number_literal",
     })) return "N";
     if (isOneOf(k, &.{
