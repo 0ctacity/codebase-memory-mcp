@@ -534,7 +534,7 @@ static bool spill_ensure_file(cbm_result_spill_t *sp) {
         *slash = '\0';
         cbm_mkdir_p(dir, 0700);
     }
-    sp->file = fopen(sp->path, "w+b");
+    sp->file = cbm_fopen(sp->path, "w+b");
     if (!sp->file) {
         sp->open_failed = true;
         cbm_log_warn("mem.spill.open_failed", "path", sp->path);

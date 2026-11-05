@@ -750,9 +750,28 @@ static pid_t cbm_popen_spawn_sh(const char *cmd, char **envp, int *read_fd) {
     bool configured =
         posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0) == 0 &&
         posix_spawn_file_actions_adddup2(&actions, wr, STDOUT_FILENO) == 0;
+#if defined(__APPLE__)
+    posix_spawnattr_t attr;
+    posix_spawnattr_t *attr_ptr = NULL;
+    if (posix_spawnattr_init(&attr) == 0) {
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+#define POSIX_SPAWN_CLOEXEC_DEFAULT 0x2000
+#endif
+        (void)posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+        attr_ptr = &attr;
+        (void)posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+    }
+#else
+    posix_spawnattr_t *attr_ptr = NULL;
+#endif
     char *const argv[] = {(char *)"sh", (char *)"-c", (char *)cmd, NULL};
     pid_t pid = CBM_NOT_FOUND;
-    int rc = configured ? posix_spawn(&pid, "/bin/sh", &actions, NULL, argv, envp) : CBM_NOT_FOUND;
+    int rc = configured ? posix_spawn(&pid, "/bin/sh", &actions, attr_ptr, argv, envp) : CBM_NOT_FOUND;
+#if defined(__APPLE__)
+    if (attr_ptr) {
+        (void)posix_spawnattr_destroy(&attr);
+    }
+#endif
     (void)posix_spawn_file_actions_destroy(&actions);
     (void)close(wr);
     if (rc != 0 || pid <= 0) {
@@ -900,6 +919,45 @@ int cbm_exec_no_shell(const char *const *argv) {
     if (!argv || !argv[0]) {
         return CBM_NOT_FOUND;
     }
+#if defined(__APPLE__)
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        return CBM_NOT_FOUND;
+    }
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+#define POSIX_SPAWN_CLOEXEC_DEFAULT 0x2000
+#endif
+    (void)posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT);
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        (void)posix_spawnattr_destroy(&attr);
+        return CBM_NOT_FOUND;
+    }
+    (void)posix_spawn_file_actions_addinherit_np(&actions, STDIN_FILENO);
+    (void)posix_spawn_file_actions_addinherit_np(&actions, STDOUT_FILENO);
+    (void)posix_spawn_file_actions_addinherit_np(&actions, STDERR_FILENO);
+
+    pid_t pid = CBM_NOT_FOUND;
+    extern char **environ;
+    int rc = posix_spawnp(&pid, argv[0], &actions, &attr, (char *const *)argv, environ);
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)posix_spawnattr_destroy(&attr);
+
+    if (rc != 0 || pid <= 0) {
+        return (rc == ENOENT || rc == EACCES) ? 127 : CBM_NOT_FOUND;
+    }
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return CBM_NOT_FOUND;
+        }
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return CBM_NOT_FOUND;
+#else
     pid_t pid = fork();
     if (pid < 0) {
         return CBM_NOT_FOUND;
@@ -921,6 +979,7 @@ int cbm_exec_no_shell(const char *const *argv) {
         return WEXITSTATUS(status);
     }
     return CBM_NOT_FOUND; /* killed by signal */
+#endif
 }
 
 #endif /* _WIN32 */

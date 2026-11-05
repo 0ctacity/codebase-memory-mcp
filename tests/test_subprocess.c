@@ -638,46 +638,89 @@ TEST(posix_child_does_not_inherit_lock_fd) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX close-on-exec descriptor inheritance");
 #else
-    char lock_path[128];
-    snprintf(lock_path, sizeof(lock_path), "/tmp/cbm_test_lock_fd_%d.lock", (int)getpid());
+    char lock_path[512];
+    snprintf(lock_path, sizeof(lock_path), "%s/cbm_test_lock_fd_%d.lock", cbm_tmpdir(), (int)getpid());
 
     cbm_file_lock_t lock;
     int rc = cbm_file_lock_acquire(lock_path, CBM_FILE_LOCK_EXCLUSIVE, false, &lock);
-    ASSERT_EQ(rc, 0);
     int lock_fd = (int)lock.handle;
-    ASSERT_TRUE(lock_fd > STDERR_FILENO);
 
-    /* The child script checks whether lock_fd is accessible in the child.
-     * We test three ways:
-     * 1. /proc/self/fd/<N> (Linux)
-     * 2. /dev/fd/<N> (macOS / BSD)
-     * 3. Shell fd redirection (: <&<N>) which succeeds iff fd <N> is open.
-     * If the fd is open in the child, it exits 42 (failure).
-     * If the fd is properly closed, it exits 0 (clean). */
-    char script[256];
+    int run_outcome = -1;
+    int run_exit_code = -1;
+    int popen_status = -1;
+    bool popen_exited = false;
+
+    if (rc == 0) {
+        char script[512];
+        snprintf(script, sizeof(script),
+                 "if [ -e /proc/self/fd/%d ] || [ -e /dev/fd/%d ] || (: <&%d) 2>/dev/null; then exit 42; fi; exit 0",
+                 lock_fd, lock_fd, lock_fd);
+
+        /* 1. Test cbm_subprocess_run */
+        const char *argv[] = {"/bin/sh", "-c", script, NULL};
+        cbm_proc_opts_t opts = {0};
+        opts.bin = "/bin/sh";
+        opts.argv = argv;
+        cbm_proc_result_t r;
+        cbm_subprocess_run(&opts, &r);
+        run_outcome = r.outcome;
+        run_exit_code = r.exit_code;
+
+        /* 2. Test cbm_popen */
+        FILE *fp = cbm_popen(script, "r");
+        if (fp != NULL) {
+            popen_status = cbm_pclose(fp);
+            popen_exited = WIFEXITED(popen_status);
+            popen_status = WEXITSTATUS(popen_status);
+        }
+
+        cbm_file_lock_release(&lock);
+    }
+    (void)unlink(lock_path);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(lock_fd > STDERR_FILENO);
+    ASSERT_EQ(run_outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(run_exit_code, 0);
+    ASSERT_TRUE(popen_exited);
+    ASSERT_EQ(popen_status, 0);
+    PASS();
+#endif
+}
+
+/* POSIX: The spawn backstops (cbm_run_posix and cbm_exec_no_shell) must close
+ * descriptors that were opened WITHOUT close-on-exec (#77). */
+TEST(posix_child_backstop_closes_raw_descriptors) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX descriptor inheritance backstop");
+#else
+    /* Open a plain descriptor WITHOUT close-on-exec (O_CLOEXEC) */
+    int raw_fd = open("/dev/null", O_RDONLY);
+    ASSERT_TRUE(raw_fd >= 0);
+    ASSERT_TRUE(raw_fd > STDERR_FILENO);
+
+    char script[512];
     snprintf(script, sizeof(script),
              "if [ -e /proc/self/fd/%d ] || [ -e /dev/fd/%d ] || (: <&%d) 2>/dev/null; then exit 42; fi; exit 0",
-             lock_fd, lock_fd, lock_fd);
+             raw_fd, raw_fd, raw_fd);
 
-    /* 1. Test cbm_subprocess_run */
-    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    /* 1. Test cbm_subprocess_run (covers cbm_run_posix: posix_spawn on macOS, fork+exec on Linux) */
+    const char *subproc_argv[] = {"/bin/sh", "-c", script, NULL};
     cbm_proc_opts_t opts = {0};
     opts.bin = "/bin/sh";
-    opts.argv = argv;
+    opts.argv = subproc_argv;
     cbm_proc_result_t r;
     cbm_subprocess_run(&opts, &r);
+
+    /* 2. Test cbm_exec_no_shell (covers posix_spawnp on macOS, fork+exec on Linux) */
+    const char *exec_argv[] = {"/bin/sh", "-c", script, NULL};
+    int exec_rc = cbm_exec_no_shell(exec_argv);
+
+    (void)close(raw_fd);
+
     ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
     ASSERT_EQ(r.exit_code, 0);
-
-    /* 2. Test cbm_popen */
-    FILE *fp = cbm_popen(script, "r");
-    ASSERT_TRUE(fp != NULL);
-    int popen_status = cbm_pclose(fp);
-    ASSERT_TRUE(popen_status >= 0 && WIFEXITED(popen_status));
-    ASSERT_EQ(WEXITSTATUS(popen_status), 0);
-
-    cbm_file_lock_release(&lock);
-    (void)unlink(lock_path);
+    ASSERT_EQ(exec_rc, 0);
     PASS();
 #endif
 }
@@ -706,4 +749,5 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_deleted_self_spawn_path_follows_platform_ruling);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(posix_child_does_not_inherit_lock_fd);
+    RUN_TEST(posix_child_backstop_closes_raw_descriptors);
 }

@@ -646,7 +646,7 @@ fn writeScopedFilelist(srv: *Server, project: CStr, root_path: CStr, filelist: C
         c.free(@ptrCast(indexed_files));
     }
     if (rc != c.CBM_STORE_OK or indexed_count == 0) return false;
-    const fl = c.fopen(filelist, "wb");
+    const fl = c.cbm_fopen(filelist, "wb");
     if (fl == null) return false;
     defer _ = c.fclose(fl);
     const root = std.mem.span(root_path);
@@ -706,7 +706,7 @@ pub fn validateSearchPathArg(s: CStr) bool {
 
 /// Write the pattern to the temp file for grep -f.
 fn writePatternFile(tmpfile: CStr, pattern: CStr) bool {
-    const tf = c.fopen(tmpfile, "w");
+    const tf = c.cbm_fopen(tmpfile, "w");
     if (tf == null) return false;
     _ = c.fputs(pattern, tf);
     _ = c.fputc('\n', tf);
@@ -791,7 +791,7 @@ fn runGrepScan(tmpfile: []const u8, filelist: []const u8, scoped: bool, use_rege
         scan_err = "search failed: the scan command did not complete";
     }
     if (scan_err) |e| return .{ .err = e };
-    const fp = c.fopen(&outfile, "r");
+    const fp = c.cbm_fopen(&outfile, "r");
     if (fp == null) return .{ .err = "search failed" };
     defer _ = c.fclose(fp);
     collectGrepMatches(fp, std.mem.span(root_path), path_regex, GREP_MAX_MATCHES, out);

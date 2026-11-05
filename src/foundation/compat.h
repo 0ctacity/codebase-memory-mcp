@@ -147,11 +147,27 @@ char *cbm_mkdtemp(char *tmpl);
 #define cbm_mkdtemp mkdtemp
 #endif
 
+/* ── File descriptor close-on-exec (POSIX) ───────────────────── */
+#ifndef _WIN32
+#include <fcntl.h>
+#include <stdbool.h>
+static inline bool cbm_fd_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+#endif
+
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
 #else
-#define cbm_mkstemp mkstemp
+static inline int cbm_mkstemp(char *tmpl) {
+    int fd = mkstemp(tmpl);
+    if (fd >= 0) {
+        (void)cbm_fd_set_cloexec(fd);
+    }
+    return fd;
+}
 #endif
 
 /* ── setenv / unsetenv (Windows lacks them) ──────────────────── */
@@ -197,23 +213,18 @@ static inline const char *cbm_tmpdir(void) {
 #define CBM_HAS_SIGACTION 1
 #endif
 
-/* ── File descriptor close-on-exec and child fd cleanup (POSIX) ── */
+/* ── File descriptor cleanup before exec (POSIX fork+exec fallback) ── */
 #ifndef _WIN32
-#include <fcntl.h>
-#include <stdbool.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #if defined(__linux__)
 #include <sys/syscall.h>
 #endif
 
-static inline bool cbm_fd_set_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
-/* Close all open file descriptors above STDERR_FILENO in an async-signal-safe manner.
- * Suitable for calling in child process between fork() and exec(). */
+/* Close open descriptors above STDERR_FILENO in child process between fork and exec.
+ * Linux uses close_range (SYS_close_range) when available, falling back to a bounded
+ * loop for older Linux kernels. (macOS spawns via posix_spawn with
+ * POSIX_SPAWN_CLOEXEC_DEFAULT). */
 static inline void cbm_fd_close_above_stderr(void) {
 #if defined(__linux__) && defined(SYS_close_range)
     if (syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0) == 0) {
