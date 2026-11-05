@@ -110,7 +110,7 @@ static void append_trajectory(long uptime, size_t rss, size_t peak_rss, size_t c
         (void)rename(g_diag_ndjson_path, rot); /* keep one previous generation */
         g_diag_ndjson_size = 0;
     }
-    FILE *f = fopen(g_diag_ndjson_path, "a");
+    FILE *f = cbm_fopen(g_diag_ndjson_path, "a");
     if (!f) {
         return;
     }
@@ -156,7 +156,7 @@ static void write_diagnostics(void) {
     char tmp_path[sizeof(g_diag_path) + DIAG_PATH_EXTRA];
     snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
 
-    FILE *f = fopen(tmp_path, "w");
+    FILE *f = cbm_fopen(tmp_path, "w");
     if (!f) {
         return;
     }

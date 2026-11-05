@@ -305,7 +305,7 @@ pub export fn cbm_replace_binary(path: [*c]const u8, data: [*c]const u8, len: c_
     }
 
     const f = if (is_windows) c.fopen(path, "wb") orelse return CLI_ERR else blk: {
-        const fd = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC, @as(c_uint, @bitCast(mode)));
+        const fd = c.open(path, c.O_WRONLY | c.O_CREAT | c.O_TRUNC | c.O_CLOEXEC, @as(c_uint, @bitCast(mode)));
         if (fd < 0) return CLI_ERR;
         break :blk c.fdopen(fd, "wb") orelse {
             _ = c.close(fd);

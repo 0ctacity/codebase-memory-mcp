@@ -5,6 +5,7 @@
 #include "subprocess.h"
 
 #include "compat.h"   /* cbm_nanosleep */
+#include "compat_fs.h"
 #include "platform.h" /* cbm_now_ms */
 
 #include <stdio.h>
@@ -100,7 +101,7 @@ static bool cbm_tail_log(const char *log_file, long *tail_pos, cbm_proc_log_cb c
     if (!log_file) {
         return false;
     }
-    FILE *lf = fopen(log_file, "r");
+    FILE *lf = cbm_fopen(log_file, "r");
     if (!lf) {
         return false;
     }
@@ -343,8 +344,87 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
 #else /* POSIX */
 
+#if defined(__APPLE__)
+#include <spawn.h>
+
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+#define POSIX_SPAWN_CLOEXEC_DEFAULT 0x2000
+#endif
+
+static int cbm_run_apple_spawn(const cbm_proc_opts_t *opts, cbm_proc_result_t *out, pid_t *out_pid) {
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        out->outcome = CBM_PROC_SPAWN_FAILED;
+        out->exit_code = -1;
+        out->term_signal = 0;
+        return -1;
+    }
+    short flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (opts->own_process_group) {
+        flags |= POSIX_SPAWN_SETPGROUP;
+        (void)posix_spawnattr_setpgroup(&attr, 0);
+    }
+    (void)posix_spawnattr_setflags(&attr, flags);
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        (void)posix_spawnattr_destroy(&attr);
+        out->outcome = CBM_PROC_SPAWN_FAILED;
+        out->exit_code = -1;
+        out->term_signal = 0;
+        return -1;
+    }
+
+    /* Stdin: explicitly open /dev/null so child never steals from stdin (e.g. MCP stdio transport) */
+    (void)posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+
+    /* Redirect stdout and stderr to the log (or discard) */
+    const char *target = opts->log_file ? opts->log_file : "/dev/null";
+    (void)posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, target,
+                                           O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    (void)posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO, STDERR_FILENO);
+
+    const char *bin = opts->bin;
+    const char *const default_argv[] = {bin, NULL};
+    const char *const *argv = opts->argv ? opts->argv : default_argv;
+
+    pid_t pid = -1;
+    extern char **environ;
+    int rc = posix_spawnp(&pid, bin, &actions, &attr, (char *const *)argv, environ);
+
+    (void)posix_spawn_file_actions_destroy(&actions);
+    (void)posix_spawnattr_destroy(&attr);
+
+    if (rc != 0 || pid <= 0) {
+        if (opts->delete_log_on_exit && opts->log_file) {
+            (void)unlink(opts->log_file);
+        }
+        if (rc == ENOENT || rc == EACCES) {
+            /* Bogus binary path fails cleanly like execv failure (_exit 127) */
+            out->outcome = CBM_PROC_EXIT_NONZERO;
+            out->exit_code = 127;
+            out->term_signal = 0;
+            return 0;
+        }
+        out->outcome = CBM_PROC_SPAWN_FAILED;
+        out->exit_code = -1;
+        out->term_signal = 0;
+        return -1;
+    }
+    *out_pid = pid;
+    return 1;
+}
+#endif
+
 static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
-    pid_t pid = fork();
+    pid_t pid = -1;
+#if defined(__APPLE__)
+    int spawned = cbm_run_apple_spawn(opts, out, &pid);
+    if (spawned <= 0) {
+        return spawned;
+    }
+#else
+    pid = fork();
     if (pid < 0) {
         out->outcome = CBM_PROC_SPAWN_FAILED;
         out->exit_code = -1;
@@ -385,6 +465,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * setpgid runs still reaches the group (EACCES after exec is fine). */
         (void)setpgid(pid, pid);
     }
+#endif
     pid_t kill_target = opts->own_process_group ? -pid : pid;
 
     long tail_pos = 0;

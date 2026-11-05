@@ -180,7 +180,10 @@ void *cbm_mmap_read(const char *path, size_t *out_size) {
     }
     *out_size = 0;
 
-    int fd = open(path, O_RDONLY);
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         return NULL;
     }
