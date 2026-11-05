@@ -471,7 +471,7 @@ inv_mcp_initialize() {
 }
 
 # ── Invariant 4: tools/list returns all expected tools ─────────────────────
-# Cross-check against the canonical 15-tool list (TOOLS[] in src/mcp/mcp.c).
+# Cross-check against the canonical 15-tool list (the tool registry in src/mcp/mcp.zig).
 EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_file_outline compare_graphs get_graph_schema get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes"
 EXPECTED_TOOL_COUNT=15
 inv_tools_list() {

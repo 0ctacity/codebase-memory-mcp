@@ -762,7 +762,7 @@ if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
 fi
 # On Linux the binary must self-update from the static "-portable" asset: the
 # standard linux asset dynamically links glibc 2.38+ and breaks on older distros
-# (Debian 11, RHEL 8, Ubuntu 20.04). Guards build_update_url in src/cli/cli.c.
+# (Debian 11, RHEL 8, Ubuntu 20.04). Guards buildUpdateUrl in src/cli/commands.zig.
 if [ "$(uname -s)" = "Linux" ]; then
   if ! echo "$UPDATE_OUT" | grep -q -- '-portable'; then
     echo "FAIL: linux update --dry-run does not target the -portable asset"

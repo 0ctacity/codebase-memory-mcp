@@ -13,9 +13,9 @@ src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
-src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
-src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
-src/cli/cli.c:popen:sha256 checksum computation via shasum
+src/cli/commands.zig:cbm_popen:latest-release lookup via curl redirect header (hardcoded URL)
+src/cli/commands.zig:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
+src/cli/commands.zig:popen:via cbm_popen wrapper calls
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
 src/watcher/watcher.zig:cbm_popen_git:git rev-parse/status/submodule/ls-files polling (popenGit)
@@ -24,11 +24,10 @@ src/watcher/watcher.zig:cbm_popen_git:git rev-parse/status/submodule/ls-files po
 src/git/git_context.zig:cbm_popen_git:git rev-parse/symbolic-ref/merge-base metadata lookup and ls-files
 
 # ── MCP server: search and change detection ────────────────────────────────
-src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)
-src/mcp/mcp.c:cbm_popen_git:detect_changes via git diff (args validated)
-src/mcp/mcp.c:cbm_popen_git:git ls-files count for auto-index (session_root validated)
-src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
-src/mcp/mcp.c:popen:via cbm_popen wrapper calls
+src/mcp/server.zig:cbm_popen_git:detect_changes via git diff (args validated)
+src/mcp/server.zig:cbm_popen_git:git ls-files count for auto-index (session_root validated)
+src/mcp/server.zig:cbm_popen:update check to api.github.com (hardcoded URL)
+src/mcp/server.zig:popen:via cbm_popen wrapper calls
 
 # ── Pipeline: git history parsing (git log) ────────────────────────────────
 src/pipeline/pass_githistory.c:cbm_popen_git:git log for file history (path validated)
@@ -39,6 +38,6 @@ URL:https://api.github.com/repos/octacity-org/codebase-memory-mcp/releases/lates
 URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest/download:binary download + checksums
 URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version check via redirect header
 URL:https://www.sqlite.org/c3ref/c_checkpoint_full.html:sqlite WAL checkpoint API doc reference (comment only, not a network call)
-URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
+URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/server.zig)
 URL:https://github.com/octacity-org/codebase-memory-mcp/releases/latest/download:Zova-CBM binary download + checksums
 URL:https://github.com/octacity-org/codebase-memory-mcp/releases/latest:Zova-CBM version check via redirect header
