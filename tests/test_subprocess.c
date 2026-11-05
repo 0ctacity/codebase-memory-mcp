@@ -11,6 +11,7 @@
 #include "test_framework.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/file_lock.h"
 #include "../src/foundation/git_env.h"
 #include "../src/foundation/subprocess.h"
 
@@ -630,6 +631,57 @@ TEST(popen_git_strips_repo_env_and_reports_exit_status) {
 #endif
 }
 
+/* POSIX: Child processes must NOT inherit the server's open lock file descriptors (#77).
+ * Tests that both cbm_subprocess_run (via cbm_run_posix) and cbm_popen spawn children
+ * without leaking open lock file descriptors. */
+TEST(posix_child_does_not_inherit_lock_fd) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX close-on-exec descriptor inheritance");
+#else
+    char lock_path[128];
+    snprintf(lock_path, sizeof(lock_path), "/tmp/cbm_test_lock_fd_%d.lock", (int)getpid());
+
+    cbm_file_lock_t lock;
+    int rc = cbm_file_lock_acquire(lock_path, CBM_FILE_LOCK_EXCLUSIVE, false, &lock);
+    ASSERT_EQ(rc, 0);
+    int lock_fd = (int)lock.handle;
+    ASSERT_TRUE(lock_fd > STDERR_FILENO);
+
+    /* The child script checks whether lock_fd is accessible in the child.
+     * We test three ways:
+     * 1. /proc/self/fd/<N> (Linux)
+     * 2. /dev/fd/<N> (macOS / BSD)
+     * 3. Shell fd redirection (: <&<N>) which succeeds iff fd <N> is open.
+     * If the fd is open in the child, it exits 42 (failure).
+     * If the fd is properly closed, it exits 0 (clean). */
+    char script[256];
+    snprintf(script, sizeof(script),
+             "if [ -e /proc/self/fd/%d ] || [ -e /dev/fd/%d ] || (: <&%d) 2>/dev/null; then exit 42; fi; exit 0",
+             lock_fd, lock_fd, lock_fd);
+
+    /* 1. Test cbm_subprocess_run */
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    cbm_proc_result_t r;
+    cbm_subprocess_run(&opts, &r);
+    ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(r.exit_code, 0);
+
+    /* 2. Test cbm_popen */
+    FILE *fp = cbm_popen(script, "r");
+    ASSERT_TRUE(fp != NULL);
+    int popen_status = cbm_pclose(fp);
+    ASSERT_TRUE(popen_status >= 0 && WIFEXITED(popen_status));
+    ASSERT_EQ(WEXITSTATUS(popen_status), 0);
+
+    cbm_file_lock_release(&lock);
+    (void)unlink(lock_path);
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -653,4 +705,5 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_resolves_bare_binary_path_from_path);
     RUN_TEST(subprocess_deleted_self_spawn_path_follows_platform_ruling);
     RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
+    RUN_TEST(posix_child_does_not_inherit_lock_fd);
 }

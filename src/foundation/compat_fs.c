@@ -5,6 +5,7 @@
  * Windows: FindFirstFile/FindNextFile, _popen/_pclose, _mkdir, _unlink.
  */
 #include "foundation/constants.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_fs_internal.h"
 #include "foundation/git_env.h"
@@ -728,11 +729,6 @@ static void cbm_popen_git_lock_init(void) {
 
 enum { POPEN_PIPE_READ = 0, POPEN_PIPE_WRITE = 1, POPEN_PIPE_ENDS = 2 };
 
-static bool cbm_fd_set_cloexec(int fd) {
-    int flags = fcntl(fd, F_GETFD);
-    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
-}
-
 /* `/bin/sh -c cmd` with stdout on a pipe, stdin on /dev/null (never the MCP
  * transport), stderr inherited like popen(), and `envp` as the environment. */
 static pid_t cbm_popen_spawn_sh(const char *cmd, char **envp, int *read_fd) {
@@ -833,7 +829,14 @@ int cbm_pclose(FILE *f) {
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
-    return fopen(path, mode);
+    FILE *f = fopen(path, mode);
+    if (f) {
+        int fd = fileno(f);
+        if (fd >= 0) {
+            (void)cbm_fd_set_cloexec(fd);
+        }
+    }
+    return f;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
@@ -903,6 +906,7 @@ int cbm_exec_no_shell(const char *const *argv) {
     }
     if (pid == 0) {
         /* Child: exec directly — no shell interpretation */
+        cbm_fd_close_above_stderr();
         /* 127 = standard "command not found" exit code (POSIX convention) */
         enum { EXEC_NOT_FOUND = 127 };
         execvp(argv[0], (char *const *)argv);

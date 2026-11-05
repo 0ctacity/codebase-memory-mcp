@@ -197,4 +197,41 @@ static inline const char *cbm_tmpdir(void) {
 #define CBM_HAS_SIGACTION 1
 #endif
 
+/* ── File descriptor close-on-exec and child fd cleanup (POSIX) ── */
+#ifndef _WIN32
+#include <fcntl.h>
+#include <stdbool.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
+
+static inline bool cbm_fd_set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+/* Close all open file descriptors above STDERR_FILENO in an async-signal-safe manner.
+ * Suitable for calling in child process between fork() and exec(). */
+static inline void cbm_fd_close_above_stderr(void) {
+#if defined(__linux__) && defined(SYS_close_range)
+    if (syscall(SYS_close_range, STDERR_FILENO + 1, ~0U, 0) == 0) {
+        return;
+    }
+#endif
+    int max_fd = 1024;
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY) {
+        max_fd = (int)rl.rlim_cur;
+    }
+    if (max_fd > 4096) {
+        max_fd = 4096;
+    }
+    for (int fd = STDERR_FILENO + 1; fd < max_fd; fd++) {
+        (void)close(fd);
+    }
+}
+#endif
+
 #endif /* CBM_COMPAT_H */

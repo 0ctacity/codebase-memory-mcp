@@ -373,6 +373,9 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
                 (void)close(fd);
             }
         }
+        /* Close all descriptors above stderr so children (workers, git, grep)
+         * never inherit open server descriptors or lock files (#77). */
+        cbm_fd_close_above_stderr();
         execv(bin, (char *const *)argv);
         _exit(127); /* exec failed */
     }
