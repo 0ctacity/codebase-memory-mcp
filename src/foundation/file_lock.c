@@ -1,4 +1,5 @@
 #include "foundation/file_lock.h"
+#include "foundation/compat.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,8 +38,12 @@ int cbm_file_lock_acquire(const char *path, cbm_file_lock_mode_t mode, bool wait
     out->handle = (intptr_t)handle;
     return 0;
 #else
-    int fd = open(path, O_CREAT | O_RDWR, 0600);
+#ifndef O_CLOEXEC
+#define O_CLOEXEC 0
+#endif
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
     if (fd < 0) return -1;
+    (void)cbm_fd_set_cloexec(fd);
     struct flock lock = {.l_type = mode == CBM_FILE_LOCK_EXCLUSIVE ? F_WRLCK : F_RDLCK,
                          .l_whence = SEEK_SET};
     int command = wait ? F_SETLKW : F_SETLK;
