@@ -187,8 +187,8 @@ ZOVA_SRCS = \
 	src/zova/cbm_zova_bridge_stub.c \
 	src/zova/cbm_zova_plugin.c
 
-# MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
+# MCP server module: implemented in Zig (src/mcp/*.zig, part of libcbm_zig)
+MCP_SRCS =
 
 # Discover module is Zig: see CBM_ZIG_SRC.
 
@@ -234,8 +234,8 @@ SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/
 # nomic-embed-code pretrained vectors (assembler blob)
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 
-# CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
+# CLI module: implemented in Zig (src/cli/*.zig, part of libcbm_zig)
+CLI_SRCS =
 
 # mimalloc (vendored, global allocator override)
 #
@@ -489,6 +489,14 @@ endif
 # into the "c" module they use for C declarations.
 CBM_ZIG_SRC = src/cbm_zig.zig
 CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cli/cli_zig.h \
+               src/cli/archive.zig src/cli/cli.zig src/cli/commands.zig src/cli/store.zig \
+               src/cli/tool_args.zig \
+               src/cli/hook_augment.zig src/cli/progress_sink.zig src/cli/progress_sink.h \
+               src/foundation/sha256.h \
+               src/cli/cli.h src/mcp/mcp.h src/pipeline/pipeline.h \
+               src/mcp/mcp.zig src/mcp/server.zig src/mcp/code_tools.zig \
+               src/mcp/graph_tools.zig src/mcp/index_tools.zig src/mcp/project_tools.zig \
+               src/mcp/search_tools.zig src/mcp/index_supervisor.zig src/mcp/index_supervisor.h \
                src/foundation/interop.zig \
                src/cypher/parser.zig src/cypher/cypher.zig src/cypher/cypher.h \
                src/discover/discover.zig src/discover/gitignore.zig src/discover/language.zig \

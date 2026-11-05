@@ -160,14 +160,14 @@ if grep -q 'Go 1\.23\\|CGO\\|Configure Claude Code' \
     exit 1
 fi
 if grep -q -- 'printf("  --reset-indexes\\|if (update_clear_indexes(home' \
-    "$ROOT/src/cli/cli.c"; then
+    "$ROOT/src/cli/commands.zig"; then
     echo "error: install/update still expose legacy per-project index deletion" >&2
     exit 1
 fi
 grep -q '"  database: {s}' "$ROOT/src/cli_zig/cbm_cli_zig.zig"
 grep -q '"database: {s}' "$ROOT/src/cli_zig/cbm_cli_zig.zig"
 if grep -q 'project databases\\|project_databases' \
-    "$ROOT/src/cli/cli.c" "$ROOT/src/cli_zig/cbm_cli_zig.zig"; then
+    "$ROOT/src/cli/cli.zig" "$ROOT/src/cli/commands.zig" "$ROOT/src/cli_zig/cbm_cli_zig.zig"; then
     echo "error: installer diagnostics still describe per-project databases" >&2
     exit 1
 fi

@@ -81,3 +81,17 @@ pub fn ciEq(a: CStr, b: CStr) bool {
     if (a == null or b == null) return false;
     return std.ascii.eqlIgnoreCase(std.mem.span(a), std.mem.span(b));
 }
+
+// ── stdio ──────────────────────────────────────────────────────────
+
+pub fn stdin() ?*c.FILE {
+    return c.cbm_zig_stdin();
+}
+
+pub fn stdout() ?*c.FILE {
+    return c.cbm_zig_stdout();
+}
+
+pub fn stderr() ?*c.FILE {
+    return c.cbm_zig_stderr();
+}

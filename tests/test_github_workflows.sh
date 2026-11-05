@@ -140,7 +140,8 @@ grep -q '#define cbm_mkdir_mode' "$ROOT/src/foundation/compat.h"
 for path in \
   "$ROOT/src/store/store.c" \
   "$ROOT/src/zova/cbm_zova_operations.c" \
-  "$ROOT/src/cli/cli.c"; do
+  "$ROOT/src/cli/cli.zig" \
+  "$ROOT/src/cli/commands.zig"; do
   if rg -n '\blstat\(' "$path"; then
     echo "error: $path bypasses the Windows-compatible cbm_lstat wrapper" >&2
     exit 1

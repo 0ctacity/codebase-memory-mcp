@@ -12,6 +12,13 @@ const c = @import("c");
 
 comptime {
     _ = @import("cli_zig/cbm_cli_zig.zig");
+    checkExports(@import("cli/archive.zig"));
+    checkExports(@import("cli/cli.zig"));
+    checkExports(@import("cli/commands.zig"));
+    checkExports(@import("cli/hook_augment.zig"));
+    checkExports(@import("cli/progress_sink.zig"));
+    checkExports(@import("cli/store.zig"));
+    checkExports(@import("cli/tool_args.zig"));
     checkExports(@import("cypher/parser.zig"));
     checkExports(@import("cypher/cypher.zig"));
     checkExports(@import("discover/discover.zig"));
@@ -19,6 +26,14 @@ comptime {
     checkExports(@import("discover/language.zig"));
     checkExports(@import("discover/userconfig.zig"));
     checkExports(@import("git/git_context.zig"));
+    checkExports(@import("mcp/code_tools.zig"));
+    checkExports(@import("mcp/graph_tools.zig"));
+    checkExports(@import("mcp/index_supervisor.zig"));
+    checkExports(@import("mcp/index_tools.zig"));
+    checkExports(@import("mcp/mcp.zig"));
+    checkExports(@import("mcp/project_tools.zig"));
+    checkExports(@import("mcp/search_tools.zig"));
+    checkExports(@import("mcp/server.zig"));
     checkExports(@import("simhash/minhash.zig"));
     checkExports(@import("watcher/watcher.zig"));
 }

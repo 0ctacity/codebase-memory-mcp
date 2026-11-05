@@ -18,6 +18,16 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <fnmatch.h>
+#include <poll.h>
+#endif
+#include <ctype.h>
+#include <math.h>
 
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
@@ -27,19 +37,47 @@
 #include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include "foundation/mem.h"
+#include "foundation/diagnostics.h"
+#include "foundation/dump_verify.h"
+#include "foundation/profile.h"
+#include "foundation/subprocess.h"
 #include "foundation/platform.h"
+#include "foundation/sha256.h"
 #include "foundation/str_util.h"
+#include "mcp/mcp.h"
+#include "pipeline/pipeline.h"
+#include "store/store.h"
 #include "tree_sitter/api.h"
+#include "zova/cbm_zova_coordination.h"
 #include "zova/cbm_zova_operations.h"
 #include "zova/cbm_zova_repository.h"
 #include "zova/cbm_zova_route.h"
+#include <sqlite3.h>
 #include <yyjson/yyjson.h>
 
+/* stdin/stdout/stderr are macros whose expansion differs per libc (a
+ * variable on glibc, a function call on Windows), so translate-c cannot give
+ * the Zig side one spelling. These accessors can. */
+static inline FILE *cbm_zig_stdin(void) {
+    return stdin;
+}
+static inline FILE *cbm_zig_stdout(void) {
+    return stdout;
+}
+static inline FILE *cbm_zig_stderr(void) {
+    return stderr;
+}
+
 /* Headers of the ported modules: the Zig side implements these. */
+#include "cli/cli.h"
+#include "cli/cli_zig.h"
+#include "cli/progress_sink.h"
 #include "cypher/cypher.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "git/git_context.h"
+#include "mcp/index_supervisor.h"
 #include "simhash/minhash.h"
 #include "watcher/watcher.h"
 
