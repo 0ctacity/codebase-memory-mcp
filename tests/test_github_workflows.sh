@@ -139,7 +139,7 @@ grep -q '#define cbm_lstat' "$ROOT/src/foundation/compat.h"
 grep -q '#define cbm_mkdir_mode' "$ROOT/src/foundation/compat.h"
 for path in \
   "$ROOT/src/store/store.zig" \
-  "$ROOT/src/zova/cbm_zova_operations.c" \
+  "$ROOT/src/zova/cbm_zova_operations.zig" \
   "$ROOT/src/cli/cli.zig" \
   "$ROOT/src/cli/commands.zig"; do
   if rg -n '\blstat\(' "$path"; then
@@ -147,7 +147,7 @@ for path in \
     exit 1
   fi
 done
-if rg -n '\bmkdir\([^,]+,' "$ROOT/src/zova/cbm_zova_operations.c"; then
+if rg -n '\bmkdir\([^,]+,' "$ROOT/src/zova/cbm_zova_operations.zig"; then
   echo "error: Zova operations bypasses the Windows-compatible mkdir wrapper" >&2
   exit 1
 fi

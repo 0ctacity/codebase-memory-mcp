@@ -22,6 +22,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <fnmatch.h>
