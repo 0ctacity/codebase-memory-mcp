@@ -194,8 +194,8 @@ PIPELINE_SRCS = \
 
 # SimHash / MinHash, watcher and git context modules are Zig: see CBM_ZIG_SRC.
 
-# Semantic embedding module
-SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/rotsq.c
+# Semantic embedding module: implemented in Zig (src/semantic/*.zig, part of libcbm_zig)
+SEMANTIC_SRCS =
 
 # nomic-embed-code pretrained vectors (assembler blob)
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
@@ -479,6 +479,10 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/discover/discover.h src/discover/userconfig.h \
                src/git/git_context.zig src/git/git_context.h \
                src/graph_buffer/graph_buffer.zig src/graph_buffer/graph_buffer.h \
+               src/semantic/ast_profile.zig src/semantic/fp.zig src/semantic/rotsq.zig \
+               src/semantic/semantic.zig \
+               src/semantic/ast_profile.h src/semantic/rotsq.h src/semantic/semantic.h \
+               vendored/nomic/code_vectors.h vendored/nomic/code_tokens.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/store/store.zig src/store/store.h \
                src/watcher/watcher.zig src/watcher/watcher.h \

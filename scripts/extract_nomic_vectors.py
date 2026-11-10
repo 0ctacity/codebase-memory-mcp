@@ -520,7 +520,7 @@ def main():
     print()
     print("next steps:")
     print(f"  1. update Makefile.cbm: change UNIXCODER_BLOB_SRC path to vendored/nomic/")
-    print(f"  2. update #include in semantic.c: \"vendored/nomic/code_vectors.h\"")
+    print(f"  2. update #include in src/cbm_zig_c.h: \"nomic/code_vectors.h\"")
     print(f"  3. arch -arm64 make -j12 -f Makefile.cbm clean-c && arch -arm64 make -j12 -f Makefile.cbm")
 
 
