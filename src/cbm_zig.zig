@@ -64,6 +64,8 @@ comptime {
     checkExports(@import("simhash/minhash.zig"));
     checkExports(@import("store/store.zig"));
     checkExports(@import("watcher/watcher.zig"));
+    checkExports(@import("zova/cbm_zova.zig"));
+    checkExports(@import("zova/cbm_zova.zig").zova_only);
     if (c.CBM_WITH_ZOVA == 0) checkExports(@import("zova/cbm_zova_bridge_stub.zig"));
     checkExports(@import("zova/cbm_zova_coordination.zig"));
     checkExports(@import("zova/cbm_zova_delta.zig"));

@@ -149,10 +149,10 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 
 # SQLite writer
 
-# Optional Zova storage adapter. Compiles to no-op stubs unless
-# CBM_WITH_ZOVA=1 is set for the build.
-ZOVA_SRCS = \
-	src/zova/cbm_zova.c
+# Optional Zova storage adapter: implemented in Zig (src/zova/*.zig, part of
+# libcbm_zig). Its database functions are no-op stubs unless CBM_WITH_ZOVA=1
+# is set for the build.
+ZOVA_SRCS =
 
 # MCP server module: implemented in Zig (src/mcp/*.zig, part of libcbm_zig)
 MCP_SRCS =
@@ -482,6 +482,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/store/store.zig src/store/store.h \
                src/watcher/watcher.zig src/watcher/watcher.h \
+               src/zova/cbm_zova.zig \
                src/zova/cbm_zova_bridge_stub.zig src/zova/cbm_zova_coordination.zig \
                src/zova/cbm_zova_delta.zig src/zova/cbm_zova_edge_payload.zig \
                src/zova/cbm_zova_operations.zig \
