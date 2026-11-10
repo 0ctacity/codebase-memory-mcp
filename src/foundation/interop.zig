@@ -2,6 +2,7 @@
 //! cbm_log, snprintf-style formatting, malloc'd allocations and C strings.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 
 pub const Str = [*:0]const u8;
@@ -80,6 +81,58 @@ pub fn sp(s: CStr) []const u8 {
 pub fn ciEq(a: CStr, b: CStr) bool {
     if (a == null or b == null) return false;
     return std.ascii.eqlIgnoreCase(std.mem.span(a), std.mem.span(b));
+}
+
+// ── Windows ────────────────────────────────────────────────────────
+
+/// INVALID_HANDLE_VALUE: translate-c cannot evaluate the ((HANDLE)(LONG_PTR)-1)
+/// macro. Only referenced from Windows branches.
+pub const INVALID_HANDLE_VALUE: ?*anyopaque = @ptrFromInt(std.math.maxInt(usize));
+
+// ── Environment ────────────────────────────────────────────────────
+
+const posix_environ = struct {
+    extern var environ: ?[*:null]?[*:0]u8;
+};
+
+/// The process environment block (`environ`), however this libc spells it.
+pub fn environ() ?[*:null]?[*:0]u8 {
+    return switch (builtin.os.tag) {
+        .windows => @ptrCast(c.__p__environ().*),
+        .macos => @ptrCast(c._NSGetEnviron().*),
+        else => posix_environ.environ,
+    };
+}
+
+// ── errno ──────────────────────────────────────────────────────────
+
+pub fn errno() c_int {
+    return std.c._errno().*;
+}
+
+pub fn setErrno(value: c_int) void {
+    std.c._errno().* = value;
+}
+
+// ── wait status ────────────────────────────────────────────────────
+
+// The <sys/wait.h> macros, which translate-c cannot express. The encoding is
+// the same on Linux and macOS.
+
+pub fn wifexited(status: c_int) bool {
+    return (status & 0x7f) == 0;
+}
+
+pub fn wexitstatus(status: c_int) c_int {
+    return (status >> 8) & 0xff;
+}
+
+pub fn wifsignaled(status: c_int) bool {
+    return (status & 0x7f) != 0x7f and (status & 0x7f) != 0;
+}
+
+pub fn wtermsig(status: c_int) c_int {
+    return status & 0x7f;
 }
 
 // ── stdio ──────────────────────────────────────────────────────────

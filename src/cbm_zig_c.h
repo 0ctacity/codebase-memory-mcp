@@ -27,8 +27,43 @@
 #include <poll.h>
 #endif
 #include <ctype.h>
+#include <inttypes.h>
+#include <limits.h>
 #include <math.h>
 
+/* Platform headers used by the Zig foundation modules. */
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#include <io.h>
+#include <process.h>
+#include <psapi.h>
+#include "foundation/win_utf8.h"
+#include <tre/regex.h>
+#else
+#include <dirent.h>
+#include <pthread.h>
+#include <regex.h>
+#include <sched.h>
+#include <spawn.h>
+#include <strings.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#endif
+#ifdef __APPLE__
+#include <CommonCrypto/CommonDigest.h>
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <sys/sysctl.h>
+#endif
+#ifdef __linux__
+#include <sys/sysinfo.h>
+#endif
+#include <mimalloc.h>
+
+#include "foundation/arena.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_regex.h"
@@ -37,14 +72,23 @@
 #include "foundation/hash_table.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include "foundation/log_internal.h"
 #include "foundation/mem.h"
 #include "foundation/diagnostics.h"
 #include "foundation/dump_verify.h"
+#include "foundation/file_lock.h"
+#include "foundation/git_env.h"
 #include "foundation/profile.h"
 #include "foundation/subprocess.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "foundation/sha256_backend.h"
+#include "foundation/slab_alloc.h"
+#include "foundation/str_intern.h"
 #include "foundation/str_util.h"
+#include "foundation/system_info_internal.h"
+#include "foundation/compat_fs_internal.h"
+#include "foundation/yaml.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"

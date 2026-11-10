@@ -2,7 +2,6 @@
 #
 # Usage:
 #   make -f Makefile.cbm test           # Build + run all tests (ASan + UBSan)
-#   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
 #   make -f Makefile.cbm test-tsan      # Thread sanitizer build
 #   make -f Makefile.cbm cbm            # Production binary
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
@@ -93,29 +92,11 @@ LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
+# The rest of src/foundation is Zig (CBM_ZIG_SRCS). hash_table.c wraps the
+# vendored Verstable macro template; c_shim.c holds the variadic functions.
 FOUNDATION_SRCS = \
-    src/foundation/arena.c \
     src/foundation/hash_table.c \
-    src/foundation/str_intern.c \
-    src/foundation/log.c \
-    src/foundation/str_util.c \
-    src/foundation/platform.c \
-    src/foundation/system_info.c \
-    src/foundation/slab_alloc.c \
-    src/foundation/yaml.c \
-    src/foundation/compat.c \
-    src/foundation/compat_thread.c \
-    src/foundation/compat_fs.c \
-    src/foundation/file_lock.c \
-    src/foundation/compat_regex.c \
-    src/foundation/mem.c \
-    src/foundation/diagnostics.c \
-    src/foundation/profile.c \
-    src/foundation/dump_verify.c \
-    src/foundation/limits.c \
-    src/foundation/subprocess.c \
-    src/foundation/git_env.c \
-    src/foundation/sha256.c
+    src/foundation/c_shim.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -492,12 +473,20 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/cli/archive.zig src/cli/cli.zig src/cli/commands.zig src/cli/store.zig \
                src/cli/tool_args.zig \
                src/cli/hook_augment.zig src/cli/progress_sink.zig src/cli/progress_sink.h \
-               src/foundation/sha256.h \
                src/cli/cli.h src/mcp/mcp.h src/pipeline/pipeline.h \
                src/mcp/mcp.zig src/mcp/server.zig src/mcp/code_tools.zig \
                src/mcp/graph_tools.zig src/mcp/index_tools.zig src/mcp/project_tools.zig \
                src/mcp/search_tools.zig src/mcp/index_supervisor.zig src/mcp/index_supervisor.h \
                src/foundation/interop.zig \
+               src/foundation/arena.zig src/foundation/compat.zig src/foundation/compat_fs.zig \
+               src/foundation/compat_regex.zig src/foundation/compat_thread.zig \
+               src/foundation/diagnostics.zig src/foundation/dump_verify.zig \
+               src/foundation/file_lock.zig src/foundation/git_env.zig src/foundation/limits.zig \
+               src/foundation/log.zig src/foundation/mem.zig src/foundation/platform.zig \
+               src/foundation/profile.zig src/foundation/sha256.zig src/foundation/slab_alloc.zig \
+               src/foundation/str_intern.zig src/foundation/str_util.zig \
+               src/foundation/subprocess.zig src/foundation/system_info.zig src/foundation/yaml.zig \
+               $(wildcard src/foundation/*.h) \
                src/cypher/parser.zig src/cypher/cypher.zig src/cypher/cypher.h \
                src/discover/discover.zig src/discover/gitignore.zig src/discover/language.zig \
                src/discover/userconfig.zig \
@@ -539,7 +528,7 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-cli test-mcp test-repro test-foundation test-tsan cbm check-zova test-zova test-zova-c-sql-functions test-zova-bridge zova-test-runner clean-c print-build-sources lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-cli test-mcp test-repro test-tsan cbm check-zova test-zova test-zova-c-sql-functions test-zova-bridge zova-test-runner clean-c print-build-sources lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -624,14 +613,6 @@ $(BUILD_DIR)/cbm_zova_bridge.o: $(CBM_ZOVA_BRIDGE_ZIG_SRC) src/zova/cbm_zova_bri
 			-Msqlite_c=$(BUILD_DIR)/sqlite_c.zig \
 			-Mzova_build_options=$(BUILD_DIR)/zova_build_options.zig
 endif
-
-# ── Foundation-only test (fast, no extraction) ───────────────────
-
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
-
-test-foundation: $(BUILD_DIR)/test-foundation
-	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
