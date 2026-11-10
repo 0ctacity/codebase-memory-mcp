@@ -532,7 +532,6 @@ fn grammarSources(b: *std.Build) []const []const u8 {
 const native_sources = [_][]const u8{
     "src/foundation/hash_table.c",
     "src/foundation/c_shim.c",
-    "src/store/store.c",
     "src/zova/cbm_zova.c",
     "src/zova/cbm_zova_publish_model.c",
     "src/zova/cbm_zova_edge_payload.c",
