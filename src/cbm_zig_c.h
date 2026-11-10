@@ -6,8 +6,9 @@
  * Makefile.cbm). Include only what a ported module calls, so a header that
  * translate-c cannot handle never blocks an unrelated module.
  *
- * Translated without CBM_WITH_ZOVA: the declarations used here do not depend
- * on it, and leaving it unset keeps the Zova SDK headers out of the build.
+ * The build passes -DCBM_WITH_ZOVA=0|1 to translate-c. With Zova, the SDK
+ * header zova.h is translated too, and the Zig Zova modules compile their
+ * real implementation instead of the no-Zova stubs.
  */
 #ifndef CBM_ZIG_C_H
 #define CBM_ZIG_C_H
@@ -94,12 +95,20 @@
 #include "semantic/semantic.h"
 #include "store/store.h"
 #include "tree_sitter/api.h"
+#include "zova/cbm_zova.h"
+#include "zova/cbm_zova_bridge.h"
 #include "zova/cbm_zova_coordination.h"
 #include "zova/cbm_zova_delta.h"
+#include "zova/cbm_zova_edge_payload.h"
 #include "zova/cbm_zova_operations.h"
 #include "zova/cbm_zova_publish_model.h"
 #include "zova/cbm_zova_repository.h"
 #include "zova/cbm_zova_route.h"
+#include "zova/cbm_zova_v5_snapshot.h"
+#include "zova/cbm_zova_writer_gate.h"
+#if CBM_WITH_ZOVA
+#include <zova.h>
+#endif
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 

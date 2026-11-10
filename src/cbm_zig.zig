@@ -64,6 +64,13 @@ comptime {
     checkExports(@import("simhash/minhash.zig"));
     checkExports(@import("store/store.zig"));
     checkExports(@import("watcher/watcher.zig"));
+    if (c.CBM_WITH_ZOVA == 0) checkExports(@import("zova/cbm_zova_bridge_stub.zig"));
+    checkExports(@import("zova/cbm_zova_coordination.zig"));
+    checkExports(@import("zova/cbm_zova_delta.zig"));
+    checkExports(@import("zova/cbm_zova_edge_payload.zig"));
+    checkExports(@import("zova/cbm_zova_route.zig"));
+    checkExports(@import("zova/cbm_zova_v5_snapshot.zig"));
+    checkExports(@import("zova/cbm_zova_writer_gate.zig"));
 }
 
 /// Checks every pub `cbm_*` function of `module` against the C declaration

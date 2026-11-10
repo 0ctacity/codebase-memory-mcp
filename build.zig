@@ -419,6 +419,10 @@ fn addCbmZigLibrary(b: *std.Build, cfg: Config, kind: BuildKind) *std.Build.Step
     });
     c_decls.defineCMacro("_DEFAULT_SOURCE", null);
     c_decls.defineCMacro("_GNU_SOURCE", null);
+    c_decls.defineCMacro("CBM_WITH_ZOVA", if (cfg.with_zova) "1" else "0");
+    if (cfg.with_zova) {
+        c_decls.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ cfg.zova_root, "include" }) });
+    }
     for ([_][]const u8{
         "src",
         "vendored",
@@ -534,15 +538,8 @@ const native_sources = [_][]const u8{
     "src/foundation/c_shim.c",
     "src/zova/cbm_zova.c",
     "src/zova/cbm_zova_publish_model.c",
-    "src/zova/cbm_zova_edge_payload.c",
-    "src/zova/cbm_zova_delta.c",
     "src/zova/cbm_zova_operations.c",
-    "src/zova/cbm_zova_v5_snapshot.c",
-    "src/zova/cbm_zova_writer_gate.c",
-    "src/zova/cbm_zova_coordination.c",
-    "src/zova/cbm_zova_route.c",
     "src/zova/cbm_zova_repository.c",
-    "src/zova/cbm_zova_bridge_stub.c",
     "src/zova/cbm_zova_plugin.c",
     "src/pipeline/fqn.c",
     "src/pipeline/path_alias.c",
