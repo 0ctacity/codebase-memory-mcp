@@ -109,6 +109,7 @@ jobs:
           mkdir -p .ci/windows-zig "$RUNNER_TEMP/cbm-zig-local" "$RUNNER_TEMP/cbm-zig-global"
           # CBM's Zig modules read C declarations from a translate-c module "c".
           zig translate-c -lc -target "$TARGET" -D_DEFAULT_SOURCE -D_GNU_SOURCE \
+            -DCBM_WITH_ZOVA=1 -I"$ZOVA_ROOT/include" \
             -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include \
             -Iinternal/cbm -Iinternal/cbm/vendored/ts_runtime/include \
             src/cbm_zig_c.h > "$RUNNER_TEMP/cbm_c.zig"

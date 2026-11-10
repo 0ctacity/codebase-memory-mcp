@@ -154,15 +154,8 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 ZOVA_SRCS = \
 	src/zova/cbm_zova.c \
 	src/zova/cbm_zova_publish_model.c \
-	src/zova/cbm_zova_edge_payload.c \
-	src/zova/cbm_zova_delta.c \
 	src/zova/cbm_zova_operations.c \
-	src/zova/cbm_zova_v5_snapshot.c \
-	src/zova/cbm_zova_writer_gate.c \
-	src/zova/cbm_zova_coordination.c \
-	src/zova/cbm_zova_route.c \
 	src/zova/cbm_zova_repository.c \
-	src/zova/cbm_zova_bridge_stub.c \
 	src/zova/cbm_zova_plugin.c
 
 # MCP server module: implemented in Zig (src/mcp/*.zig, part of libcbm_zig)
@@ -491,9 +484,21 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/graph_buffer/graph_buffer.zig src/graph_buffer/graph_buffer.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/store/store.zig src/store/store.h \
-               src/watcher/watcher.zig src/watcher/watcher.h
+               src/watcher/watcher.zig src/watcher/watcher.h \
+               src/zova/cbm_zova_bridge_stub.zig src/zova/cbm_zova_coordination.zig \
+               src/zova/cbm_zova_delta.zig src/zova/cbm_zova_edge_payload.zig \
+               src/zova/cbm_zova_route.zig src/zova/cbm_zova_v5_snapshot.zig \
+               src/zova/cbm_zova_writer_gate.zig \
+               $(wildcard src/zova/*.h)
+# The Zig modules see CBM_WITH_ZOVA and, with Zova, the SDK header too.
 CBM_ZIG_C_INCLUDES = -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include \
                      -I$(CBM_DIR) -I$(TS_INCLUDE)
+ifeq ($(CBM_WITH_ZOVA),1)
+CBM_ZIG_C_INCLUDES += -DCBM_WITH_ZOVA=1 -I$(ZOVA_ROOT)/include
+CBM_ZIG_SRCS += $(ZOVA_ROOT)/include/zova.h
+else
+CBM_ZIG_C_INCLUDES += -DCBM_WITH_ZOVA=0
+endif
 CBM_ZIG_LIB = $(BUILD_DIR)/libcbm_zig.a
 # Test runners link a ReleaseSafe copy: the sanitizers do not instrument Zig
 # code, so its runtime safety checks are what catch bounds and overflow bugs.
