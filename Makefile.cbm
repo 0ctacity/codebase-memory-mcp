@@ -173,8 +173,7 @@ MCP_SRCS =
 
 # Discover module is Zig: see CBM_ZIG_SRC.
 
-# Graph buffer module (new)
-GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
+# Graph buffer module is Zig: see CBM_ZIG_SRC.
 
 # Pipeline module (new)
 PIPELINE_SRCS = \
@@ -267,7 +266,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(ZOVA_SRCS) $(MCP_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) $(CLI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(ZOVA_SRCS) $(MCP_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) $(CLI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS)
 
@@ -492,6 +491,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/discover/userconfig.zig \
                src/discover/discover.h src/discover/userconfig.h \
                src/git/git_context.zig src/git/git_context.h \
+               src/graph_buffer/graph_buffer.zig src/graph_buffer/graph_buffer.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/watcher/watcher.zig src/watcher/watcher.h
 CBM_ZIG_C_INCLUDES = -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include \
@@ -820,7 +820,7 @@ SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
 LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(MCP_SRCS) \
-            $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) \
+            $(PIPELINE_SRCS) $(SEMANTIC_SRCS) \
             $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
