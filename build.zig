@@ -537,7 +537,6 @@ const native_sources = [_][]const u8{
     "src/foundation/hash_table.c",
     "src/foundation/c_shim.c",
     "src/zova/cbm_zova.c",
-    "src/zova/cbm_zova_repository.c",
     "src/pipeline/fqn.c",
     "src/pipeline/path_alias.c",
     "src/pipeline/laravel_routing.c",
