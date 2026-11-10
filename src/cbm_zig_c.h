@@ -7,7 +7,7 @@
  * translate-c cannot handle never blocks an unrelated module.
  *
  * The build passes -DCBM_WITH_ZOVA=0|1 to translate-c. With Zova, the SDK
- * header zova.h is translated too, and the Zig Zova modules compile their
+ * headers zova.h and zova_plugin.h are translated too, and the Zig Zova modules compile their
  * real implementation instead of the no-Zova stubs.
  */
 #ifndef CBM_ZIG_C_H
@@ -101,6 +101,7 @@
 #include "zova/cbm_zova_delta.h"
 #include "zova/cbm_zova_edge_payload.h"
 #include "zova/cbm_zova_operations.h"
+#include "zova/cbm_zova_plugin.h"
 #include "zova/cbm_zova_publish_model.h"
 #include "zova/cbm_zova_repository.h"
 #include "zova/cbm_zova_route.h"
@@ -108,6 +109,7 @@
 #include "zova/cbm_zova_writer_gate.h"
 #if CBM_WITH_ZOVA
 #include <zova.h>
+#include <zova_plugin.h>
 #endif
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
