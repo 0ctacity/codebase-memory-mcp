@@ -152,8 +152,7 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 # Optional Zova storage adapter. Compiles to no-op stubs unless
 # CBM_WITH_ZOVA=1 is set for the build.
 ZOVA_SRCS = \
-	src/zova/cbm_zova.c \
-	src/zova/cbm_zova_repository.c
+	src/zova/cbm_zova.c
 
 # MCP server module: implemented in Zig (src/mcp/*.zig, part of libcbm_zig)
 MCP_SRCS =
@@ -487,6 +486,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/zova/cbm_zova_delta.zig src/zova/cbm_zova_edge_payload.zig \
                src/zova/cbm_zova_operations.zig \
                src/zova/cbm_zova_plugin.zig src/zova/cbm_zova_publish_model.zig \
+               src/zova/cbm_zova_repository.zig \
                src/zova/cbm_zova_route.zig \
                src/zova/cbm_zova_v5_snapshot.zig \
                src/zova/cbm_zova_writer_gate.zig \

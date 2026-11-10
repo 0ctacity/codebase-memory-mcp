@@ -71,6 +71,7 @@ comptime {
     checkExports(@import("zova/cbm_zova_operations.zig"));
     checkExports(@import("zova/cbm_zova_plugin.zig"));
     checkExports(@import("zova/cbm_zova_publish_model.zig"));
+    checkExports(@import("zova/cbm_zova_repository.zig"));
     checkExports(@import("zova/cbm_zova_route.zig"));
     checkExports(@import("zova/cbm_zova_v5_snapshot.zig"));
     checkExports(@import("zova/cbm_zova_writer_gate.zig"));
