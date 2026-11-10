@@ -62,13 +62,14 @@ comptime {
     checkExports(@import("mcp/search_tools.zig"));
     checkExports(@import("mcp/server.zig"));
     checkExports(@import("simhash/minhash.zig"));
+    checkExports(@import("store/store.zig"));
     checkExports(@import("watcher/watcher.zig"));
 }
 
 /// Checks every pub `cbm_*` function of `module` against the C declaration
 /// of the same name in the translated headers.
 fn checkExports(comptime module: type) void {
-    @setEvalBranchQuota(10000);
+    @setEvalBranchQuota(50000);
     for (@typeInfo(module).@"struct".decl_names) |name| {
         if (!std.mem.startsWith(u8, name, "cbm_")) continue;
         const Impl = @TypeOf(@field(module, name));

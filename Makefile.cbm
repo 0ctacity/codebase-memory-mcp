@@ -149,9 +149,6 @@ PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 
 # SQLite writer
 
-# Store module (new)
-STORE_SRCS = src/store/store.c
-
 # Optional Zova storage adapter. Compiles to no-op stubs unless
 # CBM_WITH_ZOVA=1 is set for the build.
 ZOVA_SRCS = \
@@ -266,7 +263,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(ZOVA_SRCS) $(MCP_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) $(CLI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(ZOVA_SRCS) $(MCP_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) $(CLI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS)
 
@@ -493,6 +490,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/git/git_context.zig src/git/git_context.h \
                src/graph_buffer/graph_buffer.zig src/graph_buffer/graph_buffer.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
+               src/store/store.zig src/store/store.h \
                src/watcher/watcher.zig src/watcher/watcher.h
 CBM_ZIG_C_INCLUDES = -Isrc -Ivendored -Ivendored/sqlite3 -Ivendored/mimalloc/include \
                      -I$(CBM_DIR) -I$(TS_INCLUDE)
@@ -819,7 +817,7 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(MCP_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(MCP_SRCS) \
             $(PIPELINE_SRCS) $(SEMANTIC_SRCS) \
             $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
             $(ZSTD_SRCS) $(MAIN_SRC)

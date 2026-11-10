@@ -138,7 +138,7 @@ grep -q 'checksums.txt' "$WORKFLOWS/release.yml"
 grep -q '#define cbm_lstat' "$ROOT/src/foundation/compat.h"
 grep -q '#define cbm_mkdir_mode' "$ROOT/src/foundation/compat.h"
 for path in \
-  "$ROOT/src/store/store.c" \
+  "$ROOT/src/store/store.zig" \
   "$ROOT/src/zova/cbm_zova_operations.c" \
   "$ROOT/src/cli/cli.zig" \
   "$ROOT/src/cli/commands.zig"; do
