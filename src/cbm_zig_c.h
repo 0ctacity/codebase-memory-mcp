@@ -92,6 +92,7 @@
 #include "foundation/yaml.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/worker_pool.h"
 #include "semantic/semantic.h"
 #include "store/store.h"
 #include "tree_sitter/api.h"
