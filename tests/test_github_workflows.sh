@@ -97,7 +97,7 @@ bash "$ROOT/scripts/ci-test-shard.sh" --verify
 grep -q 'CBM_WITH_ZOVA=1' "$WORKFLOWS/_build.yml"
 grep -q 'ZOVA_ROOT=' "$WORKFLOWS/_build.yml"
 grep -q 'zova_fresh_build_begin' "$WORKFLOWS/_build.yml"
-grep -q 'cbm_zova_publish_model.c' "$ROOT/Makefile.cbm"
+grep -q 'cbm_zova_publish_model.zig' "$ROOT/Makefile.cbm"
 grep -q 'if \$WITH_ZOVA' "$ROOT/scripts/build.sh"
 grep -q 'codebase-memory-mcp-linux-.*-portable.tar.gz' "$WORKFLOWS/_build.yml"
 grep -q 'os: darwin' "$WORKFLOWS/_build.yml"
