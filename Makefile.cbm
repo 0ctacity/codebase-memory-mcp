@@ -72,7 +72,7 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
                 -fsanitize=thread -fno-omit-frame-pointer
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
-# (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), ntdll
+# (CommandLineToArgvW — the UTF-8 argv path in main.zig, #423/#20), ntdll
 # (Zig's Windows runtime), and --allow-multiple-definition (MinGW CRT clashes).
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
@@ -430,7 +430,7 @@ endif
 CBM_ZIG_SRC = src/cbm_zig.zig
 CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cli/cli_zig.h \
                src/cli/archive.zig src/cli/cli.zig src/cli/commands.zig src/cli/store.zig \
-               src/cli/tool_args.zig \
+               src/cli/tool_args.zig src/main.zig src/main.h \
                src/cli/hook_augment.zig src/cli/progress_sink.zig src/cli/progress_sink.h \
                src/cli/cli.h src/mcp/mcp.h src/pipeline/pipeline.h \
                src/pipeline/worker_pool.h \

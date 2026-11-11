@@ -24,7 +24,7 @@
 
 #include "foundation/subprocess.h" /* cbm_proc_outcome_t */
 
-/* Worker-role state, set once from the CLI arg parser (main.c) when this process
+/* Worker-role state, set once from the CLI arg parser (main.zig) when this process
  * was spawned as a supervised worker. When active, indexing must run in-process
  * (the gate must NOT re-supervise). response_out (may be NULL) is the file the
  * worker writes its final result string to, for the parent to read back. */

@@ -156,7 +156,7 @@ int cbm_mcp_check_index_root(const char *repo_path, char *canonical_out, size_t 
  * response string (caller frees) on success, or NULL to signal the caller must
  * degrade to the in-process path (kill switch set, spawn failure, or the process
  * is not a supervisor host). This is the shared entry the watcher re-index
- * (main.c) and the session auto-index (mcp.c) route through. */
+ * (main.zig) and the session auto-index (mcp.c) route through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
 /* Index hold (ADR-0001) for root_path, canonicalized the way index_repository

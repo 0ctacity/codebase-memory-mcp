@@ -53,6 +53,7 @@ comptime {
     checkExports(@import("foundation/yaml.zig"));
     checkExports(@import("git/git_context.zig"));
     checkExports(@import("graph_buffer/graph_buffer.zig"));
+    checkExports(@import("main.zig"));
     checkExports(@import("mcp/code_tools.zig"));
     checkExports(@import("mcp/graph_tools.zig"));
     checkExports(@import("mcp/index_supervisor.zig"));
