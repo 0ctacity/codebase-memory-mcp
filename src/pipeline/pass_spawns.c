@@ -15,10 +15,8 @@
 #include <stdio.h>
 #include <string.h>
 
-/* Edge confidence: a site read from the source, or only from the
- * macro-expanded buffer of a C-family file. */
+/* Edge confidence: a site read from the source. */
 static const double SPAWN_CONF_SOURCE = 1.0;
-static const double SPAWN_CONF_EXPANDED = 0.5;
 
 /* Strategies that only guess by name: they never make a spawn spelling an
  * ordinary call (`subprocess.run` must not become the project's `run`, nor
@@ -97,19 +95,9 @@ void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, co
     if (process_id <= 0) {
         return;
     }
-    /* C-family files are extracted twice; a call from the macro-expanded
-     * buffer carries an expanded-buffer line, not a source line. It records
-     * no line and less confidence, so the raw site's edge (which wins on
-     * confidence when both exist) keeps the source line. */
     char edge_props[CBM_SZ_512];
-    if (call->source_origin == CBM_SOURCE_ORIGIN_RAW) {
-        snprintf(edge_props, sizeof(edge_props),
-                 "{\"api\":\"%s\",\"program\":\"%s\",\"line\":%d,\"confidence\":%.2f}", api,
-                 program, call->start_line, SPAWN_CONF_SOURCE);
-    } else {
-        snprintf(edge_props, sizeof(edge_props),
-                 "{\"api\":\"%s\",\"program\":\"%s\",\"confidence\":%.2f}", api, program,
-                 SPAWN_CONF_EXPANDED);
-    }
+    snprintf(edge_props, sizeof(edge_props),
+             "{\"api\":\"%s\",\"program\":\"%s\",\"line\":%d,\"confidence\":%.2f}", api, program,
+             call->start_line, SPAWN_CONF_SOURCE);
     cbm_gbuf_insert_edge(gbuf, source->id, process_id, "SPAWNS", edge_props);
 }

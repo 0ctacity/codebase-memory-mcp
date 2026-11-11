@@ -324,7 +324,6 @@ static const cbm_spawn_api_t *spawn_table(CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
-    case CBM_LANG_ARKTS:
         return js_family;
     case CBM_LANG_GO:
         return go;
