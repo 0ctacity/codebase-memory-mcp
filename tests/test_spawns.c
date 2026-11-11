@@ -90,8 +90,18 @@ TEST(spawn_match_bare_names) {
 /* Program of `callee(arg0, arg1)` as the extractor records it. */
 static const char *sp_program(CBMLanguage lang, const char *callee, const char *arg0,
                               const char *arg1, const CBMImport *imports, int count, char *buf) {
-    CBMCallArg args[2] = {{.expr = arg0, .index = 0}, {.expr = arg1, .index = 1}};
-    CBMCall call = {.callee_name = callee, .args = args, .arg_count = arg1 ? 2 : (arg0 ? 1 : 0)};
+    CBMCall call = {0};
+    call.callee_name = callee;
+    if (arg0) {
+        call.args[0].expr = arg0;
+        call.args[0].index = 0;
+        call.arg_count = 1;
+    }
+    if (arg1) {
+        call.args[1].expr = arg1;
+        call.args[1].index = 1;
+        call.arg_count = 2;
+    }
     const cbm_spawn_api_t *api = cbm_spawn_match(lang, callee, imports, count);
     if (!api) {
         return "(no match)";
@@ -214,14 +224,14 @@ static bool sp_index(sp_proj_t *p, const sp_file_t *files, int count, int pad) {
     cbm_mkdir_p(cache, 0755);
     snprintf(p->dbpath, sizeof(p->dbpath), "%s/%s.db", cache, p->project);
     unlink(p->dbpath);
-    p->srv = cbm_mcp_server_new(NULL);
+    p->srv = cbm_mcp_server_new();
     if (!p->srv) {
         return false;
     }
     char args[800];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", p->tmpdir);
     free(cbm_mcp_handle_tool(p->srv, "index_repository", args));
-    p->store = cbm_store_open_path(p->dbpath);
+    p->store = cbm_store_open_path_query(p->dbpath);
     return p->store != NULL;
 }
 
