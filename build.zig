@@ -536,11 +536,9 @@ fn grammarSources(b: *std.Build) []const []const u8 {
 const native_sources = [_][]const u8{
     "src/foundation/hash_table.c",
     "src/foundation/c_shim.c",
-    "src/pipeline/laravel_routing.c",
     "src/pipeline/pipeline.c",
     "src/pipeline/pipeline_incremental.c",
     "src/pipeline/pass_parallel.c",
-    "src/pipeline/service_bindings.c",
     "src/pipeline/pass_lsp_cross.c",
     "src/pipeline/pass_semantic.c",
     "src/pipeline/pass_tests.c",

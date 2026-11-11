@@ -62,9 +62,11 @@ comptime {
     checkExports(@import("mcp/search_tools.zig"));
     checkExports(@import("mcp/server.zig"));
     checkExports(@import("pipeline/fqn.zig"));
+    checkExports(@import("pipeline/laravel_routing.zig"));
     checkExports(@import("pipeline/path_alias.zig"));
     checkExports(@import("pipeline/registry.zig"));
     checkExports(@import("pipeline/result_spill.zig"));
+    checkExports(@import("pipeline/service_bindings.zig"));
     checkExports(@import("pipeline/worker_pool.zig"));
     checkExports(@import("semantic/ast_profile.zig"));
     checkExports(@import("semantic/rotsq.zig"));
