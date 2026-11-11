@@ -189,6 +189,7 @@ static inline FILE *cbm_zig_stderr(void) {
 #include "mcp/index_supervisor.h"
 #include "pipeline/laravel_routing.h"
 #include "pipeline/lsp_resolve.h"
+#include "pipeline/spawns.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/path_alias.h"
 #include "pipeline/pipeline.h"

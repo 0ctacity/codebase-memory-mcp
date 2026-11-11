@@ -90,6 +90,7 @@ comptime {
     checkExports(@import("pipeline/registry.zig"));
     checkExports(@import("pipeline/result_spill.zig"));
     checkExports(@import("pipeline/service_bindings.zig"));
+    checkExports(@import("pipeline/spawns.zig"));
     checkExports(@import("pipeline/worker_pool.zig"));
     checkExports(@import("semantic/ast_profile.zig"));
     checkExports(@import("semantic/rotsq.zig"));

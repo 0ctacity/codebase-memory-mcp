@@ -155,6 +155,9 @@ static const cbm_spawn_api_t ruby[] = {
     {"Open3.pipeline", NULL, U, 0, -1},  {NULL, NULL, 0, 0, -1},
 };
 
+/* PHP: global functions (exec, system, passthru, etc.). Bare calls with
+ * a receiver ($pdo->exec) are skipped by the pipeline caller (spawns.zig)
+ * via call->is_method. */
 static const cbm_spawn_api_t php[] = {
     {"exec", NULL, U, 0, -1},
     {"shell_exec", NULL, U, 0, -1},

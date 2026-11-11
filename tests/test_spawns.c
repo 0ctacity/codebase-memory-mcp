@@ -1,13 +1,14 @@
 /*
  * test_spawns.c — SPAWNS edges: a call that starts another program, to the
  * Process node of that program (internal/cbm/spawn_patterns.h,
- * src/pipeline/pass_spawns.c).
+ * src/pipeline/spawns.zig).
  *
  * Unit tests pin how a call is recognised (spellings, the file's imports,
  * bare names only when nothing in the project answers) and which program it
  * starts (a literal, a collection's first element, never an argument after a
  * variable program). Pipeline tests pin the edges in an indexed repo and that
- * the sequential and parallel resolvers emit the same ones.
+ * the result does not depend on the file count (single-thread vs worker-pool
+ * batching).
  */
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
@@ -15,6 +16,7 @@
 #include <foundation/compat_fs.h>
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
+#include "pipeline/spawns.h"
 #include <store/store.h>
 #include <sqlite3.h>
 #include "spawn_patterns.h"
@@ -402,6 +404,8 @@ static const sp_file_t SP_FILES[] = {
                   "func deploy() { exec.Command(\"kubectl\", \"apply\").Run() }\n"},
     {"launch.js", "const { spawn } = require(\"child_process\");\n"
                   "function start() { spawn(\"node\", [\"server.js\"]); }\n"},
+    /* Bare PHP exec is a spawn; method call on a receiver ($pdo->exec) is not. */
+    {"db.php", "<?php\nfunction cleanup($pdo) {\n    $pdo->exec(\"DELETE FROM jobs\");\n    exec(\"ls -la\");\n}\n"},
 };
 #define SP_FILE_COUNT ((int)(sizeof(SP_FILES) / sizeof(SP_FILES[0])))
 
@@ -413,6 +417,9 @@ TEST(spawns_in_the_graph) {
     ASSERT_EQ(sp_spawns(&p, "clean", "rm"), 1);
     ASSERT_EQ(sp_spawns(&p, "deploy", "kubectl"), 1);
     ASSERT_EQ(sp_spawns(&p, "start", "node"), 1);
+    ASSERT_EQ(sp_spawns(&p, "cleanup", "ls"), 1);
+    ASSERT_EQ(sp_spawns(&p, "cleanup", "DELETE"), 0);
+    ASSERT_EQ(sp_calls(&p, "cleanup", "DELETE"), 0);
     /* The spawn replaces the CALLS edge a guess would have made. */
     ASSERT_EQ(sp_calls(&p, "build", "run"), 0);
     /* A project-defined system() is code, not a process. */
@@ -424,13 +431,14 @@ TEST(spawns_in_the_graph) {
     ASSERT_TRUE(sp_has_process_node(&p, "rm", "__process__rm"));
     ASSERT_TRUE(sp_has_process_node(&p, "kubectl", "__process__kubectl"));
     ASSERT_TRUE(sp_has_process_node(&p, "node", "__process__node"));
+    ASSERT_TRUE(sp_has_process_node(&p, "ls", "__process__ls"));
     sp_cleanup(&p);
     PASS();
 }
 
-/* The sequential (few files) and parallel (past MIN_FILES_FOR_PARALLEL)
- * resolvers ask at the same point and emit the same SPAWNS edges. */
-TEST(spawns_parallel_matches_sequential) {
+/* Emission of SPAWNS edges does not depend on file count (single-thread
+ * vs worker-pool batching). */
+TEST(spawns_result_invariant_to_file_count) {
     static char seq[4096];
     static char par[4096];
     sp_proj_t p;
@@ -454,5 +462,5 @@ SUITE(spawns) {
     RUN_TEST(spawn_match_bare_names);
     RUN_TEST(spawn_program_rules);
     RUN_TEST(spawns_in_the_graph);
-    RUN_TEST(spawns_parallel_matches_sequential);
+    RUN_TEST(spawns_result_invariant_to_file_count);
 }

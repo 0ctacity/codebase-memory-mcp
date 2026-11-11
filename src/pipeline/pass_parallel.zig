@@ -14,6 +14,7 @@ const c = @import("c");
 const interop = @import("../foundation/interop.zig");
 const util = @import("util.zig");
 const lsp_resolve = @import("lsp_resolve.zig");
+const spawns = @import("spawns.zig");
 
 const CStr = util.CStr;
 const MutStr = util.MutStr;
@@ -2629,9 +2630,9 @@ fn resolveFileCalls(
         // A call that starts another program (subprocess.run, exec.Command,
         // posix_spawn): a SPAWNS edge to its Process node instead of a CALLS
         // edge. `res` holds the LSP answer when there is one.
-        var spawn: c.cbm_pipeline_spawn_t = undefined;
-        if (c.cbm_pipeline_spawn_site(rc.main_gbuf, lang, call, &result.imports, &res, &spawn)) {
-            c.cbm_pipeline_emit_spawn(ws.local_edge_buf, source_node, call, &spawn);
+        var spawn: spawns.Spawn = undefined;
+        if (spawns.site(rc.main_gbuf, lang, call, &result.imports, &res, &spawn)) {
+            spawns.emit(ws.local_edge_buf, source_node, call, &spawn);
             continue;
         }
 

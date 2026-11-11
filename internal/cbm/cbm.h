@@ -275,7 +275,8 @@ typedef struct {
     uint32_t site_start_byte;           // start byte of the call node; joins an LSP row that
                                         // carries an exact invocation site (Zig)
     bool is_method;                     // method/member call with an UNRESOLVED receiver. Perl:
-                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                        // arrow/method call ($obj->m). PHP: member call ($obj->m).
+                                        // Ruby: member call (obj.m). TS/JS/TSX: member call
                                         // x.foo() whose receiver is not this/super. Python:
                                         // x.foo() where x is not self/cls/super() and is not
                                         // rooted in an imported name. Zig: x.m() whose
