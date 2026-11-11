@@ -540,8 +540,6 @@ const native_sources = [_][]const u8{
     "src/pipeline/pipeline_incremental.c",
     "src/pipeline/pass_parallel.c",
     "src/pipeline/pass_lsp_cross.c",
-    "src/pipeline/pass_githistory.c",
-    "src/pipeline/pass_gitdiff.c",
     "src/pipeline/pass_configlink.c",
     "src/pipeline/pass_route_nodes.c",
     "src/pipeline/pass_envscan.c",
