@@ -167,8 +167,7 @@ PIPELINE_SRCS = \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/pass_parallel.c \
-    src/pipeline/pass_lsp_cross.c \
-    src/pipeline/pass_pkgmap.c
+    src/pipeline/pass_lsp_cross.c
 
 # SimHash / MinHash, watcher and git context modules are Zig: see CBM_ZIG_SRC.
 
@@ -467,10 +466,10 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/pipeline/pass_enrichment.zig src/pipeline/pass_envscan.zig \
                src/pipeline/pass_gitdiff.zig src/pipeline/pass_githistory.zig \
                src/pipeline/pass_importance.zig src/pipeline/pass_infrascan.zig \
-               src/pipeline/pass_k8s.zig src/pipeline/pass_route_nodes.zig \
-               src/pipeline/pass_semantic.zig src/pipeline/pass_semantic_edges.zig \
-               src/pipeline/pass_similarity.zig src/pipeline/pass_tests.zig \
-               src/pipeline/path_alias.zig src/pipeline/registry.zig \
+               src/pipeline/pass_k8s.zig src/pipeline/pass_pkgmap.zig \
+               src/pipeline/pass_route_nodes.zig src/pipeline/pass_semantic.zig \
+               src/pipeline/pass_semantic_edges.zig src/pipeline/pass_similarity.zig \
+               src/pipeline/pass_tests.zig src/pipeline/path_alias.zig src/pipeline/registry.zig \
                src/pipeline/result_spill.zig src/pipeline/service_bindings.zig \
                src/pipeline/util.zig src/pipeline/worker_pool.zig src/pipeline/laravel_routing.h \
                src/pipeline/lsp_resolve.h src/pipeline/pass_lsp_cross.h \
