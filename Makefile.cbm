@@ -168,7 +168,6 @@ PIPELINE_SRCS = \
     src/pipeline/pipeline.c \
     src/pipeline/pipeline_incremental.c \
     src/pipeline/pass_parallel.c \
-    src/pipeline/result_spill.c \
     src/pipeline/service_bindings.c \
     src/pipeline/pass_lsp_cross.c \
     src/pipeline/pass_semantic.c \
@@ -481,11 +480,11 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/semantic/ast_profile.h src/semantic/rotsq.h src/semantic/semantic.h \
                vendored/nomic/code_vectors.h vendored/nomic/code_tokens.h \
                src/pipeline/fqn.zig src/pipeline/path_alias.zig src/pipeline/registry.zig \
-               src/pipeline/util.zig src/pipeline/worker_pool.zig src/pipeline/laravel_routing.h \
-               src/pipeline/lsp_resolve.h src/pipeline/pass_lsp_cross.h \
-               src/pipeline/path_alias.h src/pipeline/pipeline_internal.h \
-               src/pipeline/result_spill.h src/pipeline/worker_pool.h \
-               src/graph_buffer/graph_buffer.h \
+               src/pipeline/result_spill.zig src/pipeline/util.zig src/pipeline/worker_pool.zig \
+               src/pipeline/laravel_routing.h src/pipeline/lsp_resolve.h \
+               src/pipeline/pass_lsp_cross.h src/pipeline/path_alias.h \
+               src/pipeline/pipeline_internal.h src/pipeline/result_spill.h \
+               src/pipeline/worker_pool.h src/graph_buffer/graph_buffer.h \
                src/simhash/minhash.zig src/simhash/minhash.h \
                src/store/store.zig src/store/store.h \
                src/watcher/watcher.zig src/watcher/watcher.h \

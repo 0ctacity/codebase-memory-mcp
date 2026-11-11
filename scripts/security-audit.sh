@@ -171,7 +171,7 @@ while IFS= read -r match; do
     file=$(echo "$match" | cut -d: -f1)
     relfile="${file#"$ROOT/"}"
     case "$relfile" in
-        src/cli/cli.zig|src/pipeline/*.c|src/foundation/diagnostics.zig|src/mcp/search_tools.zig|src/mcp/index_tools.zig)
+        src/cli/cli.zig|src/pipeline/*.zig|src/foundation/diagnostics.zig|src/mcp/search_tools.zig|src/mcp/index_tools.zig)
             ;; # Known safe (diagnostics.zig: atomic .tmp+rename metrics dump to configured path;
                # search_tools.zig: search pattern/file-list temp files; index_tools.zig:
                # index supervisor response/quarantine files)
