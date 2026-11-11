@@ -538,7 +538,7 @@ const native_sources = [_][]const u8{
     "src/foundation/c_shim.c",
     "src/pipeline/pipeline.c",
     "src/pipeline/pipeline_incremental.c",
-    "src/pipeline/pass_parallel.c",
+    "src/pipeline/lsp_resolve_shim.c",
     "vendored/yyjson/yyjson.c",
     "internal/cbm/cbm.c",
     "internal/cbm/extract_defs.c",
