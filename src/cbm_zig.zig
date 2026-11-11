@@ -83,6 +83,7 @@ comptime {
     checkExports(@import("pipeline/pass_similarity.zig"));
     checkExports(@import("pipeline/pass_tests.zig"));
     checkExports(@import("pipeline/path_alias.zig"));
+    checkExports(@import("pipeline/pipeline_incremental.zig"));
     checkExports(@import("pipeline/registry.zig"));
     checkExports(@import("pipeline/result_spill.zig"));
     checkExports(@import("pipeline/service_bindings.zig"));
