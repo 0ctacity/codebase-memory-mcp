@@ -63,6 +63,35 @@
 #ifdef __linux__
 #include <sys/sysinfo.h>
 #endif
+
+/* C11 atomics, as translate-c can read them. translate-c has no atomic
+ * types, so a declaration that names one (the pipeline context's cancel flag,
+ * the shared id counter) would be dropped together with everything that uses
+ * it. Here an atomic type is its plain type and the atomic operations are the
+ * compiler builtins, which keeps those declarations and their layout. The Zig
+ * side reads and writes such fields with @atomicLoad / @atomicStore /
+ * @atomicRmw. Only this translation unit sees the view: the C sources keep
+ * the real <stdatomic.h>. */
+#define __CLANG_STDATOMIC_H /* keeps clang's <stdatomic.h> out */
+#define _Atomic
+typedef _Bool atomic_bool;
+typedef int atomic_int;
+typedef unsigned int atomic_uint;
+typedef long atomic_long;
+typedef unsigned long atomic_ulong;
+typedef long long atomic_llong;
+typedef unsigned long long atomic_ullong;
+#define memory_order_relaxed __ATOMIC_RELAXED
+#define memory_order_consume __ATOMIC_CONSUME
+#define memory_order_acquire __ATOMIC_ACQUIRE
+#define memory_order_release __ATOMIC_RELEASE
+#define memory_order_acq_rel __ATOMIC_ACQ_REL
+#define memory_order_seq_cst __ATOMIC_SEQ_CST
+#define atomic_load(p) __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define atomic_load_explicit(p, o) __atomic_load_n((p), (o))
+#define atomic_fetch_add(p, v) __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+#define atomic_fetch_add_explicit(p, v, o) __atomic_fetch_add((p), (v), (o))
+
 #include <mimalloc.h>
 
 #include "foundation/arena.h"
@@ -91,12 +120,26 @@
 #include "foundation/system_info_internal.h"
 #include "foundation/compat_fs_internal.h"
 #include "foundation/yaml.h"
+#include "arena.h"
+#include "cbm.h"
+#include "helpers.h"
+#include "lang_specs.h"
+#include "lsp/c_lsp.h"
+#include "lsp/go_lsp.h"
+#include "lsp/java_lsp.h"
+#include "lsp/kotlin_lsp.h"
+#include "lsp/php_lsp.h"
+#include "lsp/py_lsp.h"
+#include "lsp/rust_cargo.h"
+#include "lsp/rust_lsp.h"
+#include "lsp/ts_lsp.h"
+#include "lsp/zig_lsp.h"
 #include "mcp/mcp.h"
 #include "nomic/code_vectors.h"
-#include "pipeline/pipeline.h"
-#include "pipeline/worker_pool.h"
+#include "service_patterns.h"
 #include "store/store.h"
 #include "tree_sitter/api.h"
+#include "xxhash/xxhash.h"
 #include "zova/cbm_zova.h"
 #include "zova/cbm_zova_bridge.h"
 #include "zova/cbm_zova_coordination.h"
@@ -139,6 +182,14 @@ static inline FILE *cbm_zig_stderr(void) {
 #include "git/git_context.h"
 #include "graph_buffer/graph_buffer.h"
 #include "mcp/index_supervisor.h"
+#include "pipeline/laravel_routing.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
+#include "pipeline/path_alias.h"
+#include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h"
+#include "pipeline/result_spill.h"
+#include "pipeline/worker_pool.h"
 #include "semantic/ast_profile.h"
 #include "semantic/semantic.h"
 #include "simhash/minhash.h"
