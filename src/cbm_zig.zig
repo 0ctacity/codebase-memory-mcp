@@ -61,6 +61,7 @@ comptime {
     checkExports(@import("mcp/project_tools.zig"));
     checkExports(@import("mcp/search_tools.zig"));
     checkExports(@import("mcp/server.zig"));
+    checkExports(@import("pipeline/worker_pool.zig"));
     checkExports(@import("semantic/ast_profile.zig"));
     checkExports(@import("semantic/rotsq.zig"));
     checkExports(@import("semantic/semantic.zig"));
