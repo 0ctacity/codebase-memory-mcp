@@ -2626,6 +2626,15 @@ fn resolveFileCalls(
             }
         }
 
+        // A call that starts another program (subprocess.run, exec.Command,
+        // posix_spawn): a SPAWNS edge to its Process node instead of a CALLS
+        // edge. `res` holds the LSP answer when there is one.
+        var spawn: c.cbm_pipeline_spawn_t = undefined;
+        if (c.cbm_pipeline_spawn_site(rc.main_gbuf, lang, call, &result.imports, &res, &spawn)) {
+            c.cbm_pipeline_emit_spawn(ws.local_edge_buf, source_node, call, &spawn);
+            continue;
+        }
+
         const unresolved = res.qualified_name == null or res.qualified_name[0] == 0;
         if (unresolved or c.cbm_registry_strategy_is_weak(res.strategy)) {
             // A callee an import binds to an external client library

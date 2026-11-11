@@ -115,7 +115,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
-    $(CBM_DIR)/service_patterns.c
+    $(CBM_DIR)/service_patterns.c \
+    $(CBM_DIR)/spawn_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -162,7 +163,7 @@ MCP_SRCS =
 # Graph buffer module is Zig: see CBM_ZIG_SRC.
 
 # Pipeline module: implemented in Zig (src/pipeline/*.zig, part of libcbm_zig)
-PIPELINE_SRCS =
+PIPELINE_SRCS = src/pipeline/pass_spawns.c
 
 # SimHash / MinHash, watcher and git context modules are Zig: see CBM_ZIG_SRC.
 
@@ -273,7 +274,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference.c tests/test_importance.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_spawns.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference.c tests/test_importance.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

@@ -140,6 +140,7 @@ typedef unsigned long long atomic_ullong;
 #include "mcp/mcp.h"
 #include "nomic/code_vectors.h"
 #include "service_patterns.h"
+#include "spawn_patterns.h"
 #include "store/store.h"
 #include "tree_sitter/api.h"
 #include "xxhash/xxhash.h"

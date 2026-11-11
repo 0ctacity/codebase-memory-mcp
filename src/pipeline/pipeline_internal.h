@@ -18,9 +18,32 @@
 #include "foundation/hash_table.h"
 #include "cbm.h"
 #include "service_patterns.h" /* cbm_svc_kind_t */
+#include "spawn_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
 #include <string.h>
+
+/* A spawn site (pass_spawns.c): the API the call names and the program it
+ * starts (CBM_SPAWN_DYNAMIC when not a literal). */
+typedef struct {
+    const char *api;
+    char program[CBM_SPAWN_PROGRAM_MAX];
+} cbm_pipeline_spawn_t;
+
+/* True when `call` starts another program (spawn_patterns.h) and `res`, the
+ * registry answer after the cross-language veto, does not make it a call into
+ * the project's own code. `imports` are the file's extracted imports, not the
+ * resolver's import map: that one holds only imports that resolved to project
+ * nodes, and subprocess or os/exec never do. Emits cbm_pipeline_emit_spawn
+ * INSTEAD of a CALLS edge. */
+bool cbm_pipeline_spawn_site(const cbm_gbuf_t *gbuf, CBMLanguage lang, const CBMCall *call,
+                             const CBMImportArray *imports, const cbm_resolution_t *res,
+                             cbm_pipeline_spawn_t *out);
+
+/* The Process node of the spawned program (QN __process__<program>, one per
+ * program) and the SPAWNS edge from `source` to it. */
+void cbm_pipeline_emit_spawn(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
+                             const cbm_pipeline_spawn_t *spawn);
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
