@@ -14,6 +14,7 @@ const c = @import("c");
 const interop = @import("../foundation/interop.zig");
 const util = @import("util.zig");
 const lsp_resolve = @import("lsp_resolve.zig");
+const spawns = @import("spawns.zig");
 
 const CStr = util.CStr;
 const MutStr = util.MutStr;
@@ -2624,6 +2625,15 @@ fn resolveFileCalls(
                 emitServiceEdge(ws.local_edge_buf, source_node, source_node, call, &svc_res, module_qn, rc.registry, rc.main_gbuf, imp_keys, imp_vals, imp_count, false, lang, &route_mount);
                 continue;
             }
+        }
+
+        // A call that starts another program (subprocess.run, exec.Command,
+        // posix_spawn): a SPAWNS edge to its Process node instead of a CALLS
+        // edge. `res` holds the LSP answer when there is one.
+        var spawn: spawns.Spawn = undefined;
+        if (spawns.site(rc.main_gbuf, lang, call, &result.imports, &res, &spawn)) {
+            spawns.emit(ws.local_edge_buf, source_node, call, &spawn);
+            continue;
         }
 
         const unresolved = res.qualified_name == null or res.qualified_name[0] == 0;

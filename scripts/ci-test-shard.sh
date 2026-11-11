@@ -10,7 +10,7 @@ mcp_query=(
   mcp cypher cli integration security
 )
 pipeline=(
-  graph_buffer registry pipeline importance index_resilience call_reference fqn route_canon
+  graph_buffer registry pipeline spawns importance index_resilience call_reference fqn route_canon
   path_alias watcher
   configlink infrascan worker_pool parallel incremental discover language userconfig
   gitignore git_context

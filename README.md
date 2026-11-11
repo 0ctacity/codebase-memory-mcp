@@ -352,10 +352,10 @@ with the same name gets the shortest unique parent-qualified name, such as
 ## Graph data model
 
 **Node labels:** `Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`,
-`Interface`, `Enum`, `Type`, `Route`, `Resource`
+`Interface`, `Enum`, `Type`, `Route`, `Resource`, `Process`
 
 **Edge types:** `CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`,
-`IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `INHERITS`,
+`IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `SPAWNS`, `IMPLEMENTS`, `INHERITS`,
 `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `EMITS`,
 `LISTENS_ON`, `DATA_FLOWS`, `SIMILAR_TO`, `SEMANTICALLY_RELATED`, `FILE_CHANGES_WITH`
 

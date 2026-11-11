@@ -115,7 +115,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
-    $(CBM_DIR)/service_patterns.c
+    $(CBM_DIR)/service_patterns.c \
+    $(CBM_DIR)/spawn_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
@@ -273,7 +274,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference.c tests/test_importance.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_spawns.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference.c tests/test_importance.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -468,6 +469,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/pipeline/pass_tests.zig src/pipeline/path_alias.zig src/pipeline/pipeline.zig \
                src/pipeline/pipeline_incremental.zig src/pipeline/registry.zig \
                src/pipeline/result_spill.zig src/pipeline/service_bindings.zig \
+               src/pipeline/spawns.zig src/pipeline/spawns.h \
                src/pipeline/util.zig src/pipeline/worker_pool.zig src/pipeline/laravel_routing.h \
                src/pipeline/lsp_resolve.h src/pipeline/pass_lsp_cross.h \
                src/pipeline/path_alias.h src/pipeline/pipeline_internal.h \
