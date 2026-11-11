@@ -12,6 +12,7 @@ const std = @import("std");
 const c = @import("c");
 const interop = @import("../foundation/interop.zig");
 const util = @import("util.zig");
+const lsp_resolve = @import("lsp_resolve.zig");
 
 const CStr = util.CStr;
 const MutStr = util.MutStr;
@@ -820,7 +821,7 @@ fn incrRestoreInboundEdges(gbuf: ?*Gbuf, cap: *EdgeCapture) c_int {
         // re-prove its CALL_REFERENCE. Keep the snapshot edge only while the
         // same QN is still a callable; never guess a rename.
         if (s.type != null and streq(s.type, "CALL_REFERENCE") and
-            !c.cbm_pipeline_node_is_callable_target(tgt))
+            !lsp_resolve.nodeIsCallableTarget(tgt))
         {
             continue;
         }

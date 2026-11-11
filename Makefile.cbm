@@ -161,10 +161,8 @@ MCP_SRCS =
 
 # Graph buffer module is Zig: see CBM_ZIG_SRC.
 
-# Pipeline module: implemented in Zig (src/pipeline/*.zig, part of libcbm_zig).
-# lsp_resolve_shim.c compiles one inline function of lsp_resolve.h that
-# translate-c cannot hand to the Zig side.
-PIPELINE_SRCS = src/pipeline/lsp_resolve_shim.c
+# Pipeline module: implemented in Zig (src/pipeline/*.zig, part of libcbm_zig)
+PIPELINE_SRCS =
 
 # SimHash / MinHash, watcher and git context modules are Zig: see CBM_ZIG_SRC.
 
@@ -457,7 +455,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/semantic/semantic.zig \
                src/semantic/ast_profile.h src/semantic/rotsq.h src/semantic/semantic.h \
                vendored/nomic/code_vectors.h vendored/nomic/code_tokens.h \
-               src/pipeline/fqn.zig src/pipeline/laravel_routing.zig \
+               src/pipeline/fqn.zig src/pipeline/laravel_routing.zig src/pipeline/lsp_resolve.zig \
                src/pipeline/pass_compile_commands.zig src/pipeline/pass_complexity.zig \
                src/pipeline/pass_configlink.zig src/pipeline/pass_configures.zig \
                src/pipeline/pass_enrichment.zig src/pipeline/pass_envscan.zig \

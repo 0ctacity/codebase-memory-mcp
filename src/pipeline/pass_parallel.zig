@@ -13,6 +13,7 @@ const std = @import("std");
 const c = @import("c");
 const interop = @import("../foundation/interop.zig");
 const util = @import("util.zig");
+const lsp_resolve = @import("lsp_resolve.zig");
 
 const CStr = util.CStr;
 const MutStr = util.MutStr;
@@ -97,10 +98,6 @@ const PP_RETAIN_PER_FILE_HARD_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MiB per
 /// not re-pay the full nap tax on every file pull when napping cannot reclaim
 /// memory (the resident floor, not in-flight transients, holds the budget).
 var g_bp_nap_cycles: std.atomic.Value(c_long) = .init(0);
-/// Defined here, declared in lsp_resolve.h: the uncapped tail-match scan's
-/// cost, logged at the end of parallel resolve.
-pub export var g_lsp_tail_lookups: u64 = 0;
-pub export var g_lsp_tail_candidates: u64 = 0;
 
 pub export fn cbm_pp_bp_nap_cycles() c_long {
     return g_bp_nap_cycles.load(.monotonic);
@@ -2473,7 +2470,7 @@ fn resolveFileCalls(
                 var key: [1024]u8 = undefined;
                 // A row with a site span proves one call site: key it by that
                 // site so it never answers a same-named call elsewhere in the
-                // caller (cbm_pipeline_lsp_site_admits).
+                // caller (lsp_resolve.zig siteAdmits).
                 const kn = if (rc_e.site_end_byte > rc_e.site_start_byte)
                     c.snprintf(&key, key.len, "%s|%s@%u", rc_e.caller_qn, short_name, rc_e.site_start_byte)
                 else
@@ -2502,7 +2499,7 @@ fn resolveFileCalls(
         const source_node = source_node_opt orelse continue;
 
         // LSP-resolved calls take precedence over registry textual matching.
-        // The shared helper and CBM_LSP_CONFIDENCE_FLOOR (lsp_resolve.h)
+        // The shared helper (lsp_resolve.zig) and CBM_LSP_CONFIDENCE_FLOOR
         // decide which LSP overrides are admitted. Unique-tail fallbacks
         // are JVM-only (see cbm_pipeline_lsp_allow_tail_match).
         const allow_tail = c.cbm_pipeline_lsp_allow_tail_match(lang);
@@ -2510,7 +2507,7 @@ fn resolveFileCalls(
         var lsp: ?*const c.CBMResolvedCall = null;
         t0 = extractNowNs();
         if (lsp_idx != null and call.enclosing_func_qn != null) {
-            const call_leaf: CStr = c.cbm_pipeline_call_callee_leaf(call.callee_name);
+            const call_leaf: CStr = lsp_resolve.bareSegment(call.callee_name);
             var key: [1024]u8 = undefined;
             var kn: c_int = if (call_leaf != null)
                 c.snprintf(&key, key.len, "%s|%s@%u", call.enclosing_func_qn, call_leaf, call.site_start_byte)
@@ -2725,23 +2722,22 @@ fn resolveFileUsages(
     imp_count: c_int,
     lang: Language,
 ) void {
-    var ref_index: c.cbm_pipeline_ref_index_t = undefined;
-    _ = c.cbm_pipeline_ref_index_build(&result.resolved_calls, &ref_index);
+    var ref_index = lsp_resolve.RefIndex.build(&result.resolved_calls);
+    defer ref_index.deinit();
     const allow_tail = c.cbm_pipeline_lsp_allow_tail_match(lang);
     for (0..ix(result.usages.count)) |u| {
         const usage = util.at(result.usages.items, u);
         if (usage.ref_name == null) continue;
         const src = findSourceNode(rc.main_gbuf, rc.project_name, rel, usage.enclosing_func_qn) orelse continue;
-        var tgt: ?*const Node = null;
-        var row: ?*const c.CBMResolvedCall = null;
-        const join = c.cbm_pipeline_join_lsp_reference(rc.main_gbuf, rc.project_name, &ref_index, usage, allow_tail, @ptrCast(&tgt), @ptrCast(&row));
-        if (join == c.CBM_REF_JOIN_SKIP or (join == c.CBM_REF_JOIN_VALUE and usage.reference_only)) {
+        const join = lsp_resolve.joinLspReference(rc.main_gbuf, rc.project_name, ref_index, usage, allow_tail);
+        if (join.kind == .skip or (join.kind == .value and usage.reference_only)) {
             continue;
         }
-        if (join == c.CBM_REF_JOIN_NONE) {
+        var tgt = join.target;
+        if (join.kind == .none) {
             const res = c.cbm_registry_resolve(rc.registry, usage.ref_name, module_qn, imp_keys, imp_vals, imp_count);
             if (res.qualified_name == null or res.qualified_name[0] == 0) continue;
-            if (!c.cbm_pipeline_reference_fallback_allowed(lang, usage, res.strategy, imp_keys, imp_count)) {
+            if (!lsp_resolve.referenceFallbackAllowed(lang, usage, res.strategy, imp_keys, imp_count)) {
                 continue;
             }
             tgt = c.cbm_gbuf_find_by_qn(rc.main_gbuf, res.qualified_name);
@@ -2759,12 +2755,11 @@ fn resolveFileUsages(
         var uprops: [c.CBM_SZ_512]u8 = undefined;
         var esc_ref: [c.CBM_SZ_256]u8 = undefined; // sliced source text: escape quotes/newlines
         _ = c.cbm_json_escape(&esc_ref, esc_ref.len, usage.ref_name);
-        const callable = join == c.CBM_REF_JOIN_CALLABLE;
-        _ = c.cbm_pipeline_reference_props(&uprops, uprops.len, &esc_ref, if (callable) row else null);
+        const callable = join.kind == .callable;
+        lsp_resolve.referenceProps(&uprops, &esc_ref, if (callable) join.row else null);
         _ = c.cbm_gbuf_insert_edge(ws.local_edge_buf, src.id, target.id, if (callable) "CALL_REFERENCE" else "USAGE", &uprops);
         ws.usages_resolved += 1;
     }
-    c.cbm_pipeline_ref_index_free(&ref_index);
 }
 
 /// Resolve throws/raises for one file.
@@ -3151,7 +3146,7 @@ fn resolveWorker(worker_id: c_int, ctx_ptr: ?*anyopaque) callconv(.c) void {
         const jvm_cross_lsp = lang == c.CBM_LANG_JAVA or lang == c.CBM_LANG_KOTLIN;
         const rust_workspace_cross_lsp =
             lang == c.CBM_LANG_RUST and rc.rust_manifest != null and rc.rust_manifest.?.member_count > 0;
-        const invocation_rows = c.cbm_pipeline_invocation_row_count(&result.resolved_calls);
+        const invocation_rows = lsp_resolve.invocationRowCount(&result.resolved_calls);
         var ref_candidates: c_int = 0;
         for (0..ix(result.usages.count)) |u| {
             ref_candidates += @intFromBool(result.usages.items[u].may_be_call_reference);
@@ -3160,7 +3155,7 @@ fn resolveWorker(worker_id: c_int, ctx_ptr: ?*anyopaque) callconv(.c) void {
             rc.all_defs != null and rc.def_count > 0 and c.cbm_pxc_has_cross_lsp(lang) and
             (result.calls.count > 0 or ref_candidates > 0) and
             (jvm_cross_lsp or rust_workspace_cross_lsp or invocation_rows < result.calls.count or
-                c.cbm_pipeline_reference_row_count(&result.resolved_calls) < ref_candidates or
+                lsp_resolve.referenceRowCount(&result.resolved_calls) < ref_candidates or
                 (lang == c.CBM_LANG_ZIG and rc.def_modules != null and
                     c.cbm_pxc_zig_args_in_module(rc.cross_registries, rc.def_modules[fidx]))) and
             !is_generated;
@@ -3422,8 +3417,8 @@ pub export fn cbm_parallel_resolve(
         .rust_manifest = rust_manifest_ptr,
         .lsp_failures = lsp_failures,
     };
-    @atomicStore(u64, &g_lsp_tail_lookups, 0, .monotonic);
-    @atomicStore(u64, &g_lsp_tail_candidates, 0, .monotonic);
+    lsp_resolve.tail_lookups.store(0, .monotonic);
+    lsp_resolve.tail_candidates.store(0, .monotonic);
     c.cbm_pxc_filter_stats_reset();
     // F4 lazy shared Rust registry: mutex up before workers spawn.
     c.cbm_mutex_init(&rc.rust_shared_mu);
@@ -3589,8 +3584,8 @@ pub export fn cbm_parallel_resolve(
     // Candidate-scan cost (upstream f6e3af43). per_lookup is a property of
     // the corpus, not the machine; if it grows with repo size the tail-match
     // scan is turning resolve superlinear.
-    const tail_lookups = @atomicLoad(u64, &g_lsp_tail_lookups, .monotonic);
-    const tail_cands = @atomicLoad(u64, &g_lsp_tail_candidates, .monotonic);
+    const tail_lookups = lsp_resolve.tail_lookups.load(.monotonic);
+    const tail_cands = lsp_resolve.tail_candidates.load(.monotonic);
     var tl_buf: [32]u8 = undefined;
     var tc_buf: [32]u8 = undefined;
     var tp_buf: [32]u8 = undefined;
