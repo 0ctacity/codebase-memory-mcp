@@ -2942,27 +2942,13 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
-            // Flag arrow/method calls with a receiver ($obj->m / Class->m). The
+            // Perl-only: flag arrow/method calls ($obj->m / Class->m). The
             // generic short-name resolver cannot place a method without a known
             // receiver type, so the call-resolution pass suppresses those edges.
-            // Also read by the process-spawn detector so method calls on an object
-            // ($pdo->exec) do not match bare spawn APIs.
             // Default false for every other language (struct is zero-init).
             if (ctx->language == CBM_LANG_PERL &&
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
-            }
-            if (ctx->language == CBM_LANG_PHP &&
-                (strcmp(ts_node_type(node), "member_call_expression") == 0 ||
-                 strcmp(ts_node_type(node), "nullsafe_member_call_expression") == 0)) {
-                call.is_method = true;
-            }
-            if (ctx->language == CBM_LANG_RUBY &&
-                strcmp(ts_node_type(node), "call") == 0) {
-                TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
-                if (!ts_node_is_null(recv)) {
-                    call.is_method = true;
-                }
             }
             // Python receiver-aware guard (#1276; same intent as the Perl and
             // TS/JS flags). Flag an attribute call x.foo() whose receiver is not

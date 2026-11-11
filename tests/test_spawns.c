@@ -406,6 +406,8 @@ static const sp_file_t SP_FILES[] = {
                   "function start() { spawn(\"node\", [\"server.js\"]); }\n"},
     /* Bare PHP exec is a spawn; method call on a receiver ($pdo->exec) is not. */
     {"db.php", "<?php\nfunction cleanup($pdo) {\n    $pdo->exec(\"DELETE FROM jobs\");\n    exec(\"ls -la\");\n}\n"},
+    /* Receiver-form Ruby launch API. */
+    {"worker.rb", "def run_worker\n    Open3.capture3(\"ls\")\nend\n"},
 };
 #define SP_FILE_COUNT ((int)(sizeof(SP_FILES) / sizeof(SP_FILES[0])))
 
@@ -420,6 +422,7 @@ TEST(spawns_in_the_graph) {
     ASSERT_EQ(sp_spawns(&p, "cleanup", "ls"), 1);
     ASSERT_EQ(sp_spawns(&p, "cleanup", "DELETE"), 0);
     ASSERT_EQ(sp_calls(&p, "cleanup", "DELETE"), 0);
+    ASSERT_EQ(sp_spawns(&p, "run_worker", "ls"), 1);
     /* The spawn replaces the CALLS edge a guess would have made. */
     ASSERT_EQ(sp_calls(&p, "build", "run"), 0);
     /* A project-defined system() is code, not a process. */
@@ -450,7 +453,7 @@ TEST(spawns_result_invariant_to_file_count) {
     sp_cleanup(&p);
     ASSERT_TRUE(seq[0] != '\0');
     if (strcmp(seq, par) != 0) {
-        fprintf(stderr, "  sequential:\n%s  parallel:\n%s", seq, par);
+        fprintf(stderr, "  few files:\n%s  many files:\n%s", seq, par);
     }
     ASSERT_STR_EQ(seq, par);
     PASS();

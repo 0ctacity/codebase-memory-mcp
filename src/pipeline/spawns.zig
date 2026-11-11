@@ -100,12 +100,6 @@ pub fn site(
     const import_count: c_int = if (imports) |imp| imp.count else 0;
     const api = c.cbm_spawn_match(lang, call.callee_name, import_items, import_count) orelse return false;
 
-    // A bare launch API (e.g. PHP exec, Ruby exec) called as a method on a receiver
-    // (such as $pdo->exec("DELETE FROM ...") or obj.exec(...)) is not a process spawn.
-    if (call.is_method and (api.*.rule == c.CBM_SPAWN_BARE or api.*.rule == c.CBM_SPAWN_BARE_IMPORTED)) {
-        return false;
-    }
-
     var qualified = false;
     if (call.callee_name) |name| {
         var p = name;
