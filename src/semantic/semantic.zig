@@ -5,12 +5,12 @@
 //! metadata — no source file reads. Uses xxHash for deterministic random
 //! vectors; std.hash.XxHash3 produces the same values as the vendored xxHash.
 //!
-//! Float expressions go through fp.mulAdd wherever the C code wrote a
-//! product plus a term in one expression: see fp.zig.
+//! Floating point: `a * b + c` is never fused into one multiply-add, here,
+//! in rotsq.zig or in pass_semantic_edges.zig. Zig does not fuse on its own,
+//! so every platform computes the same scores and builds the same edges.
 
 const std = @import("std");
 const c = @import("c");
-const fp = @import("fp.zig");
 const interop = @import("../foundation/interop.zig");
 
 const XxHash3 = std.hash.XxHash3;
@@ -374,9 +374,9 @@ pub export fn cbm_sem_cosine(a_c: ?*const Vec, b_c: ?*const Vec) f32 {
     var mag_a: f32 = 0.0;
     var mag_b: f32 = 0.0;
     for (a.v, b.v) |x, y| {
-        dot = fp.mulAdd(f32, x, y, dot);
-        mag_a = fp.mulAdd(f32, x, x, mag_a);
-        mag_b = fp.mulAdd(f32, y, y, mag_b);
+        dot += x * y;
+        mag_a += x * x;
+        mag_b += y * y;
     }
     const denom = @sqrt(mag_a) * @sqrt(mag_b);
     if (denom < DENOM_EPS) return 0.0;
@@ -468,7 +468,7 @@ pub export fn cbm_sem_normalize(v_c: ?*Vec) void {
     const v = v_c orelse return;
     var mag: f32 = 0.0;
     for (v.v) |x| {
-        mag = fp.mulAdd(f32, x, x, mag);
+        mag += x * x;
     }
     mag = @sqrt(mag);
     if (mag < DENOM_EPS) return;
@@ -482,7 +482,7 @@ pub export fn cbm_sem_vec_add_scaled(dst_c: ?*Vec, src_c: ?*const Vec, scale: f3
     const dst = dst_c orelse return;
     const src = src_c orelse return;
     for (&dst.v, src.v) |*d, s| {
-        d.* = fp.mulAdd(f32, scale, s, d.*);
+        d.* += scale * s;
     }
 }
 
@@ -824,13 +824,13 @@ inline fn semTargetInitFromSrc(dst: *Vec, src: *const SrcEntry) void {
 inline fn semVecAddSrcScaled(dst: *Vec, src: *const SrcEntry, scale: f32) void {
     if (src.is_sparse != 0) {
         for (src.indices[0..src.nnz], src.values[0..src.nnz]) |idx, val| {
-            dst.v[idx] = fp.mulAdd(f32, scale, val, dst.v[idx]);
+            dst.v[idx] += scale * val;
         }
     } else {
         const s = src.dense_int8.?;
         const mul = scale * (UNIT_POS / INT8_MAX);
         for (&dst.v, s[0..DIM]) |*d, x| {
-            d.* = fp.mulAdd(f32, mul, @floatFromInt(x), d.*);
+            d.* += mul * @as(f32, @floatFromInt(x));
         }
     }
 }
@@ -930,7 +930,7 @@ const CooccurInt8Ctx = struct {
 inline fn semVecAddInt8Scaled(dst: *Vec, src: *const [DIM]i8, scale: f32) void {
     const mul = scale * (UNIT_POS / INT8_MAX);
     for (&dst.v, src) |*d, x| {
-        d.* = fp.mulAdd(f32, mul, @floatFromInt(x), d.*);
+        d.* += mul * @as(f32, @floatFromInt(x));
     }
 }
 
@@ -1027,7 +1027,7 @@ fn blendWorker(worker_id: c_int, ctx_ptr: ?*anyopaque) callconv(.c) void {
             const vec = &at(bc.entries, i).enriched_vec;
             cbm_sem_normalize(vec);
             for (&vec.v, bc.pass1[i].v) |*e, p1| {
-                e.* = fp.mulAdd(f32, RRI_BETA, p1, RRI_ALPHA * e.*);
+                e.* = RRI_BETA * p1 + RRI_ALPHA * e.*;
             }
         }
     }
@@ -1464,7 +1464,7 @@ pub export fn cbm_sem_proximity(path_a: ?Str, path_b: ?Str) f32 {
     if (max_total == 0) return UNIT_POS;
     const ratio = @as(f32, @floatFromInt(shared)) / @as(f32, @floatFromInt(max_total));
     // Same file = 1.10, same dir = 1.05, distant = 1.00
-    return fp.mulAdd(f32, ratio, PROX_MAX_BOOST, UNIT_POS);
+    return ratio * PROX_MAX_BOOST + UNIT_POS;
 }
 
 /// Cosine similarity for small float arrays (AST profile).
@@ -1473,9 +1473,9 @@ fn smallCosine(a: []const f32, b: []const f32) f32 {
     var ma: f32 = 0.0;
     var mb: f32 = 0.0;
     for (a, b) |x, y| {
-        dot = fp.mulAdd(f32, x, y, dot);
-        ma = fp.mulAdd(f32, x, x, ma);
-        mb = fp.mulAdd(f32, y, y, mb);
+        dot += x * y;
+        ma += x * x;
+        mb += y * y;
     }
     const denom = @sqrt(ma) * @sqrt(mb);
     return if (denom < DENOM_EPS) 0.0 else dot / denom;
@@ -1494,7 +1494,7 @@ fn sparseTfidfCosine(a: *const Func, b: *const Func) f32 {
     var ib: usize = 0;
     while (ia < a_len and ib < b_len) {
         if (a.tfidf_indices[ia] == b.tfidf_indices[ib]) {
-            dot = fp.mulAdd(f32, a.tfidf_weights[ia], b.tfidf_weights[ib], dot);
+            dot += a.tfidf_weights[ia] * b.tfidf_weights[ib];
             ia += 1;
             ib += 1;
         } else if (a.tfidf_indices[ia] < b.tfidf_indices[ib]) {
@@ -1504,10 +1504,10 @@ fn sparseTfidfCosine(a: *const Func, b: *const Func) f32 {
         }
     }
     for (a.tfidf_weights[0..a_len]) |w| {
-        ma = fp.mulAdd(f32, w, w, ma);
+        ma += w * w;
     }
     for (b.tfidf_weights[0..b_len]) |w| {
-        mb = fp.mulAdd(f32, w, w, mb);
+        mb += w * w;
     }
     const denom = @sqrt(ma) * @sqrt(mb);
     return if (denom > DENOM_EPS) dot / denom else 0.0;
@@ -1537,26 +1537,26 @@ pub export fn cbm_sem_combined_score(
     var score = cfg.w_tfidf * sparseTfidfCosine(a, b);
 
     // Signal 2: Random Indexing
-    score = fp.mulAdd(f32, cfg.w_ri, c.cbm_rsq_ip(&a.ri_code, &b.ri_code), score);
+    score += cfg.w_ri * c.cbm_rsq_ip(&a.ri_code, &b.ri_code);
 
     // Signal 3: MinHash Jaccard
     if (a.has_minhash and b.has_minhash) {
         const j = c.cbm_minhash_jaccard(a_minhash, b_minhash);
-        score = fp.mulAdd(f32, cfg.w_minhash, @floatCast(j), score);
+        score += cfg.w_minhash * @as(f32, @floatCast(j));
     }
 
     // Signal 4: API Signatures
-    score = fp.mulAdd(f32, cfg.w_api, c.cbm_rsq_ip(&a.api_code, &b.api_code), score);
+    score += cfg.w_api * c.cbm_rsq_ip(&a.api_code, &b.api_code);
 
     // Signal 5: Type Signatures
-    score = fp.mulAdd(f32, cfg.w_type, c.cbm_rsq_ip(&a.type_code, &b.type_code), score);
+    score += cfg.w_type * c.cbm_rsq_ip(&a.type_code, &b.type_code);
 
     // Signal 7: Decorator Pattern
-    score = fp.mulAdd(f32, cfg.w_decorator, c.cbm_rsq_ip(&a.deco_code, &b.deco_code), score);
+    score += cfg.w_decorator * c.cbm_rsq_ip(&a.deco_code, &b.deco_code);
 
     // Signal 8+9+11: Structural profile + data flow + Halstead
     const sp_score = smallCosine(&a.struct_profile, &b.struct_profile);
-    score = fp.mulAdd(f32, cfg.w_struct_profile, sp_score, score);
+    score += cfg.w_struct_profile * sp_score;
 
     // Signal 6: Module proximity (multiplier, not additive).
     // Proximity returns [1.0, 1.10] — a same-file/same-dir boost for ranking.
@@ -1593,7 +1593,7 @@ pub export fn cbm_sem_diffuse(
     const inv_n = UNIT_POS / @as(f32, @floatFromInt(neighbor_count));
     const one_minus_alpha = UNIT_POS - alpha;
     for (&combined.v, mean.v) |*x, m| {
-        x.* = fp.mulAdd(f32, one_minus_alpha, x.*, alpha * m * inv_n);
+        x.* = one_minus_alpha * x.* + alpha * m * inv_n;
     }
     cbm_sem_normalize(combined);
 }
