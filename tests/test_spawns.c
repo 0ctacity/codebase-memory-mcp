@@ -164,7 +164,6 @@ typedef struct {
 
 typedef struct {
     char tmpdir[256];
-    char dbpath[1024];
     char *project;
     cbm_mcp_server_t *srv;
     cbm_store_t *store;
@@ -195,6 +194,9 @@ static bool sp_index(sp_proj_t *p, const sp_file_t *files, int count, int pad) {
     if (!p->tmpdir[0]) {
         return false;
     }
+    for (char *c = p->tmpdir; *c; c++) {
+        if (*c == '\\') *c = '/';
+    }
     for (int i = 0; i < count; i++) {
         if (!sp_write(p->tmpdir, files[i].name, files[i].content)) {
             return false;
@@ -213,25 +215,18 @@ static bool sp_index(sp_proj_t *p, const sp_file_t *files, int count, int pad) {
     if (!p->project) {
         return false;
     }
-    char cache[700];
-    const char *configured = getenv("CBM_CACHE_DIR");
-    const char *home = getenv("HOME");
-    if (configured && configured[0]) {
-        snprintf(cache, sizeof(cache), "%s", configured);
-    } else {
-        snprintf(cache, sizeof(cache), "%s/.cache/codebase-memory-mcp", home ? home : "/tmp");
-    }
-    cbm_mkdir_p(cache, 0755);
-    snprintf(p->dbpath, sizeof(p->dbpath), "%s/%s.db", cache, p->project);
-    unlink(p->dbpath);
+    th_remove_project_workspace(p->project);
     p->srv = cbm_mcp_server_new();
     if (!p->srv) {
         return false;
     }
     char args[800];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", p->tmpdir);
-    free(cbm_mcp_handle_tool(p->srv, "index_repository", args));
-    p->store = cbm_store_open_path_query(p->dbpath);
+    char *resp = cbm_mcp_handle_tool(p->srv, "index_repository", args);
+    if (resp) {
+        free(resp);
+    }
+    p->store = th_open_project_store(p->project);
     return p->store != NULL;
 }
 
@@ -242,74 +237,155 @@ static void sp_cleanup(sp_proj_t *p) {
     if (p->srv) {
         cbm_mcp_server_free(p->srv);
     }
-    if (p->dbpath[0]) {
-        char side[1100];
-        unlink(p->dbpath);
-        snprintf(side, sizeof(side), "%s-wal", p->dbpath);
-        unlink(side);
-        snprintf(side, sizeof(side), "%s-shm", p->dbpath);
-        unlink(side);
+    if (p->project) {
+        th_remove_project_workspace(p->project);
+        free(p->project);
     }
-    free(p->project);
     if (p->tmpdir[0]) {
         th_rmtree(p->tmpdir);
     }
     memset(p, 0, sizeof(*p));
 }
 
-static int sp_count(sp_proj_t *p, const char *sql, const char *a, const char *b) {
-    sqlite3 *db = cbm_store_get_db(p->store);
-    sqlite3_stmt *stmt = NULL;
-    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
-        return -1;
-    }
-    int n = sqlite3_bind_parameter_count(stmt);
-    const char *values[] = {p->project, a, b};
-    for (int i = 0; i < n && i < 3; i++) {
-        sqlite3_bind_text(stmt, i + 1, values[i], -1, SQLITE_TRANSIENT);
-    }
-    int count = sqlite3_step(stmt) == SQLITE_ROW ? sqlite3_column_int(stmt, 0) : -1;
-    sqlite3_finalize(stmt);
-    return count;
-}
-
 /* SPAWNS edges from the definition named `caller` to the Process `program`. */
 static int sp_spawns(sp_proj_t *p, const char *caller, const char *program) {
-    return sp_count(p,
-                    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-                    "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='SPAWNS' "
-                    "AND s.name=?2 AND t.name=?3 AND t.label='Process'",
-                    caller, program);
+    if (!p || !p->store) return -1;
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    if (cbm_store_find_nodes_by_name(p->store, p->project, caller, &callers, &caller_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < caller_count; i++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(p->store, callers[i].id, "SPAWNS", &edges, &edge_count) == CBM_STORE_OK) {
+            for (int j = 0; j < edge_count; j++) {
+                cbm_node_t target = {0};
+                if (cbm_store_find_node_by_id(p->store, edges[j].target_id, &target) == CBM_STORE_OK) {
+                    if (target.name && strcmp(target.name, program) == 0 &&
+                        target.label && strcmp(target.label, "Process") == 0) {
+                        matches++;
+                    }
+                    cbm_node_free_fields(&target);
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    cbm_store_free_nodes(callers, caller_count);
+    return matches;
 }
 
 static int sp_calls(sp_proj_t *p, const char *caller, const char *callee) {
-    return sp_count(p,
-                    "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id "
-                    "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 AND e.type='CALLS' "
-                    "AND s.name=?2 AND t.name=?3",
-                    caller, callee);
+    if (!p || !p->store) return -1;
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    if (cbm_store_find_nodes_by_name(p->store, p->project, caller, &callers, &caller_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < caller_count; i++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(p->store, callers[i].id, "CALLS", &edges, &edge_count) == CBM_STORE_OK) {
+            for (int j = 0; j < edge_count; j++) {
+                cbm_node_t target = {0};
+                if (cbm_store_find_node_by_id(p->store, edges[j].target_id, &target) == CBM_STORE_OK) {
+                    if (target.name && strcmp(target.name, callee) == 0) {
+                        matches++;
+                    }
+                    cbm_node_free_fields(&target);
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    cbm_store_free_nodes(callers, caller_count);
+    return matches;
+}
+
+static int sp_spawns_from(sp_proj_t *p, const char *caller) {
+    if (!p || !p->store) return -1;
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    if (cbm_store_find_nodes_by_name(p->store, p->project, caller, &callers, &caller_count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < caller_count; i++) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(p->store, callers[i].id, "SPAWNS", &edges, &edge_count) == CBM_STORE_OK) {
+            matches += edge_count;
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+    cbm_store_free_nodes(callers, caller_count);
+    return matches;
+}
+
+static bool sp_has_process_node(sp_proj_t *p, const char *name, const char *qualified_name) {
+    if (!p || !p->store) return false;
+    cbm_node_t node = {0};
+    if (cbm_store_find_node_by_qn(p->store, p->project, qualified_name, &node) != CBM_STORE_OK) {
+        return false;
+    }
+    bool ok = (node.label && strcmp(node.label, "Process") == 0) &&
+              (node.name && strcmp(node.name, name) == 0);
+    cbm_node_free_fields(&node);
+    return ok;
+}
+
+static int sp_edge_cmp(const void *a, const void *b) {
+    return strcmp(*(const char * const *)a, *(const char * const *)b);
 }
 
 /* Every SPAWNS edge as "caller>program|api" lines, sorted, into `out`. */
 static bool sp_edge_set(sp_proj_t *p, char *out, size_t n) {
-    sqlite3 *db = cbm_store_get_db(p->store);
-    sqlite3_stmt *stmt = NULL;
-    const char *sql = "SELECT s.name || '>' || t.name || '|' || json_extract(e.properties,'$.api') "
-                      "FROM edges e JOIN nodes s ON s.id=e.source_id JOIN nodes t ON "
-                      "t.id=e.target_id WHERE e.project=?1 AND e.type='SPAWNS' ORDER BY 1";
-    if (!db || sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        sqlite3_finalize(stmt);
+    if (!p || !p->store) return false;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(p->store, p->project, "SPAWNS", &edges, &edge_count) != CBM_STORE_OK) {
         return false;
     }
-    sqlite3_bind_text(stmt, 1, p->project, -1, SQLITE_TRANSIENT);
-    out[0] = '\0';
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *row = (const char *)sqlite3_column_text(stmt, 0);
-        size_t used = strlen(out);
-        snprintf(out + used, n - used, "%s\n", row ? row : "?");
+    char **lines = calloc((size_t)(edge_count > 0 ? edge_count : 1), sizeof(char *));
+    int valid_lines = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0};
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(p->store, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(p->store, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            char api[128] = "";
+            if (edges[i].properties_json) {
+                const char *pos = strstr(edges[i].properties_json, "\"api\":\"");
+                if (pos) {
+                    pos += 7;
+                    const char *end = strchr(pos, '"');
+                    if (end && (size_t)(end - pos) < sizeof(api)) {
+                        memcpy(api, pos, (size_t)(end - pos));
+                        api[end - pos] = '\0';
+                    }
+                }
+            }
+            char line[512];
+            snprintf(line, sizeof(line), "%s>%s|%s", src.name ? src.name : "?", tgt.name ? tgt.name : "?", api);
+            lines[valid_lines++] = strdup(line);
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
     }
-    sqlite3_finalize(stmt);
+    cbm_store_free_edges(edges, edge_count);
+
+    qsort(lines, (size_t)valid_lines, sizeof(char *), sp_edge_cmp);
+
+    out[0] = '\0';
+    for (int i = 0; i < valid_lines; i++) {
+        size_t used = strlen(out);
+        snprintf(out + used, n - used, "%s\n", lines[i]);
+        free(lines[i]);
+    }
+    free(lines);
     return true;
 }
 
@@ -341,17 +417,13 @@ TEST(spawns_in_the_graph) {
     ASSERT_EQ(sp_calls(&p, "build", "run"), 0);
     /* A project-defined system() is code, not a process. */
     ASSERT_EQ(sp_calls(&p, "use_own", "system"), 1);
-    ASSERT_EQ(sp_count(&p,
-                       "SELECT COUNT(*) FROM edges e JOIN nodes s ON s.id=e.source_id WHERE "
-                       "e.project=?1 AND e.type='SPAWNS' AND s.name=?2",
-                       "use_own", NULL),
-              0);
+    ASSERT_EQ(sp_spawns_from(&p, "use_own"), 0);
     /* One Process node per program, named and qualified by it. */
-    ASSERT_EQ(sp_count(&p,
-                       "SELECT COUNT(*) FROM nodes WHERE label='Process' AND name=?2 AND "
-                       "qualified_name='__process__make'",
-                       "make", NULL),
-              1);
+    ASSERT_TRUE(sp_has_process_node(&p, "make", "__process__make"));
+    ASSERT_TRUE(sp_has_process_node(&p, CBM_SPAWN_DYNAMIC, "__process__<dynamic>"));
+    ASSERT_TRUE(sp_has_process_node(&p, "rm", "__process__rm"));
+    ASSERT_TRUE(sp_has_process_node(&p, "kubectl", "__process__kubectl"));
+    ASSERT_TRUE(sp_has_process_node(&p, "node", "__process__node"));
     sp_cleanup(&p);
     PASS();
 }
