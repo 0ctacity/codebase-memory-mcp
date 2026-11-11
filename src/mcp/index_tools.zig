@@ -221,7 +221,7 @@ fn buildWorkerFailureResponse(args: CStr, outcome: c.cbm_proc_outcome_t) HeapStr
 }
 
 /// Drop the cached store so the next query reopens whatever the worker
-/// published to cbm.zova. NULL-safe: the background watcher path (main.c) has
+/// published to cbm.zova. NULL-safe: the background watcher path (main.zig) has
 /// no MCP server, so there is nothing to invalidate.
 fn supervisorInvalidateStore(srv: ?*Server) void {
     const s = srv orelse return;
@@ -527,7 +527,7 @@ pub fn indexRunSupervisedPath(srv: ?*Server, root_path: CStr) HeapStr {
     return indexRunSupervised(srv, args);
 }
 
-/// The watcher re-index in main.c has no MCP server, so it reaches the
+/// The watcher re-index in main.zig has no MCP server, so it reaches the
 /// supervised runner through this srv-less wrapper.
 pub export fn cbm_mcp_index_run_supervised_path(root_path: [*c]const u8) [*c]u8 {
     return indexRunSupervisedPath(null, root_path);
@@ -749,7 +749,7 @@ fn indexRepositoryRun(srv: *Server, args: CStr) HeapStr {
     c.yyjson_mut_doc_free(doc);
     // Free the pipeline only after the response doc copied the excluded list.
     // Supervised worker: skip the deep free — the process exits right after
-    // handing over the response (main.c fast-exits), and piecemeal-freeing a
+    // handing over the response (main.zig fast-exits), and piecemeal-freeing a
     // multi-GB graph before process death costs minutes on kernel-scale
     // repos; the OS reclaims it wholesale at exit.
     if (c.cbm_index_worker_active()) {

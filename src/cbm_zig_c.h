@@ -40,6 +40,9 @@
 #include <io.h>
 #include <process.h>
 #include <psapi.h>
+#include <shellapi.h> /* CommandLineToArgvW: not in windows.h under WIN32_LEAN_AND_MEAN */
+#include <signal.h>
+#include <tlhelp32.h>
 #include "foundation/win_utf8.h"
 #include <tre/regex.h>
 #else
@@ -181,6 +184,7 @@ static inline FILE *cbm_zig_stderr(void) {
 #include "discover/userconfig.h"
 #include "git/git_context.h"
 #include "graph_buffer/graph_buffer.h"
+#include "main.h"
 #include "mcp/index_supervisor.h"
 #include "pipeline/laravel_routing.h"
 #include "pipeline/lsp_resolve.h"

@@ -328,7 +328,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 
-/* ── Subcommands (wired from main.c) ─────────────────────────── */
+/* ── Subcommands (wired from main.zig) ─────────────────────────── */
 
 /* install: copy binary, install skills, install editor MCP configs, ensure PATH.
  * Prompts to delete old indexes if any exist — rejects on "no". */
