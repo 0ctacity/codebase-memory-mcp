@@ -2,7 +2,6 @@
 
 const std = @import("std");
 const c = @import("c");
-const fp = @import("fp.zig");
 
 const XxHash3 = std.hash.XxHash3;
 
@@ -105,9 +104,9 @@ pub export fn cbm_rsq_ip(a: *const c.cbm_rsq_code_t, b: *const c.cbm_rsq_code_t)
     // C: d*oa*ob + oa*sb*Σcb + ob*sa*Σca + sa*sb*dot, summed left to right.
     // The first sum fuses with its left product, the later ones with their
     // right product.
-    var ip = fp.mulAdd(f64, d * oa, ob, oa * sb * @as(f64, @floatFromInt(b.code_sum)));
-    ip = fp.mulAdd(f64, ob * sa, @as(f64, @floatFromInt(a.code_sum)), ip);
-    ip = fp.mulAdd(f64, sa * sb, @as(f64, @floatFromInt(dot)), ip);
+    var ip = d * oa * ob + oa * sb * @as(f64, @floatFromInt(b.code_sum));
+    ip += ob * sa * @as(f64, @floatFromInt(a.code_sum));
+    ip += sa * sb * @as(f64, @floatFromInt(dot));
     return @floatCast(ip);
 }
 
@@ -115,7 +114,7 @@ pub export fn cbm_rsq_ip(a: *const c.cbm_rsq_code_t, b: *const c.cbm_rsq_code_t)
 
 pub export fn cbm_rsq_decode(code: *const c.cbm_rsq_code_t, out: [*]f32) void {
     for (code.codes, 0..) |b, i| {
-        out[i * 2] = fp.mulAdd(f32, code.scale, @floatFromInt(b & 0x0F), code.offset);
-        out[i * 2 + 1] = fp.mulAdd(f32, code.scale, @floatFromInt(b >> 4), code.offset);
+        out[i * 2] = code.scale * @as(f32, @floatFromInt(b & 0x0F)) + code.offset;
+        out[i * 2 + 1] = code.scale * @as(f32, @floatFromInt(b >> 4)) + code.offset;
     }
 }

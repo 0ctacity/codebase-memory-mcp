@@ -453,7 +453,7 @@ CBM_ZIG_SRCS = $(CBM_ZIG_SRC) src/cbm_zig_c.h src/cli_zig/cbm_cli_zig.zig src/cl
                src/discover/discover.h src/discover/userconfig.h \
                src/git/git_context.zig src/git/git_context.h \
                src/graph_buffer/graph_buffer.zig src/graph_buffer/graph_buffer.h \
-               src/semantic/ast_profile.zig src/semantic/fp.zig src/semantic/rotsq.zig \
+               src/semantic/ast_profile.zig src/semantic/rotsq.zig \
                src/semantic/semantic.zig \
                src/semantic/ast_profile.h src/semantic/rotsq.h src/semantic/semantic.h \
                vendored/nomic/code_vectors.h vendored/nomic/code_tokens.h \

@@ -12,7 +12,6 @@ const std = @import("std");
 const c = @import("c");
 const interop = @import("../foundation/interop.zig");
 const util = @import("util.zig");
-const fp = @import("../semantic/fp.zig");
 
 const XxHash3 = std.hash.XxHash3;
 const AtomicInt = std.atomic.Value(c_int);
@@ -621,7 +620,7 @@ fn sigBuildWorker(worker_id: c_int, ctx_ptr: ?*anyopaque) callconv(.c) void {
         for (0..NUM_HYPERPLANES) |h| {
             var dot: f32 = 0.0;
             for (dec, sc.hyperplanes[h]) |d, plane| {
-                dot = fp.mulAdd(f32, d, plane, dot);
+                dot += d * plane;
             }
             if (dot > 0.0) sig |= @as(u64, 1) << @intCast(h);
         }
