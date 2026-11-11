@@ -64,6 +64,7 @@ comptime {
     checkExports(@import("mcp/server.zig"));
     checkExports(@import("pipeline/fqn.zig"));
     checkExports(@import("pipeline/laravel_routing.zig"));
+    checkExports(@import("pipeline/lsp_resolve.zig"));
     checkExports(@import("pipeline/pass_compile_commands.zig"));
     checkExports(@import("pipeline/pass_complexity.zig"));
     checkExports(@import("pipeline/pass_configlink.zig"));
