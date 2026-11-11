@@ -74,6 +74,7 @@ comptime {
     checkExports(@import("pipeline/pass_importance.zig"));
     checkExports(@import("pipeline/pass_infrascan.zig"));
     checkExports(@import("pipeline/pass_k8s.zig"));
+    checkExports(@import("pipeline/pass_lsp_cross.zig"));
     checkExports(@import("pipeline/pass_pkgmap.zig"));
     checkExports(@import("pipeline/pass_route_nodes.zig"));
     checkExports(@import("pipeline/pass_semantic.zig"));
