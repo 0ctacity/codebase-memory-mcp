@@ -63,6 +63,10 @@ comptime {
     checkExports(@import("mcp/server.zig"));
     checkExports(@import("pipeline/fqn.zig"));
     checkExports(@import("pipeline/laravel_routing.zig"));
+    checkExports(@import("pipeline/pass_configures.zig"));
+    checkExports(@import("pipeline/pass_enrichment.zig"));
+    checkExports(@import("pipeline/pass_semantic.zig"));
+    checkExports(@import("pipeline/pass_tests.zig"));
     checkExports(@import("pipeline/path_alias.zig"));
     checkExports(@import("pipeline/registry.zig"));
     checkExports(@import("pipeline/result_spill.zig"));
