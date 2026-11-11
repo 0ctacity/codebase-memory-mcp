@@ -541,8 +541,6 @@ const native_sources = [_][]const u8{
     "src/pipeline/pass_parallel.c",
     "src/pipeline/pass_lsp_cross.c",
     "src/pipeline/pass_route_nodes.c",
-    "src/pipeline/pass_infrascan.c",
-    "src/pipeline/pass_k8s.c",
     "src/pipeline/pass_pkgmap.c",
     "vendored/yyjson/yyjson.c",
     "internal/cbm/cbm.c",
