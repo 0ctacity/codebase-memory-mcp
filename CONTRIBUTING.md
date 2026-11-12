@@ -67,7 +67,7 @@ src/
   watcher/          Git-based background auto-sync
   cli/              CLI subcommands (install, update, uninstall, config)
 internal/cbm/       Tree-sitter AST extraction (64 languages, vendored C grammars)
-vendored/           sqlite3, yyjson, mimalloc, xxhash, tre, nomic
+vendored/           sqlite3, yyjson, mimalloc, tre, nomic
 scripts/            Build, test, lint, security audit scripts
 tests/              All C test files
 ```

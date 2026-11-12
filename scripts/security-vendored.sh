@@ -4,7 +4,7 @@ set -euo pipefail
 # Layer 8: Vendored dependency integrity — verifies vendored C sources match
 # checked-in checksums. Detects supply chain tampering of vendored libraries.
 #
-# Libraries covered: mimalloc, sqlite3, tre, xxhash, yyjson
+# Libraries covered: mimalloc, sqlite3, tre, yyjson
 #
 # Usage: scripts/security-vendored.sh
 
@@ -134,11 +134,11 @@ else
 fi
 
 # Verify the dangerous call rules cover every vendored library.
-# Known safe: yyjson, xxhash, tre (pure computation, no OS interaction)
+# Known safe: yyjson, tre (pure computation, no OS interaction)
 # Known with exceptions: sqlite3 (dlopen), mimalloc (LoadLibrary)
 # If a new library appears, the scan above already checks it — but this ensures
 # we've consciously evaluated each library.
-KNOWN_VENDORED="mimalloc nomic sqlite3 tre xxhash yyjson"
+KNOWN_VENDORED="mimalloc nomic sqlite3 tre yyjson"
 while IFS= read -r libdir; do
     libname=$(basename "$libdir")
     found=false

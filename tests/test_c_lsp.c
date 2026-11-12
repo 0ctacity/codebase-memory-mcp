@@ -610,12 +610,13 @@ TEST(clsp_calls_attributed_to_function_issue220) {
 
 /* Issue #355: indexing segfaulted while extracting a heavily-macro'd xxhash
  * C header (`dhw/xx_hash.h`). The reporter's exact file isn't available, so
- * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
+ * this drives xxhash.h (~7.5k lines, same macro-dense family; a test fixture,
+ * BSD-2-Clause, license in its header comment)
  * through C extraction as a proxy/regression guard. Runs under ASan. */
 TEST(clsp_nocrash_issue355_xxhash_header) {
-    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    FILE *fp = fopen("tests/fixtures/xxhash.h", "rb");
     if (!fp) {
-        FAIL("vendored/xxhash/xxhash.h not found (run from repo root)");
+        FAIL("tests/fixtures/xxhash.h not found (run from repo root)");
     }
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);

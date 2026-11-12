@@ -24,7 +24,7 @@ override CXX := $(CXX) $(ARCHFLAGS)
 
 # Include paths for:
 #   src/         — new foundation headers
-#   vendored/    — yyjson, xxhash, sqlite3
+#   vendored/    — yyjson, sqlite3
 #   internal/cbm — existing extraction headers (cbm.h, helpers.h, etc.)
 #   internal/cbm/vendored/ts_runtime/include — tree-sitter API
 CBM_DIR = internal/cbm
