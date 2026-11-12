@@ -286,8 +286,6 @@ const SourceFlavor = enum {
     cxx,
     mimalloc,
     sqlite,
-    lz4,
-    zstd,
 };
 
 fn flags(b: *std.Build, cfg: Config, kind: BuildKind, flavor: SourceFlavor) []const []const u8 {
@@ -322,14 +320,6 @@ fn flags(b: *std.Build, cfg: Config, kind: BuildKind, flavor: SourceFlavor) []co
         },
         .sqlite => {
             list.appendSlice(a, &.{ "-std=c11", "-w", "-DSQLITE_DQS=0", "-DSQLITE_THREADSAFE=1", "-DSQLITE_ENABLE_FTS5" }) catch @panic("OOM");
-            if (kind == .prod) list.append(a, "-O2") catch @panic("OOM") else list.appendSlice(a, &.{ "-g", "-O1" }) catch @panic("OOM");
-        },
-        .lz4 => {
-            list.appendSlice(a, &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-w", "-Iinternal/cbm" }) catch @panic("OOM");
-            if (kind == .prod) list.append(a, "-O2") catch @panic("OOM") else list.appendSlice(a, &.{ "-g", "-O1" }) catch @panic("OOM");
-        },
-        .zstd => {
-            list.appendSlice(a, &.{ "-std=c11", "-D_DEFAULT_SOURCE", "-w", "-Iinternal/cbm/vendored/zstd" }) catch @panic("OOM");
             if (kind == .prod) list.append(a, "-O2") catch @panic("OOM") else list.appendSlice(a, &.{ "-g", "-O1" }) catch @panic("OOM");
         },
     }
@@ -376,9 +366,6 @@ fn addNativeSources(
     module.addCSourceFile(.{ .file = b.path("internal/cbm/ts_runtime.c"), .flags = flags(b, cfg, kind, .grammar) });
     module.addCSourceFile(.{ .file = b.path("internal/cbm/lsp_all.c"), .flags = flags(b, cfg, kind, .grammar) });
     module.addCSourceFile(.{ .file = b.path("internal/cbm/preprocessor.cpp"), .flags = flags(b, cfg, kind, .cxx), .language = .cpp });
-    module.addCSourceFile(.{ .file = b.path("internal/cbm/vendored/lz4/lz4.c"), .flags = flags(b, cfg, kind, .lz4) });
-    module.addCSourceFile(.{ .file = b.path("internal/cbm/vendored/lz4/lz4hc.c"), .flags = flags(b, cfg, kind, .lz4) });
-    module.addCSourceFile(.{ .file = b.path("internal/cbm/vendored/zstd/zstd.c"), .flags = flags(b, cfg, kind, .zstd) });
     module.addAssemblyFile(b.path("vendored/nomic/code_vectors_blob.S"));
 
     module.addCSourceFiles(.{ .files = &native_sources, .flags = flags(b, cfg, kind, .normal) });
@@ -554,9 +541,6 @@ const native_sources = [_][]const u8{
     "internal/cbm/lang_specs.c",
     "internal/cbm/service_patterns.c",
     "internal/cbm/spawn_patterns.c",
-    "internal/cbm/ac.c",
-    "internal/cbm/lz4_store.c",
-    "internal/cbm/zstd_store.c",
 };
 
 const zova_test_sources = [_][]const u8{
@@ -608,7 +592,6 @@ const all_test_sources = [_][]const u8{
     "tests/test_grammar_regression.c",
     "tests/test_grammar_labels.c",
     "tests/test_grammar_imports.c",
-    "tests/test_ac.c",
     "tests/test_store_nodes.c",
     "tests/test_store_edges.c",
     "tests/test_store_search.c",
@@ -635,8 +618,6 @@ const all_test_sources = [_][]const u8{
     "tests/test_index_resilience.c",
     "tests/test_call_reference.c",
     "tests/test_watcher.c",
-    "tests/test_lz4.c",
-    "tests/test_zstd.c",
     "tests/test_go_lsp.c",
     "tests/test_c_lsp.c",
     "tests/test_php_lsp.c",

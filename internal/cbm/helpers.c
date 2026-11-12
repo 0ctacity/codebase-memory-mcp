@@ -1554,13 +1554,6 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang) {
     return false;
 }
 
-/* Back-compat wrapper: computes the parent via ts_node_parent (O(n)).
- * Prefer cbm_is_module_level_p at call sites that already know the
- * parent (the common case — iterating a parent's children). */
-bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
-    return cbm_is_module_level_p(ts_node_parent(node), lang);
-}
-
 // --- FQN computation ---
 // Mirrors Go's fqn.Compute(): project + path_parts_dotted + name
 

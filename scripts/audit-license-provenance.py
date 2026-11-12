@@ -41,8 +41,6 @@ LIBS = {
     "vendored/mimalloc": ("microsoft/mimalloc", None),
     "vendored/tre": ("laurikari/tre", None),
     "vendored/yyjson": ("ibireme/yyjson", None),
-    "internal/cbm/vendored/lz4": ("lz4/lz4", "lib/LICENSE"),
-    "internal/cbm/vendored/zstd": ("facebook/zstd", None),
     "internal/cbm/vendored/simplecpp": ("danmar/simplecpp", None),
     "internal/cbm/vendored/verstable": ("JacksonAllan/Verstable", None),
     "internal/cbm/vendored/ts_runtime": ("tree-sitter/tree-sitter", None),
@@ -123,7 +121,7 @@ def main():
         if ours is None:
             results[key] = ("NO-LOCAL-LICENSE", "")
             return
-        # 1) exact upstream path (e.g. lz4 lib/LICENSE), at HEAD then pinned
+        # 1) exact upstream path (e.g. lib/LICENSE), at HEAD then pinned
         if exact_path:
             for ref in (None, pinned):
                 up = upstream_file(repo, exact_path, ref)

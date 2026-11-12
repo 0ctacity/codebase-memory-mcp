@@ -190,16 +190,10 @@ const CBMType* cbm_type_object_lit(CBMArena* a,
     const char** prop_names, const CBMType** prop_types,
     const CBMType* call_signature, const CBMType* index_value);
 const CBMType* cbm_type_infer(CBMArena* a, const char* name);
-const CBMType* cbm_type_mapped(CBMArena* a,
-    const char* key_name, const CBMType* key_constraint, const CBMType* value);
 
 // Operations
 const CBMType* cbm_type_deref(const CBMType* t);         // remove one pointer level
-const CBMType* cbm_type_elem(const CBMType* t);           // get element type (slice/chan/pointer)
 bool cbm_type_is_unknown(const CBMType* t);
-bool cbm_type_is_interface(const CBMType* t);
-bool cbm_type_is_pointer(const CBMType* t);
-bool cbm_type_is_reference(const CBMType* t);
 bool cbm_type_is_union(const CBMType* t);
 bool cbm_type_is_protocol(const CBMType* t);
 bool cbm_type_is_module(const CBMType* t);

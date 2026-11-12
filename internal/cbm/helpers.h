@@ -216,13 +216,9 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
 // nesting at call sites without re-deriving the set.
 bool cbm_is_loop_node_type(const char *kind);
 
-// Is this a module-level node? (not nested inside function/class body)
-bool cbm_is_module_level(TSNode node, CBMLanguage lang);
-
-// Same check, but the node's PARENT is supplied directly — avoids the
-// O(n) ts_node_parent rescan. Use at call sites iterating a known
-// parent's children (the common case). `parent` is the parent of the
-// node being classified.
+// Is a node whose parent is `parent` module-level (not nested inside a
+// function/class body)? Taking the parent avoids an O(n) ts_node_parent
+// rescan at call sites that iterate a known parent's children.
 bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 
 // --- FQN computation ---

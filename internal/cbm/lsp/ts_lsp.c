@@ -16,8 +16,8 @@
  *   - Category 20: imports surface `module.symbol` resolution against the registry.
  *   - Category 25: emits unresolved-call diagnostics (confidence 0).
  *
- * Cross-file (Phase 3) merges defs project-wide before per-file resolution; see
- * cbm_batch_ts_lsp_cross.
+ * Cross-file (Phase 3) resolves one file against defs the caller has already
+ * merged project-wide; see cbm_run_ts_lsp_cross.
  *
  * Conventions (mirrors c_lsp / go_lsp):
  *   - All allocations go through ctx->arena; no malloc / free.
@@ -5525,22 +5525,4 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     if (owns_tree)
         ts_tree_delete(tree);
-}
-
-// ── Batch cross-file (Phase 3) ────────────────────────────────────────────────
-
-void cbm_batch_ts_lsp_cross(CBMArena *arena, CBMBatchTSLSPFile *files, int file_count,
-                            CBMResolvedCallArray *out) {
-    if (!arena || !files || !out || file_count <= 0)
-        return;
-    // Project-scope merging happens implicitly: every file's CBMLSPDef set already
-    // includes both same-file and cross-file defs (built by the caller). The plan §17
-    // finding #4 fix ensures the *caller* merges interface declarations
-    // by QN before passing them in.
-    for (int i = 0; i < file_count; i++) {
-        CBMBatchTSLSPFile *f = &files[i];
-        cbm_run_ts_lsp_cross(arena, f->source, f->source_len, f->module_qn, f->js_mode, f->jsx_mode,
-                             f->dts_mode, f->defs, f->def_count, f->import_names, f->import_qns,
-                             f->import_count, f->cached_tree, &out[i]);
-    }
 }

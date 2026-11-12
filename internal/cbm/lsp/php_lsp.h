@@ -109,26 +109,4 @@ void cbm_run_php_lsp_cross(
     TSTree *cached_tree,           /* NULL = parse internally */
     CBMResolvedCallArray *out);
 
-/* --- Batch cross-file LSP --- */
-
-/* Per-file input for batch PHP LSP processing. */
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    TSTree *cached_tree;            /* NULL = parse internally */
-    CBMLSPDef *defs;                /* combined file-local + cross-file defs */
-    int def_count;
-    const char **import_names;      /* parallel arrays, import_count long */
-    const char **import_qns;
-    int import_count;
-} CBMBatchPHPLSPFile;
-
-/* Process multiple PHP files' cross-file LSP in one call. out must point to
- * file_count pre-zeroed CBMResolvedCallArray structs. */
-void cbm_batch_php_lsp_cross(
-    CBMArena *arena,
-    CBMBatchPHPLSPFile *files, int file_count,
-    CBMResolvedCallArray *out);
-
 #endif /* CBM_LSP_PHP_LSP_H */

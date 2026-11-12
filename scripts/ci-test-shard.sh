@@ -25,9 +25,9 @@ languages=(
   grammar_probe_e grammar_probe_f grammar_probe_g
 )
 core=(
-  arena hash_table dyn_array str_intern log str_util platform subprocess dump_verify ac
+  arena hash_table dyn_array str_intern log str_util platform subprocess dump_verify
   store_nodes store_edges store_search
-  lz4 zstd system_info slab_alloc mem yaml semantic
+  system_info slab_alloc mem yaml semantic
   ast_profile simhash stack_overflow store_arch
 )
 

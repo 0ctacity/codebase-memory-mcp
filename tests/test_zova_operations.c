@@ -1075,39 +1075,40 @@ TEST(zova_operations_database_compact_noops_below_policy_threshold) {
 }
 
 
-extern int cbm_zstd_decompress(const char *src, int srcLen, char *dst, int dstCap);
-
-/* tests/fixtures/zova-format-9/cbm.zova.zst is a one-workspace database written
- * by release v1.0.1 (Zova 0.24.0, storage format 9, CBM schema 7). */
-static int operations_inflate_format9_fixture(const char *destination) {
-    enum { RAW_CAP = 8 * 1024 * 1024 };
+/* tests/fixtures/zova-format-9/cbm.zova is a one-workspace database written
+ * by release v1.0.1 (Zova 0.24.0, storage format 9, CBM schema 7). The test
+ * migrates it in place, so it works on a copy. */
+static int operations_copy_format9_fixture(const char *destination) {
     const char *directory = getenv("CBM_TEST_FIXTURE_DIR");
     char source[OPERATIONS_PATH_MAX];
-    snprintf(source, sizeof(source), "%s/zova-format-9/cbm.zova.zst",
+    snprintf(source, sizeof(source), "%s/zova-format-9/cbm.zova",
              directory && directory[0] ? directory : "tests/fixtures");
     FILE *in = fopen(source, "rb");
     if (!in) return -1;
-    char *packed = malloc(RAW_CAP), *raw = malloc(RAW_CAP);
-    size_t packed_len = packed ? fread(packed, 1, RAW_CAP, in) : 0;
-    fclose(in);
-    int raw_len = packed && raw && packed_len > 0
-                      ? cbm_zstd_decompress(packed, (int)packed_len, raw, RAW_CAP)
-                      : -1;
-    int rc = -1;
-    FILE *out = raw_len > 0 ? fopen(destination, "wb") : NULL;
-    if (out) {
-        rc = fwrite(raw, 1, (size_t)raw_len, out) == (size_t)raw_len ? 0 : -1;
-        if (fclose(out) != 0) rc = -1;
+    FILE *out = fopen(destination, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
     }
-    free(packed);
-    free(raw);
+    char buf[64 * 1024];
+    size_t n;
+    int rc = 0;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            rc = -1;
+            break;
+        }
+    }
+    if (ferror(in)) rc = -1;
+    fclose(in);
+    if (fclose(out) != 0) rc = -1;
     return rc;
 }
 
 TEST(zova_operations_migrate_format_upgrades_format9_database) {
     char path[OPERATIONS_PATH_MAX], leftover[OPERATIONS_PATH_MAX + 64];
     operations_path(path, sizeof(path), "migrate-format-9");
-    ASSERT_EQ(operations_inflate_format9_fixture(path), 0);
+    ASSERT_EQ(operations_copy_format9_fixture(path), 0);
     ASSERT_EQ(cbm_zova_database_format_status(path), CBM_ZOVA_DATABASE_MIGRATION_REQUIRED);
 
     cbm_zova_operation_report_t report = {0};

@@ -249,18 +249,4 @@ void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const cha
                                            CBMFreeFuncIter *out);
 int cbm_free_func_iter_next(CBMFreeFuncIter *it);
 
-// --- TS-specific helpers (return NULL for types without these signatures) ---
-
-// If the type has a call signature (e.g., `interface F { (x:number): string }`), return
-// a synthesised CBMRegisteredFunc whose qualified_name is "<type_qn>.__call" and
-// short_name is "__call". Returns NULL if no call signature is present, the type is
-// missing, or the receiver type was not registered. Caller must NOT free.
-const CBMRegisteredFunc *cbm_registry_lookup_callable(const CBMTypeRegistry *reg, CBMArena *arena,
-                                                      const char *type_qn);
-
-// If the type has an index signature, return the value type produced by indexing with
-// the given key type (string vs number). Returns NULL if no matching index signature.
-const CBMType *cbm_registry_lookup_index_signature(const CBMTypeRegistry *reg, const char *type_qn,
-                                                   const CBMType *key_type);
-
 #endif // CBM_LSP_TYPE_REGISTRY_H

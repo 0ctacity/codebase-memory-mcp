@@ -244,7 +244,6 @@ extern void suite_extraction_imports(void);
 extern void suite_grammar_regression(void);
 extern void suite_grammar_labels(void);
 extern void suite_grammar_imports(void);
-extern void suite_ac(void);
 extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
 extern void suite_store_search(void);
@@ -266,8 +265,6 @@ extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
 extern void suite_watcher(void);
-extern void suite_lz4(void);
-extern void suite_zstd(void);
 extern void suite_go_lsp(void);
 extern void suite_c_lsp(void);
 extern void suite_php_lsp(void);
@@ -438,7 +435,6 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(dump_verify);
 
     /* Existing C code regression tests */
-    RUN_SELECTED_SUITE(ac);
     RUN_SELECTED_SUITE(extraction);
     RUN_SELECTED_SUITE(parse_coverage);
     RUN_SELECTED_SUITE(extraction_inheritance);
@@ -483,10 +479,6 @@ int main(int argc, char **argv) {
 
     /* Watcher (M10) */
     RUN_SELECTED_SUITE(watcher);
-
-    /* LZ4 + zstd + SQLite writer */
-    RUN_SELECTED_SUITE(lz4);
-    RUN_SELECTED_SUITE(zstd);
 
     /* LSP resolvers */
     RUN_SELECTED_SUITE(scope);

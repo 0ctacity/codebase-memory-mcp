@@ -5,7 +5,6 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
-#include "extract_node_stack.h"
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
@@ -181,27 +180,6 @@ static void process_type_assign_node(CBMExtractCtx *ctx, TSNode node, const CBML
     if (strcmp(kind, "let_declaration") == 0 && ctx->language == CBM_LANG_RUST) {
         process_rust_let_type_assign(ctx, node, func_qn);
     }
-}
-
-// Walk AST for assignment patterns where RHS is a constructor call.
-static void walk_type_assigns(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, 4096);
-    ts_nstack_push(&stack, root);
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        process_type_assign_node(ctx, node, spec, cbm_enclosing_func_qn_cached(ctx, node));
-        ts_nstack_push_children(&stack, node);
-    }
-}
-
-void cbm_extract_type_assigns(CBMExtractCtx *ctx) {
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec) {
-        return;
-    }
-
-    walk_type_assigns(ctx, ctx->root, spec);
 }
 
 // --- Unified handler ---

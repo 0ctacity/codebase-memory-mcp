@@ -483,19 +483,6 @@ const CBMType *cbm_type_infer(CBMArena *a, const char *name) {
     return t;
 }
 
-const CBMType *cbm_type_mapped(CBMArena *a, const char *key_name, const CBMType *key_constraint,
-                               const CBMType *value) {
-    CBMType *t = (CBMType *)cbm_arena_alloc(a, sizeof(CBMType));
-    if (!t)
-        return &unknown_singleton;
-    memset(t, 0, sizeof(CBMType));
-    t->kind = CBM_TYPE_MAPPED;
-    t->data.mapped.key_name = key_name ? cbm_arena_strdup(a, key_name) : NULL;
-    t->data.mapped.key_constraint = key_constraint;
-    t->data.mapped.value = value;
-    return t;
-}
-
 // Operations
 
 const CBMType *cbm_type_deref(const CBMType *t) {
@@ -509,25 +496,6 @@ const CBMType *cbm_type_deref(const CBMType *t) {
     return t->data.pointer.elem;
 }
 
-const CBMType *cbm_type_elem(const CBMType *t) {
-    if (!t)
-        return cbm_type_unknown();
-    switch (t->kind) {
-    case CBM_TYPE_POINTER:
-        return t->data.pointer.elem;
-    case CBM_TYPE_SLICE:
-        return t->data.slice.elem;
-    case CBM_TYPE_CHANNEL:
-        return t->data.channel.elem;
-    case CBM_TYPE_REFERENCE:
-        return t->data.reference.elem;
-    case CBM_TYPE_RVALUE_REF:
-        return t->data.reference.elem;
-    default:
-        return cbm_type_unknown();
-    }
-}
-
 bool cbm_type_is_unknown(const CBMType *t) {
     if (!t)
         return true;
@@ -536,18 +504,6 @@ bool cbm_type_is_unknown(const CBMType *t) {
     if (((uintptr_t)t & (_Alignof(CBMType) - 1)) != 0)
         return true;
     return t->kind == CBM_TYPE_UNKNOWN;
-}
-
-bool cbm_type_is_interface(const CBMType *t) {
-    return t && t->kind == CBM_TYPE_INTERFACE;
-}
-
-bool cbm_type_is_pointer(const CBMType *t) {
-    return t && t->kind == CBM_TYPE_POINTER;
-}
-
-bool cbm_type_is_reference(const CBMType *t) {
-    return t && (t->kind == CBM_TYPE_REFERENCE || t->kind == CBM_TYPE_RVALUE_REF);
 }
 
 bool cbm_type_is_union(const CBMType *t) {

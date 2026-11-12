@@ -1066,10 +1066,6 @@ void cbm_service_pattern_cache_end(void) {
     _svc_cache = NULL;
 }
 
-void cbm_service_patterns_init(void) {
-    /* No-op — tables are static const */
-}
-
 bool cbm_service_pattern_is_global_fetch(const char *callee_name) {
     return callee_name != NULL && strcmp(callee_name, "fetch") == 0;
 }

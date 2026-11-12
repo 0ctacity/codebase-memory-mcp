@@ -158,21 +158,6 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         const char **using_targets, int using_count,
                                         TSTree *cached_tree, CBMResolvedCallArray *out);
 
-/* Batch cross-file entry for one CGo call from the parallel pipeline. */
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    TSTree *cached_tree;
-    CBMLSPDef *defs;
-    int def_count;
-    const char **using_targets;
-    int using_count;
-} CBMBatchCSLSPFile;
-
-void cbm_batch_cs_lsp_cross(CBMArena *arena, CBMBatchCSLSPFile *files, int file_count,
-                             CBMResolvedCallArray *out);
-
 /* Register .NET BCL stdlib types and functions. Generated. */
 void cbm_csharp_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 

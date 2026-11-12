@@ -5,7 +5,6 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
-#include "extract_node_stack.h"
 
 enum { MIN_TYPE_LEN = 1 };
 
@@ -242,84 +241,9 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
     }
 }
 
-// Walk function body for type references (casts, type assertions, local var types, generics).
-static void walk_body_type_refs(CBMExtractCtx *ctx, TSNode root, const char *func_qn) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, 4096);
-    ts_nstack_push(&stack, root);
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        process_body_type_ref(ctx, node, func_qn);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
-            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
-        }
-    }
-}
-
-// Walk AST for function nodes, extract type references from signatures and bodies.
-/* Process a single function node: extract type refs from signature + body. */
-static void process_func_type_refs(CBMExtractCtx *ctx, TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    if (ts_node_is_null(name_node)) {
-        return;
-    }
-    char *func_name = cbm_node_text(ctx->arena, name_node, ctx->source);
-    if (!func_name || !func_name[0]) {
-        return;
-    }
-    const char *func_qn = cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, func_name);
-    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
-    if (!ts_node_is_null(params)) {
-        extract_param_type_refs(ctx, params, func_qn);
-    }
-    extract_return_type_refs(ctx, node, func_qn);
-    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
-    if (ts_node_is_null(body)) {
-        body = ts_node_child_by_field_name(node, TS_FIELD("block"));
-    }
-    if (!ts_node_is_null(body)) {
-        walk_body_type_refs(ctx, body, func_qn);
-    }
-}
-
-static void walk_type_refs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    if (!spec->function_node_types || !spec->function_node_types[0]) {
-        return;
-    }
-
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, 4096);
-    ts_nstack_push(&stack, root);
-
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-
-        if (cbm_kind_in_set(node, spec->function_node_types)) {
-            process_func_type_refs(ctx, node);
-            continue;
-        }
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
-            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
-        }
-    }
-}
-
-void cbm_extract_type_refs(CBMExtractCtx *ctx) {
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec) {
-        return;
-    }
-
-    walk_type_refs(ctx, ctx->root, spec);
-}
-
 // --- Unified handler ---
 // For function nodes: extract signature type refs (params + return).
 // For body-level type-bearing nodes: extract body type refs.
-// The cursor visits both, so this single handler replaces the old
-// walk_type_refs + walk_body_type_refs split.
 
 // Extract signature type refs from a function node.
 static void extract_signature_type_refs(CBMExtractCtx *ctx, TSNode node, WalkState *state) {

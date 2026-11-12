@@ -5,9 +5,8 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
-#include "extract_node_stack.h"
 
-enum { MAX_EXCEPTION_NAME_LEN = 100, LAST_IDX = 1 };
+enum { MAX_EXCEPTION_NAME_LEN = 100 };
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
@@ -100,39 +99,6 @@ static void extract_throws_clause(CBMExtractCtx *ctx, TSNode node, const CBMLang
                 CBMThrow thr = {.exception_name = exc, .enclosing_func_qn = func_qn};
                 cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
             }
-        }
-    }
-}
-
-// Process a single node for throw extraction (called from iterative walker).
-static void process_throw_node(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    if (is_throw_node(node, spec)) {
-        char *exc_name = resolve_exception_name(ctx->arena, node, ctx->source);
-        if (exc_name && exc_name[0]) {
-            if (strlen(exc_name) > MAX_EXCEPTION_NAME_LEN) {
-                exc_name[MAX_EXCEPTION_NAME_LEN] = '\0';
-            }
-            CBMThrow thr;
-            thr.exception_name = exc_name;
-            thr.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
-            cbm_throws_push(&ctx->result->throws, ctx->arena, thr);
-        }
-    }
-
-    extract_throws_clause(ctx, node, spec, cbm_enclosing_func_qn_cached(ctx, node));
-}
-
-// Iterative throw walker
-static void walk_throws(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, CBM_SZ_512);
-    ts_nstack_push(&stack, root);
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        process_throw_node(ctx, node, spec);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -249,58 +215,6 @@ static TSNode resolve_write_lhs_node(TSNode node) {
         return ts_node_child(node, 0);
     }
     return (TSNode){0};
-}
-
-// Try to emit a write for an assignment node.
-static void try_emit_assignment_write(CBMExtractCtx *ctx, TSNode node, const char *func_qn) {
-    TSNode left = resolve_write_lhs_node(node);
-    if (ts_node_is_null(left)) {
-        return;
-    }
-    bool is_member = false;
-    char *name = resolve_lhs_write_name(ctx, left, &is_member);
-    if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMReadWrite rw;
-        rw.var_name = name;
-        rw.is_write = true;
-        rw.enclosing_func_qn = func_qn;
-        rw.is_member_access = is_member;
-        cbm_rw_push(&ctx->result->rw, ctx->arena, rw);
-    }
-}
-
-static void walk_readwrites(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, CBM_SZ_512);
-    ts_nstack_push(&stack, root);
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        if (cbm_kind_in_set(node, spec->assignment_node_types)) {
-            try_emit_assignment_write(ctx, node, cbm_enclosing_func_qn_cached(ctx, node));
-        }
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
-        }
-    }
-}
-
-void cbm_extract_semantic(CBMExtractCtx *ctx) {
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec) {
-        return;
-    }
-
-    // Throws
-    if ((spec->throw_node_types && spec->throw_node_types[0]) ||
-        (spec->throws_clause_field && spec->throws_clause_field[0])) {
-        walk_throws(ctx, ctx->root, spec);
-    }
-
-    // Reads/Writes
-    if (spec->assignment_node_types && spec->assignment_node_types[0]) {
-        walk_readwrites(ctx, ctx->root, spec);
-    }
 }
 
 // --- Unified handlers ---
