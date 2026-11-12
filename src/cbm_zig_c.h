@@ -143,7 +143,6 @@ typedef unsigned long long atomic_ullong;
 #include "spawn_patterns.h"
 #include "store/store.h"
 #include "tree_sitter/api.h"
-#include "xxhash/xxhash.h"
 #include "zova/cbm_zova.h"
 #include "zova/cbm_zova_bridge.h"
 #include "zova/cbm_zova_coordination.h"

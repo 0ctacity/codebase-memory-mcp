@@ -1143,8 +1143,8 @@ static uint32_t cbm_count_lines(const char *src, int src_len) {
  *
  * The marker must stay a SUFFIX and nothing else. Every reader stops at the
  * first token that is not a range, so a marker in the middle of a string
- * silently hides everything after it. objectscript_export_append_error_ranges
- * strips markers before joining two parts for exactly that reason.
+ * silently hides everything after it, so strip markers before joining two
+ * serialized lists.
  *
  * N can be non-zero while the kept list is short, because the recovery and
  * macro rules run after collection and remove ranges the cap never saw. That

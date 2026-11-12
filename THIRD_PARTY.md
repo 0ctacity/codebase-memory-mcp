@@ -55,13 +55,11 @@ License summary:
 | SQLite 3 | `vendored/sqlite3/` | Public Domain | [sqlite.org](https://www.sqlite.org/) |
 | mimalloc | `vendored/mimalloc/` | MIT | [microsoft/mimalloc](https://github.com/microsoft/mimalloc) |
 | yyjson | `vendored/yyjson/` | MIT | [ibireme/yyjson](https://github.com/ibireme/yyjson) |
-| xxHash | `vendored/xxhash/` | BSD-2-Clause | [Cyan4973/xxHash](https://github.com/Cyan4973/xxHash) |
 | TRE | `vendored/tre/` | BSD-2-Clause | [laurikari/tre](https://github.com/laurikari/tre) |
 | LZ4 | `internal/cbm/vendored/lz4/` | BSD-2-Clause (library files) | [lz4/lz4](https://github.com/lz4/lz4) |
 | Zstandard | `internal/cbm/vendored/zstd/` | BSD-3-Clause (dual BSD / GPLv2 — BSD selected) | [facebook/zstd](https://github.com/facebook/zstd) |
 | simplecpp | `internal/cbm/vendored/simplecpp/` | 0BSD | [danmar/simplecpp](https://github.com/danmar/simplecpp) |
 | Verstable | `internal/cbm/vendored/verstable/` | MIT | [JacksonAllan/Verstable](https://github.com/JacksonAllan/Verstable) |
-| wyhash | `internal/cbm/vendored/wyhash/` | Unlicense (public domain) | [wangyi-fudan/wyhash](https://github.com/wangyi-fudan/wyhash) |
 
 ## Embedded Model Data
 
