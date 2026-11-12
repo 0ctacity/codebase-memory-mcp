@@ -3067,13 +3067,3 @@ void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     if (owns) ts_tree_delete(tree);
 }
-
-void cbm_batch_cs_lsp_cross(CBMArena *arena, CBMBatchCSLSPFile *files, int file_count,
-                             CBMResolvedCallArray *out) {
-    if (!arena || !files) return;
-    for (int i = 0; i < file_count; i++) {
-        CBMBatchCSLSPFile *f = &files[i];
-        cbm_run_cs_lsp_cross(arena, f->source, f->source_len, f->module_qn, f->defs, f->def_count,
-                              f->using_targets, f->using_count, f->cached_tree, &out[i]);
-    }
-}

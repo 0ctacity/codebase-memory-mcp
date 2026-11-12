@@ -34,16 +34,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h> // struct timespec, CLOCK_MONOTONIC
-
-// Atomic counters for profiling parse vs extraction time (nanoseconds).
-// Accessed from multiple threads; using _Atomic for safe accumulation.
 #include <stdatomic.h>
-static _Atomic uint64_t total_parse_ns = 0;
-static _Atomic uint64_t total_extract_ns = 0;
-static _Atomic uint64_t total_lsp_ns = 0;
-static _Atomic uint64_t total_preprocess_ns = 0;
-static _Atomic uint64_t total_files_preprocessed = 0;
-static _Atomic uint64_t total_files = 0;
 
 // C/C++ preprocessor #define macros are extracted as Macro nodes (#375). On a
 // macro-dense codebase (e.g. the Linux kernel: ~2.4M macros, 49% of all nodes)
@@ -76,35 +67,6 @@ static uint64_t now_ns(void) {
     struct timespec ts;
     cbm_clock_gettime(CBM_CLOCK_MONO, &ts);
     return ((uint64_t)ts.tv_sec * NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
-}
-
-// cbm_get_profile returns accumulated parse/extract times and file count.
-void cbm_get_profile(cbm_profile_out_t out) {
-    *out.parse_ns = atomic_load(&total_parse_ns);
-    *out.extract_ns = atomic_load(&total_extract_ns);
-    *out.files = atomic_load(&total_files);
-}
-
-uint64_t cbm_get_lsp_ns(void) {
-    return atomic_load(&total_lsp_ns);
-}
-
-uint64_t cbm_get_preprocess_ns(void) {
-    return atomic_load(&total_preprocess_ns);
-}
-
-uint64_t cbm_get_files_preprocessed(void) {
-    return atomic_load(&total_files_preprocessed);
-}
-
-// cbm_reset_profile zeros the profiling counters.
-void cbm_reset_profile(void) {
-    atomic_store(&total_parse_ns, 0);
-    atomic_store(&total_extract_ns, 0);
-    atomic_store(&total_lsp_ns, 0);
-    atomic_store(&total_preprocess_ns, 0);
-    atomic_store(&total_files_preprocessed, 0);
-    atomic_store(&total_files, 0);
 }
 
 // --- Growable array push functions ---
@@ -420,15 +382,6 @@ int cbm_init(void) {
      * best-effort idempotent re-assert for paths that never hit main(). */
     cbm_alloc_init();
     return 0;
-}
-
-void cbm_reset_thread_parser(void) {
-    // Release parser's internal slab-allocated subtrees (stack, cached token).
-    // Must be called BEFORE cbm_slab_reset_thread() to avoid corrupting
-    // live slab chunks that the parser still references.
-    if (tl_parser) {
-        ts_parser_reset(tl_parser);
-    }
 }
 
 void cbm_destroy_thread_parser(void) {
@@ -1835,7 +1788,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
     }
 
     TSTree *tree = cbm_parse_source(parser, source, (uint32_t)source_len, opts);
-    uint64_t t1 = now_ns();
 
     if (!tree) {
         result->has_error = true;
@@ -1883,7 +1835,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
 
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
-    uint64_t lsp_start = now_ns();
     bool c_lsp_complete = true; // the raw C/C++ walk did not stop on a failure
     {
         if (language == CBM_LANG_GO) {
@@ -1934,7 +1885,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
     if (language == CBM_LANG_ZIG) {
         cbm_run_zig_lsp(a, result, source, source_len, root);
     }
-    atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
     // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
     // preprocessor second pass below appends calls with EXPANDED-source lines,
@@ -1945,7 +1895,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
     // Second pass: preprocess C/C++/CUDA and extract additional macro-hidden calls.
     // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
-        uint64_t pp_start = now_ns();
         char *expanded = cbm_preprocess(source, source_len, rel_path, extra_defines, include_paths,
                                         language != CBM_LANG_C);
         if (expanded) {
@@ -2001,10 +1950,8 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
                 }
             }
             cbm_preprocess_free(expanded);
-            atomic_fetch_add(&total_files_preprocessed, 1);
             (void)calls_before; // used for future logging
         }
-        atomic_fetch_add(&total_preprocess_ns, now_ns() - pp_start);
 
         /* Functions both the raw parse and the #961 preprocessed rescue lost
          * (whole-file feature guards, directives inside expressions). Runs
@@ -2107,8 +2054,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
     free(has_self);
     free(has_guarded);
 
-    uint64_t t2 = now_ns();
-
     /* Best-effort parse-coverage signal (#963): flag files whose tree contains
      * ERROR/MISSING regions. Computed AFTER extraction so definite recovery is
      * subtracted first — a region fully re-extracted as definitions is not a
@@ -2154,11 +2099,6 @@ static CBMFileResult *extract_file_impl_body(const char *source, int source_len,
 
     result->imports_count = result->imports.count;
 
-    // Accumulate profiling counters
-    atomic_fetch_add(&total_parse_ns, t1 - t0);
-    atomic_fetch_add(&total_extract_ns, t2 - t1);
-    atomic_fetch_add(&total_files, 1);
-
     // Retain tree for cross-file LSP reuse (caller frees via cbm_free_tree)
     result->cached_tree = tree;
     result->cached_lang = language;
@@ -2201,11 +2141,5 @@ void cbm_free_tree(CBMFileResult *result) {
     if (result && result->cached_tree) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
-    }
-}
-
-void cbm_free_tree_ptr(TSTree *tree) {
-    if (tree) {
-        ts_tree_delete(tree);
     }
 }

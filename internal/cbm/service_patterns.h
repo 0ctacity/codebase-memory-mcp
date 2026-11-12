@@ -26,9 +26,6 @@ typedef enum {
     CBM_SVC_TRPC = 7,      /* tRPC client procedure call */
 } cbm_svc_kind_t;
 
-/* Initialize the pattern lookup tables. Call once at startup. Thread-safe after init. */
-void cbm_service_patterns_init(void);
-
 /* Check if a resolved QN contains a known service library identifier.
  * Returns the pattern kind, or CBM_SVC_NONE if no match.
  * Matches on library name substrings in the QN (e.g., "requests" in

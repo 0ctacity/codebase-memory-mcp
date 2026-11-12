@@ -139,12 +139,6 @@ TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
 # All 64 grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
 
-# LZ4 + Aho-Corasick
-AC_LZ4_SRCS = $(CBM_DIR)/ac.c $(CBM_DIR)/lz4_store.c
-
-# Zstd compression (for persistent artifacts)
-ZSTD_SRCS = $(CBM_DIR)/zstd_store.c
-
 # Preprocessor (C++)
 PREPROCESSOR_SRC = $(CBM_DIR)/preprocessor.cpp
 
@@ -227,7 +221,7 @@ YYJSON_SRC = vendored/yyjson/yyjson.c
 # All production sources
 PROD_SRCS = $(FOUNDATION_SRCS) $(ZOVA_SRCS) $(MCP_SRCS) $(PIPELINE_SRCS) $(SEMANTIC_SRCS) $(CLI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
-                  $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS)
+                  $(GRAMMAR_SRCS)
 
 # ── Test sources ─────────────────────────────────────────────────
 
@@ -250,8 +244,7 @@ TEST_EXTRACTION_SRCS = \
     tests/test_extraction_imports.c \
     tests/test_grammar_regression.c \
     tests/test_grammar_labels.c \
-    tests/test_grammar_imports.c \
-    tests/test_ac.c
+    tests/test_grammar_imports.c
 
 TEST_STORE_SRCS = \
     tests/test_store_nodes.c \
@@ -278,8 +271,6 @@ TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_spaw
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
-TEST_LZ4_SRCS = tests/test_lz4.c
-TEST_ZSTD_SRCS = tests/test_zstd.c
 
 
 TEST_GO_LSP_SRCS = tests/test_go_lsp.c
@@ -392,7 +383,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_ZIG_LSP_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_ZOVA_SRCS) $(TEST_ZOVA_C_SQL_FUNCTIONS_SRCS) $(TEST_ZOVA_BRIDGE_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_ZIG_LSP_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_ZOVA_SRCS) $(TEST_ZOVA_C_SQL_FUNCTIONS_SRCS) $(TEST_ZOVA_BRIDGE_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -671,29 +662,17 @@ $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
-# Vendored LZ4 (test build)
-LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
-$(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
-$(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
-
-# Vendored zstd (test build)
-ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
-$(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
-
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
 	$(CC) -c -o $@ $<
 
-OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
+OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(OBJS_VENDORED_TEST) $(CBM_ZIG_TEST_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(OBJS_VENDORED_TEST) $(CBM_ZIG_TEST_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+		$(EXTRACTION_SRCS) \
 		$(OBJS_VENDORED_TEST) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(CBM_ZIG_TEST_LIB) \
@@ -725,10 +704,10 @@ test-zova-bridge:
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
 # still reproduced (the expected state); bug-repro.yml surfaces it as a board.
-$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(OBJS_VENDORED_TEST) $(CBM_ZIG_TEST_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
+$(BUILD_DIR)/test-repro-runner: $(TEST_REPRO_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(OBJS_VENDORED_TEST) $(CBM_ZIG_TEST_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -Itests -o $@ \
 		$(TEST_REPRO_SRCS) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+		$(EXTRACTION_SRCS) \
 		$(OBJS_VENDORED_TEST) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(CBM_ZIG_TEST_LIB) \
@@ -763,26 +742,14 @@ $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
-# Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
-LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
-$(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -c -o $@ $<
-$(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
-
-# Vendored zstd (compiled separately, not unity-built via zstd_store.c)
-ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
-$(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
-
-OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
+OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(UNIXCODER_OBJ)
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(OBJS_VENDORED_PROD) $(CBM_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(OBJS_VENDORED_PROD) $(CBM_ZIG_LIB) $(CBM_ZOVA_BRIDGE_LIB) $(ZOVA_CHECK_TARGET) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
-		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+		$(EXTRACTION_SRCS) \
 		$(OBJS_VENDORED_PROD) \
 		$(CBM_ZOVA_BRIDGE_LIB) \
 		$(CBM_ZIG_LIB) \
@@ -793,13 +760,11 @@ cbm:
 	$(ZIG) build cbm $(ZIG_CBM_ARGS)
 
 # Sources this Makefile builds, one "<group> <path>" line each, for
-# scripts/check-build-sources.sh to compare with build.zig. The vendored LZ4
-# and zstd paths are written out because their object rules name them directly.
+# scripts/check-build-sources.sh to compare with build.zig.
 print-build-sources:
-	@printf 'prod %s\n' $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) \
+	@printf 'prod %s\n' $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) \
 		$(MIMALLOC_SRC) $(SQLITE3_SRC) $(TRE_SRC) $(GRAMMAR_SRCS) $(TS_RUNTIME_SRC) $(LSP_SRCS) \
-		$(PREPROCESSOR_SRC) $(UNIXCODER_BLOB_SRC) \
-		$(CBM_DIR)/vendored/lz4/lz4.c $(CBM_DIR)/vendored/lz4/lz4hc.c $(CBM_DIR)/vendored/zstd/zstd.c
+		$(PREPROCESSOR_SRC) $(UNIXCODER_BLOB_SRC)
 	@printf 'test %s\n' $(ALL_TEST_SRCS)
 	@printf 'zig %s\n' $(filter %.zig,$(CBM_ZIG_SRCS) $(CBM_ZOVA_BRIDGE_ZIG_SRC))
 
@@ -822,8 +787,7 @@ SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
 LINT_SRCS = $(FOUNDATION_SRCS) $(MCP_SRCS) \
             $(PIPELINE_SRCS) $(SEMANTIC_SRCS) \
-            $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
-            $(ZSTD_SRCS) $(MAIN_SRC)
+            $(CLI_SRCS) $(EXTRACTION_SRCS) $(MAIN_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 

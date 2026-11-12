@@ -4,46 +4,10 @@
 #include "extract_unified.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
-#include "extract_node_stack.h"
 
-enum { MAX_PARENT_DEPTH = 10, LAST_IDX = 1 };
 #include <stdint.h> // uint32_t
 #include <string.h>
 #include <ctype.h>
-
-// Forward declaration
-static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec);
-
-// Check if a node is inside a call expression (to avoid double-counting as usage)
-static bool is_inside_call(TSNode node, const CBMLangSpec *spec) {
-    TSNode cur = ts_node_parent(node);
-    int depth = 0;
-    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
-        if (cbm_kind_in_set(cur, spec->call_node_types)) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-        depth++;
-    }
-    return false;
-}
-
-// Check if a node is inside an import statement
-static bool is_inside_import(TSNode node, const CBMLangSpec *spec) {
-    if (!spec->import_node_types || !spec->import_node_types[0]) {
-        return false;
-    }
-    TSNode cur = ts_node_parent(node);
-    int depth = 0;
-    while (!ts_node_is_null(cur) && depth < MAX_PARENT_DEPTH) {
-        if (cbm_kind_in_set(cur, spec->import_node_types)) {
-            return true;
-        }
-        cur = ts_node_parent(cur);
-        depth++;
-    }
-    return false;
-}
 
 // Is this an identifier-like node that represents a reference?
 static bool is_reference_node(TSNode node, CBMLanguage lang) {
@@ -72,63 +36,6 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     default:
         return false;
     }
-}
-
-// Check if a reference node is a definition name (the "name" field of its parent).
-static bool is_definition_name(TSNode node) {
-    TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) {
-        return false;
-    }
-    TSNode name_field = ts_node_child_by_field_name(parent, TS_FIELD("name"));
-    return !ts_node_is_null(name_field) &&
-           ts_node_start_byte(name_field) == ts_node_start_byte(node) &&
-           ts_node_end_byte(name_field) == ts_node_end_byte(node);
-}
-
-// Try to emit a usage for a reference node. Returns early if the node should be skipped.
-static void try_emit_usage(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
-    if (!is_reference_node(node, ctx->language)) {
-        return;
-    }
-    if (is_inside_call(node, spec) || is_inside_import(node, spec)) {
-        return;
-    }
-    if (is_definition_name(node)) {
-        return;
-    }
-    char *name = cbm_node_text(ctx->arena, node, ctx->source);
-    if (name && name[0] && !cbm_is_keyword(name, ctx->language)) {
-        CBMUsage usage = {0};
-        usage.ref_name = name;
-        usage.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
-        cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
-    }
-}
-
-// Iterative usage walker — explicit stack
-static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, 4096);
-    ts_nstack_push(&stack, root);
-
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        try_emit_usage(ctx, node, spec);
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - LAST_IDX; i >= 0; i--) {
-            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
-        }
-    }
-}
-
-void cbm_extract_usages(CBMExtractCtx *ctx) {
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec) {
-        return;
-    }
-
-    walk_usages(ctx, ctx->root, spec);
 }
 
 // --- Callable-reference candidates (CALL_REFERENCE) ---

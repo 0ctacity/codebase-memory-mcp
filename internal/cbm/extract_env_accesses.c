@@ -4,7 +4,6 @@
 #include "lang_specs.h"
 #include "extract_unified.h"
 #include "foundation/constants.h"
-#include "extract_node_stack.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
 #include <string.h>
@@ -135,51 +134,6 @@ static bool is_env_var_name(const char *s) {
         }
     }
     return has_upper;
-}
-
-// Iterative env access walker — explicit stack
-static void walk_env_accesses(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
-    TSNodeStack stack;
-    ts_nstack_init(&stack, ctx, 4096);
-    ts_nstack_push(&stack, root);
-
-    while (stack.count > 0) {
-        TSNode node = ts_nstack_pop(&stack);
-        const char *kind = ts_node_type(node);
-        const char *env_key = NULL;
-
-        if (cbm_kind_in_set(node, spec->call_node_types)) {
-            env_key = extract_env_key_from_call(ctx, node, spec);
-        } else if (strcmp(kind, "member_expression") == 0 || strcmp(kind, "subscript") == 0 ||
-                   strcmp(kind, "attribute") == 0) {
-            env_key = extract_env_key_from_member(ctx, node, spec);
-        }
-
-        if (env_key && env_key[0] && is_env_var_name(env_key)) {
-            CBMEnvAccess ea;
-            ea.env_key = env_key;
-            ea.enclosing_func_qn = cbm_enclosing_func_qn_cached(ctx, node);
-            cbm_envaccess_push(&ctx->result->env_accesses, ctx->arena, ea);
-            continue; // don't push children (avoid double-counting)
-        }
-
-        ts_nstack_push_children(&stack, node);
-    }
-}
-
-void cbm_extract_env_accesses(CBMExtractCtx *ctx) {
-    const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
-    if (!spec) {
-        return;
-    }
-
-    bool has_funcs = spec->env_access_functions && spec->env_access_functions[0];
-    bool has_members = spec->env_access_member_patterns && spec->env_access_member_patterns[0];
-    if (!has_funcs && !has_members) {
-        return;
-    }
-
-    walk_env_accesses(ctx, ctx->root, spec);
 }
 
 // --- Unified handler ---

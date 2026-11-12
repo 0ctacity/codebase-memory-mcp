@@ -3,7 +3,7 @@
 //! Coordinates multi-pass indexing:
 //!   1. Discover files
 //!   2. Build structure (Project/Folder/Package/File nodes)
-//!   3. Bulk load sources (read + LZ4 HC compress)
+//!   3. Bulk load sources
 //!   4. Extract definitions (fused: extract + write nodes + build registry)
 //!   5. Resolve imports, calls, usages, semantic edges
 //!   6. Post-passes: tests, communities, HTTP links, git history

@@ -696,31 +696,11 @@ void cbm_free_result(CBMFileResult *result);
 // Free only the cached tree from a result (caller retained it for reuse).
 void cbm_free_tree(CBMFileResult *result);
 
-// Free a standalone TSTree pointer (for Go layer cleanup).
-void cbm_free_tree_ptr(TSTree *tree);
-
-// Reset the thread-local parser's internal state, releasing slab-allocated
-// subtrees. Must be called BEFORE cbm_slab_reset_thread() so the slab rebuild
-// doesn't corrupt live parser state.
-void cbm_reset_thread_parser(void);
-
 // Destroy the thread-local parser. Call on worker thread exit.
 void cbm_destroy_thread_parser(void);
 
 // Shutdown the library. Call once at exit.
 void cbm_shutdown(void);
-
-// Profiling: get accumulated parse/extraction times and file count.
-typedef struct {
-    uint64_t *parse_ns;
-    uint64_t *extract_ns;
-    uint64_t *files;
-} cbm_profile_out_t;
-void cbm_get_profile(cbm_profile_out_t out);
-uint64_t cbm_get_lsp_ns(void);
-uint64_t cbm_get_preprocess_ns(void);
-uint64_t cbm_get_files_preprocessed(void);
-void cbm_reset_profile(void);
 
 // Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
 // it only for full/advanced index modes (it dominates extraction on macro-dense
@@ -753,11 +733,6 @@ void cbm_extract_definitions(CBMExtractCtx *ctx);
  * variables only. The C projection rescue (cbm.c) re-runs it on a second tree. */
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
-void cbm_extract_usages(CBMExtractCtx *ctx);
-void cbm_extract_semantic(CBMExtractCtx *ctx);
-void cbm_extract_type_refs(CBMExtractCtx *ctx);
-void cbm_extract_env_accesses(CBMExtractCtx *ctx);
-void cbm_extract_type_assigns(CBMExtractCtx *ctx);
 void cbm_extract_channels(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).

@@ -137,28 +137,4 @@ void cbm_ts_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 long cbm_ts_full_registry_builds(void);
 void cbm_ts_full_registry_builds_reset(void);
 
-// --- Batch cross-file LSP ---
-
-// Per-file input for batch TS LSP processing.
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    bool js_mode;
-    bool jsx_mode;
-    bool dts_mode;
-    TSTree *cached_tree; // from TSTree caching (NULL = parse internally)
-    CBMLSPDef *defs;     // combined file-local + cross-file defs
-    int def_count;
-    const char **import_names; // parallel arrays, import_count long
-    const char **import_qns;
-    int import_count;
-} CBMBatchTSLSPFile;
-
-// Process multiple TS/JS files' cross-file LSP in one CGo call.
-// out must point to file_count pre-zeroed CBMResolvedCallArray structs.
-// Project-scope declaration merging happens here (per plan §17 finding #4).
-void cbm_batch_ts_lsp_cross(CBMArena *arena, CBMBatchTSLSPFile *files, int file_count,
-                            CBMResolvedCallArray *out);
-
 #endif // CBM_LSP_TS_LSP_H
