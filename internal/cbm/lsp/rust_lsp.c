@@ -5484,33 +5484,8 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
             rf.short_name = cbm_arena_strdup(arena, d->short_name);
             rf.min_params = -1;
 
-            /* Build sig from return_types text. */
-            const CBMType **ret_types = NULL;
-            if (d->return_types && d->return_types[0]) {
-                int count = 1;
-                for (const char *p = d->return_types; *p; p++) {
-                    if (*p == '|')
-                        count++;
-                }
-                ret_types =
-                    (const CBMType **)cbm_arena_alloc(arena, (count + 1) * sizeof(const CBMType *));
-                int idx = 0;
-                char *buf = cbm_arena_strdup(arena, d->return_types);
-                char *start = buf;
-                for (char *p = buf;; p++) {
-                    if (*p == '|' || *p == '\0') {
-                        char save = *p;
-                        *p = '\0';
-                        if (start[0]) {
-                            ret_types[idx++] = rust_parse_return_type_text(arena, start, def_mod);
-                        }
-                        if (save == '\0')
-                            break;
-                        start = p + 1;
-                    }
-                }
-                ret_types[idx] = NULL;
-            }
+            const CBMType **ret_types = cbm_registry_parse_pipe_types(
+                arena, d->return_types, rust_parse_return_type_text, def_mod);
             rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
 
             if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
@@ -5710,44 +5685,4 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
     cbm_run_rust_lsp_cross_with_manifest(arena, source, source_len, module_qn, defs, def_count,
                                          import_names, import_qns, import_count, cached_tree, NULL,
                                          out);
-}
-
-void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,
-                              CBMResolvedCallArray *out) {
-    if (!files || file_count <= 0 || !out)
-        return;
-
-    for (int f = 0; f < file_count; f++) {
-        CBMBatchRustLSPFile *file = &files[f];
-        memset(&out[f], 0, sizeof(CBMResolvedCallArray));
-        if (!file->source || file->source_len <= 0)
-            continue;
-
-        CBMArena file_arena;
-        cbm_arena_init(&file_arena);
-
-        CBMResolvedCallArray file_out;
-        memset(&file_out, 0, sizeof(file_out));
-
-        cbm_run_rust_lsp_cross(&file_arena, file->source, file->source_len, file->module_qn,
-                               file->defs, file->def_count, file->import_names, file->import_qns,
-                               file->import_count, file->cached_tree, &file_out);
-
-        if (file_out.count > 0) {
-            out[f].count = file_out.count;
-            out[f].items =
-                (CBMResolvedCall *)cbm_arena_alloc(arena, file_out.count * sizeof(CBMResolvedCall));
-            for (int j = 0; j < file_out.count; j++) {
-                CBMResolvedCall *src = &file_out.items[j];
-                CBMResolvedCall *dst = &out[f].items[j];
-                dst->caller_qn = src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
-                dst->callee_qn = src->callee_qn ? cbm_arena_strdup(arena, src->callee_qn) : NULL;
-                dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
-                dst->confidence = src->confidence;
-                dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
-            }
-        }
-
-        cbm_arena_destroy(&file_arena);
-    }
 }

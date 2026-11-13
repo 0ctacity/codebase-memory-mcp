@@ -2743,6 +2743,24 @@ static const CBMType *cs_parse_return_type_text(CSLSPContext *ctx, const char *t
 
 /* ── single-file entry: cbm_run_cs_lsp ──────────────────────────── */
 
+/* Replace the signature of the first registered func named qn with one
+ * returning rt. */
+static void cs_patch_return_type(CBMArena *arena, CBMTypeRegistry *reg, const char *qn,
+                                 const CBMType *rt) {
+    for (int j = 0; j < reg->func_count; j++) {
+        if (strcmp(reg->funcs[j].qualified_name, qn) == 0) {
+            const CBMType **rets =
+                (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+            if (rets) {
+                rets[0] = rt;
+                rets[1] = NULL;
+                reg->funcs[j].signature = cbm_type_func(arena, NULL, NULL, rets);
+            }
+            return;
+        }
+    }
+}
+
 void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                     TSNode root) {
     if (!result || !arena || ts_node_is_null(root)) return;
@@ -2827,20 +2845,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
         CBMDefinition *d = &result->defs.items[i];
         if (!d->qualified_name || !d->return_type) continue;
         if (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0) continue;
-        const CBMType *rt = cs_parse_return_type_text(&ctx, d->return_type);
-        /* Find the registered func and patch its signature. */
-        for (int j = 0; j < reg.func_count; j++) {
-            if (strcmp(reg.funcs[j].qualified_name, d->qualified_name) == 0) {
-                const CBMType **rets =
-                    (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                if (rets) {
-                    rets[0] = rt;
-                    rets[1] = NULL;
-                    reg.funcs[j].signature = cbm_type_func(arena, NULL, NULL, rets);
-                }
-                break;
-            }
-        }
+        cs_patch_return_type(arena, &reg, d->qualified_name,
+                             cs_parse_return_type_text(&ctx, d->return_type));
     }
 
     /* Phase B.1.5: AST-driven return-type patch. The unified extractor
@@ -2849,25 +2855,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     {
         cs_method_rt_table_t mtab = {0};
         cs_collect_method_return_types(&ctx, root, &mtab);
-        for (int i = 0; i < mtab.count; i++) {
-            const char *qn = mtab.items[i].qn;
-            const CBMType *rt = mtab.items[i].rt;
-            bool patched = false;
-            for (int j = 0; j < reg.func_count; j++) {
-                if (strcmp(reg.funcs[j].qualified_name, qn) == 0) {
-                    const CBMType **rets =
-                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                    if (rets) {
-                        rets[0] = rt;
-                        rets[1] = NULL;
-                        reg.funcs[j].signature = cbm_type_func(arena, NULL, NULL, rets);
-                    }
-                    patched = true;
-                    break;
-                }
-            }
-            (void)patched;
-        }
+        for (int i = 0; i < mtab.count; i++)
+            cs_patch_return_type(arena, &reg, mtab.items[i].qn, mtab.items[i].rt);
     }
 
     /* Phase B.1: collect typed properties + fields. */
@@ -2926,29 +2915,7 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg,
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || (strcmp(d->label, "Interface") == 0);
-            if (d->embedded_types && *d->embedded_types) {
-                /* Parse "|"-separated list. */
-                int n = 1;
-                for (const char *p = d->embedded_types; *p; p++) if (*p == '|') n++;
-                const char **arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*arr));
-                if (arr) {
-                    int idx = 0;
-                    const char *start = d->embedded_types;
-                    for (const char *p = d->embedded_types; ; p++) {
-                        if (*p == '|' || *p == '\0') {
-                            size_t len = (size_t)(p - start);
-                            if (len > 0) {
-                                arr[idx++] = cbm_arena_strndup(arena, start, len);
-                            }
-                            if (*p == '\0') break;
-                            start = p + 1;
-                        }
-                    }
-                    arr[idx] = NULL;
-                    rt.embedded_types = arr;
-                }
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
             cbm_registry_add_type(reg, rt);
         }
         if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
@@ -3013,51 +2980,6 @@ void cbm_run_cs_lsp_cross_with_registry(CBMArena *arena, const char *source, int
 
     CSLSPContext ctx;
     cs_lsp_init(&ctx, arena, source, source_len, reg, module_qn, out);
-    for (int i = 0; i < using_count; i++) {
-        if (using_targets[i]) {
-            cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);
-        }
-    }
-    cs_lsp_process_file(&ctx, root);
-
-    if (owns) ts_tree_delete(tree);
-}
-
-void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                           const char *module_qn, CBMLSPDef *defs, int def_count,
-                           const char **using_targets, int using_count,
-                           TSTree *cached_tree, CBMResolvedCallArray *out) {
-    if (!source || !arena) return;
-
-    CBMTypeRegistry reg;
-    cbm_registry_init(&reg, arena);
-    cbm_csharp_stdlib_register(&reg, arena);
-    cs_register_lsp_defs(arena, &reg, defs, def_count);
-
-    /* Parse if needed. */
-    TSTree *tree = cached_tree;
-    bool owns = false;
-    if (!tree) {
-        TSParser *parser = ts_parser_new();
-        if (!parser) return;
-        ts_parser_set_language(parser, tree_sitter_c_sharp());
-        tree = cbm_parse_source(parser, source,
-                                source_len > 0 ? (uint32_t)source_len : (uint32_t)strlen(source),
-                                (TSParseOptions){0});
-        ts_parser_delete(parser);
-        owns = true;
-    }
-    if (!tree) return;
-    TSNode root = ts_tree_root_node(tree);
-
-    /* Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
-     * comment for the rationale. */
-    cbm_registry_finalize(&reg);
-
-    CSLSPContext ctx;
-    cs_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
-
-    /* Pre-populate using directives from the supplied list. */
     for (int i = 0; i < using_count; i++) {
         if (using_targets[i]) {
             cs_lsp_add_using(&ctx, CBM_CS_USING_NAMESPACE, "", using_targets[i], false);

@@ -981,3 +981,87 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_args(const CBMTypeRegistr
     }
     return res;
 }
+
+const char **cbm_registry_split_pipe(CBMArena *arena, const char *text, int *out_count) {
+    if (out_count)
+        *out_count = 0;
+    if (!arena || !text || !text[0])
+        return NULL;
+    int cap = 1;
+    for (const char *p = text; *p; p++) {
+        if (*p == '|')
+            cap++;
+    }
+    const char **arr = (const char **)cbm_arena_alloc(arena, (size_t)(cap + 1) * sizeof(*arr));
+    if (!arr)
+        return NULL;
+    int n = 0;
+    const char *start = text;
+    for (const char *p = text;; p++) {
+        if (*p != '|' && *p != '\0')
+            continue;
+        if (p > start) {
+            char *piece = cbm_arena_strndup(arena, start, (size_t)(p - start));
+            if (!piece)
+                return NULL;
+            arr[n++] = piece;
+        }
+        if (*p == '\0')
+            break;
+        start = p + 1;
+    }
+    if (n == 0)
+        return NULL;
+    arr[n] = NULL;
+    if (out_count)
+        *out_count = n;
+    return arr;
+}
+
+const CBMType **cbm_registry_parse_pipe_types(CBMArena *arena, const char *text,
+                                              CBMTypeTextParser parse, const char *module_qn) {
+    int n = 0;
+    const char **pieces = cbm_registry_split_pipe(arena, text, &n);
+    if (!pieces)
+        return NULL;
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*types));
+    if (!types)
+        return NULL;
+    for (int i = 0; i < n; i++)
+        types[i] = parse(arena, pieces[i], module_qn);
+    types[n] = NULL;
+    return types;
+}
+
+int cbm_registry_parse_field_defs(CBMArena *arena, const char *text, CBMTypeTextParser parse,
+                                  const char *module_qn, const char ***names_out,
+                                  const CBMType ***types_out) {
+    *names_out = NULL;
+    *types_out = NULL;
+    int n = 0;
+    const char **pieces = cbm_registry_split_pipe(arena, text, &n);
+    if (!pieces)
+        return 0;
+    const char **names = (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*names));
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*types));
+    if (!names || !types)
+        return 0;
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        const char *colon = strchr(pieces[i], ':');
+        if (!colon)
+            continue;
+        names[count] = cbm_arena_strndup(arena, pieces[i], (size_t)(colon - pieces[i]));
+        types[count] = parse(arena, colon + 1, module_qn);
+        count++;
+    }
+    if (count == 0)
+        return 0;
+    names[count] = NULL;
+    types[count] = NULL;
+    *names_out = names;
+    *types_out = types;
+    return count;
+}

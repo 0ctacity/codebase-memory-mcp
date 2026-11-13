@@ -15818,9 +15818,9 @@ TEST(clsp_issue54_preprocessed_depth_failure_is_reported) {
 }
 
 /* A depth failure is reported by every entry point: the single-file walk, the
- * cross-file walk with its own registry, with a shared registry, the batch,
- * and the pipeline's per-file fallback. None of them keeps the failed walk's
- * calls; the single-file entry points keep what `out` held before the walk. */
+ * cross-file walk with its own registry, with a shared registry, and the
+ * pipeline's per-file fallback. None of them keeps the failed walk's calls;
+ * the cross entry points keep what `out` held before the walk. */
 TEST(clsp_issue54_depth_failure_reports_all_entry_points) {
     const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
     CBMLSPDef defs[] = {
@@ -15839,7 +15839,7 @@ TEST(clsp_issue54_depth_failure_reports_all_entry_points) {
                    raw->resolved_calls.count == 0;
     if (raw)
         cbm_free_result(raw);
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 2; mode++) {
         CBMArena arena;
         CBMArena shared;
         cbm_arena_init(&arena);
@@ -15851,28 +15851,15 @@ TEST(clsp_issue54_depth_failure_reports_all_entry_points) {
         CBMResolvedCallArray out = {0};
         CBMResolvedCall earlier = {.caller_qn = "test.earlier", .callee_qn = "test.kept"};
         cbm_resolvedcall_push(&out, &arena, earlier);
-        CBMBatchCLSPFile file = {.source = src,
-                                 .source_len = (int)strlen(src),
-                                 .module_qn = "test",
-                                 .defs = defs,
-                                 .def_count = 2,
-                                 .cpp_mode = true};
-        if (mode == 2) {
-            correct = !cbm_batch_c_lsp_cross(&arena, &file, 1, &out) && correct;
-        } else {
-            CBMLSPStatus status =
-                mode == 0 ? cbm_run_c_lsp_cross_status(&arena, src, (int)strlen(src), "test", true,
-                                                       defs, 2, NULL, NULL, 0, NULL, &out)
-                          : cbm_run_c_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
-                                                                     "test", true, &overlay, NULL,
-                                                                     NULL, 0, NULL, &out);
-            correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
-        }
-        /* The batch starts each file's output empty; the single-file
-         * entry points append to what out already held. */
-        correct = correct &&
-                  (mode == 2 ? out.count == 0
-                             : out.count == 1 && strcmp(out.items[0].callee_qn, "test.kept") == 0);
+        CBMLSPStatus status =
+            mode == 0 ? cbm_run_c_lsp_cross_status(&arena, src, (int)strlen(src), "test", true,
+                                                   defs, 2, NULL, NULL, 0, NULL, &out)
+                      : cbm_run_c_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
+                                                                 "test", true, &overlay, NULL,
+                                                                 NULL, 0, NULL, &out);
+        correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
+        /* The cross entry points append to what out already held. */
+        correct = correct && out.count == 1 && strcmp(out.items[0].callee_qn, "test.kept") == 0;
         cbm_arena_destroy(&arena);
         cbm_arena_destroy(&shared);
     }
@@ -15893,7 +15880,7 @@ TEST(clsp_issue54_depth_failure_reports_all_entry_points) {
     PASS();
 }
 
-/* A memo failure in a cross-file walk is reported by all three cross entry
+/* A memo failure in a cross-file walk is reported by both cross entry
  * points, and the next walk recovers. */
 TEST(clsp_issue54_cross_file_memo_failures_propagate) {
     const char *src = "struct S { int m() { return 1; } }; void run() { S s; s.m(); }";
@@ -15906,29 +15893,22 @@ TEST(clsp_issue54_cross_file_memo_failures_propagate) {
          .return_types = "int",
          .lang = CBM_LANG_CPP},
     };
-    bool failed[3] = {false, false, false};
-    bool recovered[3] = {false, false, false};
-    for (int mode = 0; mode < 3; mode++) {
+    bool failed[2] = {false, false};
+    bool recovered[2] = {false, false};
+    for (int mode = 0; mode < 2; mode++) {
         CBMArena a;
         cbm_arena_init(&a);
         CBMTypeRegistry reg;
         cbm_registry_init(&reg, &a);
         reg.fallback = cbm_c_build_cross_registry(&a, defs, 2);
         CBMResolvedCallArray out = {0};
-        CBMBatchCLSPFile file = {.source = src,
-                                 .source_len = (int)strlen(src),
-                                 .module_qn = "test",
-                                 .cpp_mode = true,
-                                 .defs = defs,
-                                 .def_count = 2};
         for (int pass = 0; pass < 2; pass++) {
             cbm_c_lsp_test_memo_fail_after(pass == 0 ? 0 : -1);
             bool ok = mode == 0 ? cbm_run_c_lsp_cross(&a, src, (int)strlen(src), "test", true, defs,
                                                       2, NULL, NULL, 0, NULL, &out)
-                      : mode == 1
-                          ? cbm_run_c_lsp_cross_with_registry(&a, src, (int)strlen(src), "test",
-                                                              true, &reg, NULL, NULL, 0, NULL, &out)
-                          : cbm_batch_c_lsp_cross(&a, &file, 1, &out);
+                                : cbm_run_c_lsp_cross_with_registry(&a, src, (int)strlen(src),
+                                                                    "test", true, &reg, NULL, NULL,
+                                                                    0, NULL, &out);
             if (pass == 0)
                 failed[mode] = !ok && out.count == 0;
             else
@@ -15937,7 +15917,7 @@ TEST(clsp_issue54_cross_file_memo_failures_propagate) {
         cbm_c_lsp_test_memo_fail_after(-1);
         cbm_arena_destroy(&a);
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         ASSERT_TRUE(failed[i]);
         ASSERT_TRUE(recovered[i]);
     }

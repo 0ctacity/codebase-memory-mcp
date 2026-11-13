@@ -2116,121 +2116,74 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
 
 // --- Cross-file LSP: parse source, build registry from defs, run LSP ---
 
-// Helper: split "|"-separated string into array of CBMType*.
-static const CBMType** split_pipe_types(CBMArena* a, const char* text, const char* module_qn) {
-    if (!text || !text[0]) return NULL;
-
-    // Count separators
-    int count = 1;
-    for (const char* p = text; *p; p++) {
-        if (*p == '|') count++;
-    }
-
-    const CBMType** arr = (const CBMType**)cbm_arena_alloc(a, (count + 1) * sizeof(const CBMType*));
-    if (!arr) return NULL;
-
-    // Split and parse each type
-    char* buf = cbm_arena_strdup(a, text);
-    int idx = 0;
-    char* start = buf;
-    for (char* p = buf; ; p++) {
-        if (*p == '|' || *p == '\0') {
-            char save = *p;
-            *p = '\0';
-            if (start[0]) {
-                arr[idx++] = cbm_parse_return_type_text(a, start, module_qn);
-            }
-            if (save == '\0') break;
-            start = p + 1;
-        }
-    }
-    arr[idx] = NULL;
-    return idx > 0 ? arr : NULL;
-}
-
-// Helper: split "|"-separated string into array of const char*.
-static const char** split_pipe_strings(CBMArena* a, const char* text) {
-    if (!text || !text[0]) return NULL;
-
-    int count = 1;
-    for (const char* p = text; *p; p++) {
-        if (*p == '|') count++;
-    }
-
-    const char** arr = (const char**)cbm_arena_alloc(a, (count + 1) * sizeof(const char*));
-    if (!arr) return NULL;
-
-    char* buf = cbm_arena_strdup(a, text);
-    int idx = 0;
-    char* start = buf;
-    for (char* p = buf; ; p++) {
-        if (*p == '|' || *p == '\0') {
-            char save = *p;
-            *p = '\0';
-            if (start[0]) {
-                arr[idx++] = cbm_arena_strdup(a, start);
-            }
-            if (save == '\0') break;
-            start = p + 1;
-        }
-    }
-    arr[idx] = NULL;
-    return idx > 0 ? arr : NULL;
-}
-
 // Helper: parse "|"-separated "name:type" field definitions and populate a registered type.
 // Format: "Binder:Binder|Name:string|Count:int"
-// type_text is resolved relative to def_module_qn.
+// type_text is resolved relative to def_module_qn. The fields go to the FIRST
+// registered type with this QN (a receiver auto-registered by an earlier
+// Method def wins), which is the entry QN lookups return.
 static void parse_field_defs_into_type(CBMArena* arena, CBMTypeRegistry* reg,
     const char* type_qn, const char* field_defs, const char* def_module_qn) {
-    if (!field_defs || !field_defs[0] || !type_qn) return;
-
-    // Count fields
-    int count = 1;
-    for (const char* p = field_defs; *p; p++) {
-        if (*p == '|') count++;
-    }
-    if (count > 63) count = 63;
-
-    const char** names = (const char**)cbm_arena_alloc(arena, (count + 1) * sizeof(const char*));
-    const CBMType** types = (const CBMType**)cbm_arena_alloc(arena, (count + 1) * sizeof(const CBMType*));
-    if (!names || !types) return;
-
-    char* buf = cbm_arena_strdup(arena, field_defs);
-    int idx = 0;
-    char* start = buf;
-    for (char* p = buf; ; p++) {
-        if (*p == '|' || *p == '\0') {
-            char save = *p;
-            *p = '\0';
-            // Parse "name:type"
-            char* colon = NULL;
-            for (char* q = start; *q; q++) {
-                if (*q == ':') { colon = q; break; }
-            }
-            if (colon && idx < count) {
-                *colon = '\0';
-                names[idx] = cbm_arena_strdup(arena, start);
-                types[idx] = cbm_parse_return_type_text(arena, colon + 1, def_module_qn);
-                idx++;
-            }
-            if (save == '\0') break;
-            start = p + 1;
+    if (!type_qn) return;
+    const char** names = NULL;
+    const CBMType** types = NULL;
+    if (cbm_registry_parse_field_defs(arena, field_defs, cbm_parse_return_type_text,
+                                      def_module_qn, &names, &types) == 0) return;
+    for (int ti = 0; ti < reg->type_count; ti++) {
+        if (reg->types[ti].qualified_name &&
+            strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
+            reg->types[ti].field_names = names;
+            reg->types[ti].field_types = types;
+            break;
         }
     }
-    names[idx] = NULL;
-    types[idx] = NULL;
+}
 
-    if (idx > 0) {
-        // Find the registered type and update field info
-        for (int ti = 0; ti < reg->type_count; ti++) {
-            if (reg->types[ti].qualified_name &&
-                strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
-                reg->types[ti].field_names = names;
-                reg->types[ti].field_types = types;
-                break;
+// Register one CBMLSPDef. Shared by cbm_run_go_lsp_cross and the Tier 2
+// cbm_go_build_cross_registry; they differ only in def_mod's fallback.
+// Perf: borrow strings from d directly — they live in the caller's arena,
+// which outlives the registry, so cbm_arena_strdup is wasted work. On
+// kubernetes (~110k defs x 11k files x 5 strdups ~= 6B mallocs) this alone
+// saves ~90s of resolve wall time.
+static void go_register_lsp_def(CBMArena* arena, CBMTypeRegistry* reg, const CBMLSPDef* d,
+                                const char* def_mod) {
+    // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
+    // Struct included so Go structs (now labelled "Struct") register as types.
+    if (cbm_label_is_type_like(d->label)) {
+        CBMRegisteredType rt;
+        memset(&rt, 0, sizeof(rt));
+        rt.qualified_name = d->qualified_name;  // borrowed
+        rt.short_name = d->short_name;          // borrowed
+        rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
+        rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
+        // method_names are recorded for interfaces only
+        if (rt.is_interface) {
+            rt.method_names = cbm_registry_split_pipe(arena, d->method_names_str, NULL);
+        }
+        cbm_registry_add_type(reg, rt);
+        parse_field_defs_into_type(arena, reg, rt.qualified_name, d->field_defs, def_mod);
+    }
+
+    if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
+        CBMRegisteredFunc rf;
+        memset(&rf, 0, sizeof(rf));
+        rf.qualified_name = d->qualified_name;  // borrowed
+        rf.short_name = d->short_name;          // borrowed
+        const CBMType** ret_types = cbm_registry_parse_pipe_types(
+            arena, d->return_types, cbm_parse_return_type_text, def_mod);
+        rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
+        if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
+            rf.receiver_type = d->receiver_type;  // borrowed
+            // Auto-create type entry if not exists
+            if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                CBMRegisteredType auto_type;
+                memset(&auto_type, 0, sizeof(auto_type));
+                auto_type.qualified_name = rf.receiver_type;
+                const char* dot = strrchr(d->receiver_type, '.');
+                auto_type.short_name = dot ? dot + 1 : rf.receiver_type;  // borrowed substring
+                cbm_registry_add_type(reg, auto_type);
             }
         }
+        cbm_registry_add_func(reg, rf);
     }
 }
 
@@ -2617,66 +2570,10 @@ void cbm_run_go_lsp_cross(
     cbm_go_stdlib_register(&reg, arena);
 
     // Register all defs (file-local + cross-file).
-    // Perf: borrow strings from defs[] directly — they live in the
-    // caller's arena which outlives this call, so cbm_arena_strdup is
-    // wasted work. On kubernetes (~110k defs × 11k files × 5 strdups
-    // ~= 6B mallocs) this alone saves ~90s of resolve wall time.
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef* d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label) continue;
-
-        const char* def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
-
-        // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
-        // Struct included so Go structs (now labelled "Struct") register as types.
-        if (cbm_label_is_type_like(d->label)) {
-            CBMRegisteredType rt;
-            memset(&rt, 0, sizeof(rt));
-            rt.qualified_name = d->qualified_name;  // borrowed
-            rt.short_name = d->short_name;          // borrowed
-            rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
-
-            // Set method_names for interfaces from "|"-separated string
-            if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
-                rt.method_names = split_pipe_strings(arena, d->method_names_str);
-            }
-
-            cbm_registry_add_type(&reg, rt);
-
-            // Populate struct field types from field_defs
-            if (d->field_defs && d->field_defs[0]) {
-                parse_field_defs_into_type(arena, &reg, rt.qualified_name, d->field_defs, def_mod);
-            }
-        }
-
-        // Function/Method
-        if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
-            CBMRegisteredFunc rf;
-            memset(&rf, 0, sizeof(rf));
-            rf.qualified_name = d->qualified_name;  // borrowed
-            rf.short_name = d->short_name;          // borrowed
-
-            // Build FUNC type from return_types text
-            const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
-
-            // Method receiver
-            if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
-                rf.receiver_type = d->receiver_type;  // borrowed
-                // Auto-create type entry if not exists
-                if (!cbm_registry_lookup_type(&reg, rf.receiver_type)) {
-                    CBMRegisteredType auto_type;
-                    memset(&auto_type, 0, sizeof(auto_type));
-                    auto_type.qualified_name = rf.receiver_type;
-                    const char* dot = strrchr(d->receiver_type, '.');
-                    auto_type.short_name = dot ? dot + 1 : rf.receiver_type;  // borrowed substring
-                    cbm_registry_add_type(&reg, auto_type);
-                }
-            }
-
-            cbm_registry_add_func(&reg, rf);
-        }
+        go_register_lsp_def(arena, &reg, d, d->def_module_qn ? d->def_module_qn : module_qn);
     }
 
     // 3. Phase 1b: Scan AST for struct definitions to populate embedded_types
@@ -2878,47 +2775,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
         /* In the pre-built path every def carries its own def_module_qn
          * (set by cbm_pxc_collect_all_defs). There is no caller module to
          * fall back to — this registry is project-wide, not per-file. */
-        const char* def_mod = d->def_module_qn ? d->def_module_qn : "";
-
-        // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
-        // Struct included so Go structs (now labelled "Struct") register as types.
-        if (cbm_label_is_type_like(d->label)) {
-            CBMRegisteredType rt;
-            memset(&rt, 0, sizeof(rt));
-            rt.qualified_name = d->qualified_name; /* borrowed */
-            rt.short_name = d->short_name;
-            rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
-            if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
-                rt.method_names = split_pipe_strings(arena, d->method_names_str);
-            }
-            cbm_registry_add_type(reg, rt);
-            if (d->field_defs && d->field_defs[0]) {
-                parse_field_defs_into_type(arena, reg, rt.qualified_name,
-                                           d->field_defs, def_mod);
-            }
-        }
-
-        if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
-            CBMRegisteredFunc rf;
-            memset(&rf, 0, sizeof(rf));
-            rf.qualified_name = d->qualified_name; /* borrowed */
-            rf.short_name = d->short_name;
-            const CBMType** ret_types = split_pipe_types(arena, d->return_types, def_mod);
-            rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
-            if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
-                rf.receiver_type = d->receiver_type;
-                if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
-                    CBMRegisteredType auto_type;
-                    memset(&auto_type, 0, sizeof(auto_type));
-                    auto_type.qualified_name = rf.receiver_type;
-                    const char* dot = strrchr(d->receiver_type, '.');
-                    auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
-                    cbm_registry_add_type(reg, auto_type);
-                }
-            }
-            cbm_registry_add_func(reg, rf);
-        }
+        go_register_lsp_def(arena, reg, d, d->def_module_qn ? d->def_module_qn : "");
     }
 
     cbm_registry_finalize(reg);

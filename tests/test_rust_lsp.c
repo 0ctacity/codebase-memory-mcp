@@ -3661,20 +3661,6 @@ TEST(rustlsp_cov_xf_free_function_chain) {
     ASSERT_GTE(find_confident(&out, "run", "util.make"), 0);
     cbm_arena_destroy(&a); PASS();
 }
-TEST(rustlsp_cov_xf_batch) {
-    const char *src1 = "fn run() {}\n";
-    const char *src2 = "fn done() {}\n";
-    CBMArena a; cbm_arena_init(&a);
-    CBMBatchRustLSPFile files[2];
-    memset(files, 0, sizeof(files));
-    files[0].source = src1; files[0].source_len = (int)strlen(src1);
-    files[0].module_qn = "p.f1"; files[0].defs = NULL; files[0].def_count = 0;
-    files[1].source = src2; files[1].source_len = (int)strlen(src2);
-    files[1].module_qn = "p.f2"; files[1].defs = NULL; files[1].def_count = 0;
-    CBMResolvedCallArray out[2]; memset(out, 0, sizeof(out));
-    cbm_batch_rust_lsp_cross(&a, files, 2, out);
-    cbm_arena_destroy(&a); PASS();
-}
 TEST(rustlsp_cov_xf_empty_defs) {
     const char *src = "fn run() {}\n";
     CBMArena a; cbm_arena_init(&a);
@@ -6330,7 +6316,6 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_cov_xf_two_methods);
     RUN_TEST(rustlsp_cov_xf_trait_impl);
     RUN_TEST(rustlsp_cov_xf_free_function_chain);
-    RUN_TEST(rustlsp_cov_xf_batch);
     RUN_TEST(rustlsp_cov_xf_empty_defs);
     RUN_TEST(rustlsp_cov_xf_nested_modules);
     RUN_TEST(rustlsp_cov_xf_with_stdlib_chain);

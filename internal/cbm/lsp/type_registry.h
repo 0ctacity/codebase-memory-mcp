@@ -212,6 +212,32 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol_by_types(const CBMTypeRegist
                                                              const CBMType **arg_types,
                                                              int arg_count);
 
+// --- CBMLSPDef text decoding (shared by the per-language def registration) ---
+//
+// The pipeline passes multi-valued CBMLSPDef fields (embedded_types,
+// method_names_str, return_types, field_defs) as "|"-separated text.
+
+// Parses one type expression; module_qn qualifies bare names.
+typedef const CBMType *(*CBMTypeTextParser)(CBMArena *arena, const char *text,
+                                            const char *module_qn);
+
+// Split "|"-separated text into a NULL-terminated array of its non-empty
+// pieces (arena copies). Returns NULL when text has no non-empty piece.
+// out_count (optional) receives the piece count.
+const char **cbm_registry_split_pipe(CBMArena *arena, const char *text, int *out_count);
+
+// Parse each non-empty piece of "|"-separated text with parse. Returns a
+// NULL-terminated array, or NULL when text has no non-empty piece.
+const CBMType **cbm_registry_parse_pipe_types(CBMArena *arena, const char *text,
+                                              CBMTypeTextParser parse, const char *module_qn);
+
+// Parse "name:type|name:type" field definitions into parallel NULL-terminated
+// arrays. Pieces without a ':' are skipped. Returns the field count; when it is
+// 0, *names_out and *types_out are set to NULL.
+int cbm_registry_parse_field_defs(CBMArena *arena, const char *text, CBMTypeTextParser parse,
+                                  const char *module_qn, const char ***names_out,
+                                  const CBMType ***types_out);
+
 // --- Auxiliary index iterators (Rust trait / free-function fallback fast paths) ---
 //
 // Iterate registry TYPE indices whose embedded_types contain an entry whose BARE

@@ -5068,9 +5068,9 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 // ── Cross-file entry point (Phase 3) ──────────────────────────────────────────
 
-/* Register a batch of CBMLSPDef[] into a registry. Mirrors the inline
- * loop in cbm_run_ts_lsp_cross — KEEP IN SYNC. Shared by the Tier 2
- * pre-built registry builder + per-file overlay builder. Def-driven
+/* Register a batch of CBMLSPDef[] into a registry. Shared by
+ * cbm_run_ts_lsp_cross, the Tier 2 pre-built registry builder and the
+ * per-file overlay builder. Def-driven
  * (return/field/embedded/method info from def strings). */
 static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
                                  int def_count) {
@@ -5085,93 +5085,23 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
-            if (d->embedded_types && d->embedded_types[0]) {
-                int n = 1;
-                for (const char *s = d->embedded_types; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                if (arr) {
-                    int idx = 0;
-                    const char *start = d->embedded_types;
-                    for (const char *s = d->embedded_types;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            arr[idx++] = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    arr[idx] = NULL;
-                    rt.embedded_types = arr;
-                }
-            }
-            if (d->field_defs && d->field_defs[0]) {
-                int n = 1;
-                for (const char *s = d->field_defs; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **fn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const CBMType **ft_arr = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (fn_arr && ft_arr) {
-                    int idx = 0;
-                    const char *start = d->field_defs;
-                    for (const char *s = d->field_defs;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *pair = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            char *colon = pair ? strchr(pair, ':') : NULL;
-                            if (pair && colon) {
-                                *colon = '\0';
-                                fn_arr[idx] = pair;
-                                ft_arr[idx] =
-                                    parse_ts_type_text(arena, colon + 1, d->def_module_qn);
-                                idx++;
-                            }
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    fn_arr[idx] = NULL;
-                    ft_arr[idx] = NULL;
-                    rt.field_names = fn_arr;
-                    rt.field_types = ft_arr;
-                }
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
+            cbm_registry_parse_field_defs(arena, d->field_defs, parse_ts_type_text,
+                                          d->def_module_qn, &rt.field_names, &rt.field_types);
             cbm_registry_add_type(reg, rt);
-            if (d->method_names_str && d->method_names_str[0]) {
-                int n = 1;
-                for (const char *s = d->method_names_str; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **mn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const char **mqn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                if (mn_arr && mqn_arr) {
-                    int idx = 0;
-                    const char *start = d->method_names_str;
-                    for (const char *s = d->method_names_str;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *m = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            mn_arr[idx] = m;
-                            mqn_arr[idx] = cbm_arena_sprintf(arena, "%s.%s", d->qualified_name, m);
-                            idx++;
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    mn_arr[idx] = NULL;
-                    mqn_arr[idx] = NULL;
-                    if (reg->type_count > 0) {
-                        CBMRegisteredType *rt_just = &reg->types[reg->type_count - 1];
-                        rt_just->method_names = mn_arr;
-                        rt_just->method_qns = mqn_arr;
-                    }
+            int mn = 0;
+            const char **mn_arr = cbm_registry_split_pipe(arena, d->method_names_str, &mn);
+            const char **mqn_arr =
+                mn_arr ? (const char **)cbm_arena_alloc(arena, (size_t)(mn + 1) * sizeof(*mqn_arr))
+                       : NULL;
+            if (mqn_arr) {
+                for (int j = 0; j < mn; j++)
+                    mqn_arr[j] = cbm_arena_sprintf(arena, "%s.%s", d->qualified_name, mn_arr[j]);
+                mqn_arr[mn] = NULL;
+                if (reg->type_count > 0) {
+                    CBMRegisteredType *rt_just = &reg->types[reg->type_count - 1];
+                    rt_just->method_names = mn_arr;
+                    rt_just->method_qns = mqn_arr;
                 }
             }
         } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
@@ -5180,29 +5110,10 @@ static void ts_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             rf.qualified_name = d->qualified_name;
             rf.short_name = d->short_name;
             rf.min_params = -1;
-            if (d->return_types && d->return_types[0]) {
-                int n = 1;
-                for (const char *s = d->return_types; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const CBMType **rets = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (rets) {
-                    int idx = 0;
-                    const char *start = d->return_types;
-                    for (const char *s = d->return_types;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *part = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            rets[idx++] = parse_ts_type_text(arena, part, d->def_module_qn);
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    rets[idx] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
-                }
-            }
+            const CBMType **rets = cbm_registry_parse_pipe_types(
+                arena, d->return_types, parse_ts_type_text, d->def_module_qn);
+            if (rets)
+                rf.signature = cbm_type_func(arena, NULL, NULL, rets);
             if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
                 rf.receiver_type = d->receiver_type;
             }
@@ -5332,146 +5243,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
     cbm_ts_stdlib_register(&reg, arena);
 
     // Register cross-file defs.
-    for (int i = 0; i < def_count; i++) {
-        const CBMLSPDef *d = &defs[i];
-        if (!d->qualified_name || !d->short_name || !d->label)
-            continue;
-
-        if (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Interface") == 0) {
-            CBMRegisteredType rt;
-            memset(&rt, 0, sizeof(rt));
-            rt.qualified_name = d->qualified_name;
-            rt.short_name = d->short_name;
-            rt.is_interface = (strcmp(d->label, "Interface") == 0);
-            // Embedded types (extends list) — pipe-separated.
-            if (d->embedded_types && d->embedded_types[0]) {
-                int n = 1;
-                for (const char *s = d->embedded_types; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                if (arr) {
-                    int idx = 0;
-                    const char *start = d->embedded_types;
-                    for (const char *s = d->embedded_types;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            arr[idx++] = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    arr[idx] = NULL;
-                    rt.embedded_types = arr;
-                }
-            }
-            // Field defs (interface members, "name:type|name:type").
-            if (d->field_defs && d->field_defs[0]) {
-                int n = 1;
-                for (const char *s = d->field_defs; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **fn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const CBMType **ft_arr = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (fn_arr && ft_arr) {
-                    int idx = 0;
-                    const char *start = d->field_defs;
-                    for (const char *s = d->field_defs;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *pair = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            char *colon = pair ? strchr(pair, ':') : NULL;
-                            if (pair && colon) {
-                                *colon = '\0';
-                                fn_arr[idx] = pair;
-                                ft_arr[idx] =
-                                    parse_ts_type_text(arena, colon + 1, d->def_module_qn);
-                                idx++;
-                            }
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    fn_arr[idx] = NULL;
-                    ft_arr[idx] = NULL;
-                    rt.field_names = fn_arr;
-                    rt.field_types = ft_arr;
-                }
-            }
-            cbm_registry_add_type(&reg, rt);
-            // Method names from method_names_str.
-            if (d->method_names_str && d->method_names_str[0]) {
-                int n = 1;
-                for (const char *s = d->method_names_str; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const char **mn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                const char **mqn_arr =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
-                if (mn_arr && mqn_arr) {
-                    int idx = 0;
-                    const char *start = d->method_names_str;
-                    for (const char *s = d->method_names_str;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *m = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            mn_arr[idx] = m;
-                            mqn_arr[idx] = cbm_arena_sprintf(arena, "%s.%s", d->qualified_name, m);
-                            idx++;
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    mn_arr[idx] = NULL;
-                    mqn_arr[idx] = NULL;
-                    // Find the type we just inserted and attach.
-                    if (reg.type_count > 0) {
-                        CBMRegisteredType *rt_just = &reg.types[reg.type_count - 1];
-                        rt_just->method_names = mn_arr;
-                        rt_just->method_qns = mqn_arr;
-                    }
-                }
-            }
-        } else if (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) {
-            CBMRegisteredFunc rf;
-            memset(&rf, 0, sizeof(rf));
-            rf.qualified_name = d->qualified_name;
-            rf.short_name = d->short_name;
-            rf.min_params = -1;
-            // Return types from pipe-separated return_types text.
-            if (d->return_types && d->return_types[0]) {
-                int n = 1;
-                for (const char *s = d->return_types; *s; s++)
-                    if (*s == '|')
-                        n++;
-                const CBMType **rets = (const CBMType **)cbm_arena_alloc(
-                    arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                if (rets) {
-                    int idx = 0;
-                    const char *start = d->return_types;
-                    for (const char *s = d->return_types;; s++) {
-                        if (*s == '|' || *s == '\0') {
-                            char *part = cbm_arena_strndup(arena, start, (size_t)(s - start));
-                            rets[idx++] = parse_ts_type_text(arena, part, d->def_module_qn);
-                            if (*s == '\0')
-                                break;
-                            start = s + 1;
-                        }
-                    }
-                    rets[idx] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
-                }
-            }
-            if (strcmp(d->label, "Method") == 0 && d->receiver_type) {
-                rf.receiver_type = d->receiver_type;
-            }
-            cbm_registry_add_func(&reg, rf);
-        }
-    }
+    ts_register_lsp_defs(arena, &reg, defs, def_count);
 
     // Use cached tree if available; otherwise parse internally and own it.
     TSTree *tree = cached_tree;

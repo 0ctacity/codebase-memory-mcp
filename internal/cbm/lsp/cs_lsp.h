@@ -142,12 +142,6 @@ const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn
 void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                     TSNode root);
 
-/* Cross-file entry. Like Go/C: caller supplies pre-resolved defs from siblings. */
-void cbm_run_cs_lsp_cross(CBMArena *arena, const char *source, int source_len,
-                           const char *module_qn, CBMLSPDef *defs, int def_count,
-                           const char **using_targets, int using_count,
-                           TSTree *cached_tree, CBMResolvedCallArray *out);
-
 /* Tier 2: build a project-wide C# registry ONCE from all defs (filters
  * by lang), shared READ-ONLY across resolve workers. Def-driven. */
 CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
