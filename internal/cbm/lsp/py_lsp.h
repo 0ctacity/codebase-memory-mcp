@@ -205,21 +205,4 @@ bool cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         int import_count, TSTree *cached_tree,
                                         CBMResolvedCallArray *out);
 
-// --- Batch cross-file LSP ---
-
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    TSTree *cached_tree; // from TSTree caching (NULL = parse internally)
-    CBMLSPDef *defs;     // combined file-local + cross-file defs
-    int def_count;
-    const char **import_names; // parallel arrays, import_count long
-    const char **import_qns;
-    int import_count;
-} CBMBatchPyLSPFile;
-
-bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
-                            CBMResolvedCallArray *out);
-
 #endif // CBM_LSP_PY_LSP_H

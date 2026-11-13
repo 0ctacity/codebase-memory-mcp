@@ -3636,30 +3636,7 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
             rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
-            /* Embedded types from "|"-separated text. */
-            if (d->embedded_types && d->embedded_types[0]) {
-                int n = 1;
-                for (const char *p = d->embedded_types; *p; p++)
-                    if (*p == '|')
-                        n++;
-                const char **emb =
-                    (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(*emb));
-                int idx = 0;
-                const char *start = d->embedded_types;
-                while (*start) {
-                    const char *end = start;
-                    while (*end && *end != '|')
-                        end++;
-                    if (end > start) {
-                        emb[idx++] = cbm_arena_strndup(arena, start, (size_t)(end - start));
-                    }
-                    if (!*end)
-                        break;
-                    start = end + 1;
-                }
-                emb[idx] = NULL;
-                rt.embedded_types = emb;
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
             cbm_registry_add_type(&reg, rt);
         } else if (strcmp(d->label, "Method") == 0 || strcmp(d->label, "Function") == 0 ||
                    strcmp(d->label, "Constructor") == 0) {
@@ -3733,16 +3710,4 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
 
     if (owns_tree)
         ts_tree_delete(tree);
-}
-
-void cbm_batch_java_lsp_cross(CBMArena *arena, CBMBatchJavaLSPFile *files, int file_count,
-                              CBMResolvedCallArray *out) {
-    if (!files || file_count <= 0)
-        return;
-    for (int i = 0; i < file_count; i++) {
-        cbm_run_java_lsp_cross(arena, files[i].source, files[i].source_len, files[i].module_qn,
-                               files[i].defs, files[i].def_count, files[i].import_names,
-                               files[i].import_qns, files[i].import_count, files[i].cached_tree,
-                               &out[i]);
-    }
 }

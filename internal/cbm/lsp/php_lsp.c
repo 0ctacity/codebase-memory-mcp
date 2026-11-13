@@ -3999,6 +3999,47 @@ static void php_lsp_collect_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *re
 
 /* ── entry: cbm_run_php_lsp ─────────────────────────────────────── */
 
+/* Collect typed properties (declared, promoted, ctor-assigned) and merge them
+ * onto the registered types, so eval_expr_type for $this->prop and $obj->prop
+ * sees the field types. Runs after the registry is filled and before the call
+ * walk. A first pass over top-level namespace/use declarations lets type names
+ * in property declarations resolve; that state is then reset (namespace to "",
+ * use_count to keep_uses) because php_lsp_process_file re-collects it. */
+static void php_apply_class_fields(PHPLSPContext *ctx, CBMTypeRegistry *reg, TSNode root,
+                                   int keep_uses) {
+    php_class_field_table_t tab = {0};
+    /* Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²). */
+    uint32_t pkn = 0;
+    TSNode *pkids = cbm_lsp_collect_children(ctx->arena, root, &pkn);
+    for (uint32_t i = 0; i < pkn; i++) {
+        TSNode c = pkids[i];
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "namespace_definition") == 0) {
+            set_namespace_from_decl(ctx, c);
+        } else if (strcmp(k, "namespace_use_declaration") == 0) {
+            collect_use_declaration(ctx, c);
+        }
+    }
+    php_lsp_collect_class_fields(ctx, reg, root, &tab);
+    ctx->current_namespace_qn = "";
+    ctx->use_count = keep_uses;
+
+    for (int i = 0; i < tab.count; i++) {
+        php_class_fields_t *f = &tab.items[i];
+        if (f->count == 0)
+            continue;
+        /* Mutate the existing entry — registered types are stored by
+         * value in reg->types[], find the index and update it. */
+        for (int t = 0; t < reg->type_count; t++) {
+            if (strcmp(reg->types[t].qualified_name, f->class_qn) == 0) {
+                reg->types[t].field_names = f->field_names;
+                reg->types[t].field_types = f->field_types;
+                break;
+            }
+        }
+    }
+}
+
 void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                      TSNode root) {
     if (!result || !arena || ts_node_is_null(root))
@@ -4088,46 +4129,8 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
     PHPLSPContext ctx;
     php_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
 
-    /* Phase B.1: collect typed properties (declared, promoted, ctor-assigned)
-     * and merge them onto the registered types. Must run after stdlib +
-     * file defs are registered but before the call walk so eval_expr_type
-     * for $this->prop and $obj->prop sees the field types. */
-    {
-        php_class_field_table_t tab = {0};
-        /* First pass to populate the use map (so type names in property
-         * declarations resolve correctly). */
-        /* Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²). */
-        uint32_t pkn = 0;
-        TSNode *pkids = cbm_lsp_collect_children(ctx.arena, root, &pkn);
-        for (uint32_t i = 0; i < pkn; i++) {
-            TSNode c = pkids[i];
-            const char *k = ts_node_type(c);
-            if (strcmp(k, "namespace_definition") == 0) {
-                set_namespace_from_decl(&ctx, c);
-            } else if (strcmp(k, "namespace_use_declaration") == 0) {
-                collect_use_declaration(&ctx, c);
-            }
-        }
-        php_lsp_collect_class_fields(&ctx, &reg, root, &tab);
-        /* Reset namespace/use state — process_file will re-collect. */
-        ctx.current_namespace_qn = "";
-        ctx.use_count = 0;
-
-        for (int i = 0; i < tab.count; i++) {
-            php_class_fields_t *f = &tab.items[i];
-            if (f->count == 0)
-                continue;
-            /* Mutate the existing entry — registered types are stored by
-             * value in reg.types[], find the index and update it. */
-            for (int t = 0; t < reg.type_count; t++) {
-                if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
-                    reg.types[t].field_names = f->field_names;
-                    reg.types[t].field_types = f->field_types;
-                    break;
-                }
-            }
-        }
-    }
+    /* Phase B.1: merge typed properties onto the registered types. */
+    php_apply_class_fields(&ctx, &reg, root, 0);
 
     php_lsp_process_file(&ctx, root);
 
@@ -4145,38 +4148,6 @@ void cbm_run_php_lsp(CBMArena *arena, CBMFileResult *result, const char *source,
 }
 
 /* ── Cross-file + batch ───────────────────────────────────────── */
-
-/* Split a "|"-separated list into a NULL-terminated array of arena copies. */
-static const char **php_split_pipe(CBMArena *arena, const char *text) {
-    if (!text || !text[0])
-        return NULL;
-    int count = 1;
-    for (const char *p = text; *p; p++)
-        if (*p == '|')
-            count++;
-    const char **out =
-        (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(const char *));
-    if (!out)
-        return NULL;
-    int idx = 0;
-    const char *start = text;
-    for (const char *p = text;; p++) {
-        if (*p == '|' || *p == '\0') {
-            size_t n = (size_t)(p - start);
-            char *s = (char *)cbm_arena_alloc(arena, n + 1);
-            if (!s)
-                return NULL;
-            memcpy(s, start, n);
-            s[n] = '\0';
-            out[idx++] = s;
-            if (*p == '\0')
-                break;
-            start = p + 1;
-        }
-    }
-    out[idx] = NULL;
-    return out;
-}
 
 /* Build a registry from caller-supplied CBMLSPDef[] — covers both the source
  * file's own defs and cross-file referenced defs. PHP labels recognised:
@@ -4206,10 +4177,8 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
             rt.qualified_name = d->qualified_name; /* borrowed — d outlives this call */
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
-            rt.embedded_types = php_split_pipe(arena, d->embedded_types);
-            if (d->method_names_str && d->method_names_str[0]) {
-                rt.method_names = php_split_pipe(arena, d->method_names_str);
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
+            rt.method_names = cbm_registry_split_pipe(arena, d->method_names_str, NULL);
             cbm_registry_add_type(reg, rt);
         }
     }
@@ -4235,24 +4204,19 @@ static void php_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeR
              * is the unqualified return-type expression as it appears in the
              * def-defining module's source. parse_return_type_text qualifies
              * bare type names against the def's own module_qn. */
-            const char **ret_strs = php_split_pipe(arena, d->return_types);
-            const CBMType **ret_types = NULL;
-            if (ret_strs) {
-                int n = 0;
-                while (ret_strs[n])
-                    n++;
-                if (n > 0) {
-                    ret_types = (const CBMType **)cbm_arena_alloc(
-                        arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                    if (ret_types) {
-                        const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
-                        for (int j = 0; j < n; j++) {
-                            ret_types[j] = parse_return_type_text(arena, ret_strs[j], def_mod, NULL,
-                                                                  NULL, NULL, 0);
-                        }
-                        ret_types[n] = NULL;
-                    }
+            int n = 0;
+            const char **ret_strs = cbm_registry_split_pipe(arena, d->return_types, &n);
+            const CBMType **ret_types =
+                ret_strs ? (const CBMType **)cbm_arena_alloc(arena,
+                                                             (size_t)(n + 1) * sizeof(*ret_types))
+                         : NULL;
+            if (ret_types) {
+                const char *def_mod = d->def_module_qn ? d->def_module_qn : "";
+                for (int j = 0; j < n; j++) {
+                    ret_types[j] =
+                        parse_return_type_text(arena, ret_strs[j], def_mod, NULL, NULL, NULL, 0);
                 }
+                ret_types[n] = NULL;
             }
             rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
 
@@ -4324,40 +4288,9 @@ void cbm_run_php_lsp_cross(CBMArena *arena, const char *source, int source_len,
         }
     }
 
-    /* Class field collection — same flow as cbm_run_php_lsp. Walks the AST
-     * to populate typed-property field maps so $this->prop and $obj->prop
-     * resolve to the right type during the call walk. */
-    {
-        php_class_field_table_t tab = {0};
-        /* Collect top-level children once (O(n)); ts_node_child(root,i) is O(i) → O(n²). */
-        uint32_t pkn = 0;
-        TSNode *pkids = cbm_lsp_collect_children(ctx.arena, root, &pkn);
-        for (uint32_t i = 0; i < pkn; i++) {
-            TSNode c = pkids[i];
-            const char *k = ts_node_type(c);
-            if (strcmp(k, "namespace_definition") == 0) {
-                set_namespace_from_decl(&ctx, c);
-            } else if (strcmp(k, "namespace_use_declaration") == 0) {
-                collect_use_declaration(&ctx, c);
-            }
-        }
-        php_lsp_collect_class_fields(&ctx, &reg, root, &tab);
-        ctx.current_namespace_qn = "";
-        /* Reset to caller-supplied uses only — process_file re-adds AST uses. */
-        ctx.use_count = import_count;
-        for (int i = 0; i < tab.count; i++) {
-            php_class_fields_t *f = &tab.items[i];
-            if (f->count == 0)
-                continue;
-            for (int t = 0; t < reg.type_count; t++) {
-                if (strcmp(reg.types[t].qualified_name, f->class_qn) == 0) {
-                    reg.types[t].field_names = f->field_names;
-                    reg.types[t].field_types = f->field_types;
-                    break;
-                }
-            }
-        }
-    }
+    /* Class field collection. Keep the caller-supplied uses only —
+     * process_file re-adds AST uses. */
+    php_apply_class_fields(&ctx, &reg, root, import_count);
 
     php_lsp_process_file(&ctx, root);
     cbm_arena_destroy(&idx_arena);

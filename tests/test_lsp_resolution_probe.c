@@ -12,7 +12,8 @@
  * is wired for: Go, C, C++, CUDA, Python, JavaScript, TypeScript, TSX, PHP.
  * It is NOT wired (cbm_pxc_has_cross_lsp returns false) for:
  *   - Rust   — cbm_run_rust_lsp_cross EXISTS in rust_lsp.c but is never called
- *   - C#     — cbm_run_cs_lsp_cross EXISTS in cs_lsp.c but is never called
+ *   - C#     — (since wired: resolved through the Tier-2 shared registry,
+ *               cbm_run_cs_lsp_cross_with_registry)
  *   - Java   — cbm_run_java_lsp_cross EXISTS in java_lsp.h but is never called
  *   - Kotlin — NO cross-file LSP function; uses per-file cbm_run_kotlin_lsp only
  *
@@ -1430,16 +1431,11 @@ TEST(lrp_kotlin_s8_field_type_hint) {
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * ─── GROUP 9: C# (lsp_cross NOT WIRED) ───────────────────────────────
+ * ─── GROUP 9: C# (Tier-2 cross LSP) ───────────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
- * cbm_run_cs_lsp_cross EXISTS (cs_lsp.c) and the CBMCrossLspRegistries
- * struct even has a `cs` field — but cbm_pxc_has_cross_lsp returns false
- * for CBM_LANG_CSHARP.  The cross-LSP pass is never invoked for C# files.
- *
- * ROOT CAUSE: pass_lsp_cross.c cbm_pxc_has_cross_lsp() missing CBM_LANG_CSHARP.
- * FIX LOCATION: src/pipeline/pass_lsp_cross.c line ~280.
- * NOTE: CBMCrossLspRegistries.cs is already defined and cbm_pxc_registry_for_lang
- * handles CSHARP — so the fix is a 1-line addition to cbm_pxc_has_cross_lsp().
+ * Originally written when cbm_pxc_has_cross_lsp returned false for
+ * CBM_LANG_CSHARP. C# is now resolved through the Tier-2 shared registry
+ * (cbm_cs_build_cross_registry + cbm_run_cs_lsp_cross_with_registry).
  */
 
 /* S1 — C# cross-file plain static call. */
@@ -1861,7 +1857,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_kotlin_s7_generic);
     RUN_TEST(lrp_kotlin_s8_field_type_hint);
 
-    /* ── C# (lsp_cross NOT WIRED — but cbm_run_cs_lsp_cross EXISTS) ── */
+    /* ── C# (Tier-2 cross LSP) ── */
     /* S1 GREEN, S2–S8 RED reproductions */
     RUN_TEST(lrp_csharp_s1_crossfile_call);
     RUN_TEST(lrp_csharp_s2_method_dispatch);

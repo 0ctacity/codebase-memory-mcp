@@ -4014,38 +4014,6 @@ bool cbm_run_py_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 extern const TSLanguage *tree_sitter_python(void);
 
-/* Split a "|"-separated list into a NULL-terminated array of arena copies. */
-static const char **py_split_pipe(CBMArena *arena, const char *text) {
-    if (!text || !text[0])
-        return NULL;
-    int count = 1;
-    for (const char *p = text; *p; p++)
-        if (*p == '|')
-            count++;
-    const char **out =
-        (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(const char *));
-    if (!out)
-        return NULL;
-    int idx = 0;
-    const char *start = text;
-    for (const char *p = text;; p++) {
-        if (*p == '|' || *p == '\0') {
-            size_t n = (size_t)(p - start);
-            char *s = (char *)cbm_arena_alloc(arena, n + 1);
-            if (!s)
-                return NULL;
-            memcpy(s, start, n);
-            s[n] = '\0';
-            out[idx++] = s;
-            if (*p == '\0')
-                break;
-            start = p + 1;
-        }
-    }
-    out[idx] = NULL;
-    return out;
-}
-
 /* Build a registry from CBMLSPDef[] supplied by the caller — covers both
  * the source file's own defs and cross-file referenced defs. */
 static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRegistry *reg,
@@ -4067,10 +4035,8 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0 ||
                               strcmp(d->label, "Protocol") == 0;
-            rt.embedded_types = py_split_pipe(arena, d->embedded_types);
-            if (d->method_names_str && d->method_names_str[0]) {
-                rt.method_names = py_split_pipe(arena, d->method_names_str);
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
+            rt.method_names = cbm_registry_split_pipe(arena, d->method_names_str, NULL);
             cbm_registry_add_type(reg, rt);
         }
     }
@@ -4095,20 +4061,16 @@ static void py_register_lsp_defs(CBMArena *arena, CBMArena *idx_arena, CBMTypeRe
             rf.short_name = d->short_name;
 
             // Build FUNC type from "|"-separated return types.
-            const char **ret_strs = py_split_pipe(arena, d->return_types);
-            const CBMType **ret_types = NULL;
-            if (ret_strs) {
-                int n = 0;
-                while (ret_strs[n])
-                    n++;
-                if (n > 0) {
-                    ret_types = (const CBMType **)cbm_arena_alloc(
-                        arena, (size_t)(n + 1) * sizeof(const CBMType *));
-                    for (int j = 0; j < n; j++) {
-                        ret_types[j] = cbm_type_named(arena, ret_strs[j]);
-                    }
-                    ret_types[n] = NULL;
-                }
+            int n = 0;
+            const char **ret_strs = cbm_registry_split_pipe(arena, d->return_types, &n);
+            const CBMType **ret_types =
+                ret_strs ? (const CBMType **)cbm_arena_alloc(arena,
+                                                             (size_t)(n + 1) * sizeof(*ret_types))
+                         : NULL;
+            if (ret_types) {
+                for (int j = 0; j < n; j++)
+                    ret_types[j] = cbm_type_named(arena, ret_strs[j]);
+                ret_types[n] = NULL;
             }
             rf.signature = cbm_type_func(arena, NULL, NULL, ret_types);
 
@@ -4266,57 +4228,6 @@ bool cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
     return cbm_run_py_lsp_cross_with_registry_status(arena, source, source_len, module_qn, reg,
                                                      import_names, import_qns, import_count,
                                                      cached_tree, out) == CBM_LSP_COMPLETE;
-}
-
-bool cbm_batch_py_lsp_cross(CBMArena *arena, CBMBatchPyLSPFile *files, int file_count,
-                            CBMResolvedCallArray *out) {
-    if (!arena || !files || file_count <= 0 || !out)
-        return true;
-
-    bool complete = true;
-
-    for (int f = 0; f < file_count; f++) {
-        CBMBatchPyLSPFile *file = &files[f];
-        memset(&out[f], 0, sizeof(CBMResolvedCallArray));
-        if (!file->source || file->source_len <= 0)
-            continue;
-
-        CBMArena file_arena;
-        cbm_arena_init(&file_arena);
-
-        CBMResolvedCallArray file_out;
-        memset(&file_out, 0, sizeof(file_out));
-
-        if (!cbm_run_py_lsp_cross(&file_arena, file->source, file->source_len, file->module_qn,
-                                  file->defs, file->def_count, file->import_names, file->import_qns,
-                                  file->import_count, file->cached_tree, &file_out)) {
-            complete = false;
-        }
-
-        if (file_out.count > 0) {
-            out[f].count = file_out.count;
-            out[f].items = (CBMResolvedCall *)cbm_arena_alloc(arena, (size_t)file_out.count *
-                                                                         sizeof(CBMResolvedCall));
-            if (out[f].items) {
-                for (int j = 0; j < file_out.count; j++) {
-                    CBMResolvedCall *src = &file_out.items[j];
-                    CBMResolvedCall *dst = &out[f].items[j];
-                    dst->caller_qn =
-                        src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
-                    dst->callee_qn =
-                        src->callee_qn ? cbm_arena_strdup(arena, src->callee_qn) : NULL;
-                    dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
-                    dst->confidence = src->confidence;
-                    dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
-                }
-            } else {
-                out[f].count = 0;
-            }
-        }
-
-        cbm_arena_destroy(&file_arena);
-    }
-    return complete;
 }
 
 /* ── Stdlib stub — Phase 10 replaces with auto-generated body ─── */

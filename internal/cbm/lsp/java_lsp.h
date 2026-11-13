@@ -148,21 +148,4 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
  * Implementation lives in generated/java_stdlib_data.c. */
 void cbm_java_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 
-/* ── Batch cross-file LSP ─────────────────────────────────────────── */
-
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    TSTree *cached_tree;
-    CBMLSPDef *defs;
-    int def_count;
-    const char **import_names;
-    const char **import_qns;
-    int import_count;
-} CBMBatchJavaLSPFile;
-
-void cbm_batch_java_lsp_cross(CBMArena *arena, CBMBatchJavaLSPFile *files, int file_count,
-                              CBMResolvedCallArray *out);
-
 #endif /* CBM_LSP_JAVA_LSP_H */

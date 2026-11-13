@@ -5852,69 +5852,11 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface;
 
-            // Embedded/base types
-            if (d->embedded_types) {
-                // Parse "|"-separated list
-                const char *src = d->embedded_types;
-                const char *embeds[32];
-                int embed_count = 0;
-                while (*src && embed_count < 31) {
-                    const char *sep = strchr(src, '|');
-                    if (sep) {
-                        embeds[embed_count++] = cbm_arena_strndup(arena, src, sep - src);
-                        src = sep + 1;
-                    } else {
-                        embeds[embed_count++] = cbm_arena_strdup(arena, src);
-                        break;
-                    }
-                }
-                if (embed_count > 0) {
-                    const char **arr = (const char **)cbm_arena_alloc(
-                        arena, (embed_count + 1) * sizeof(const char *));
-                    for (int j = 0; j < embed_count; j++)
-                        arr[j] = embeds[j];
-                    arr[embed_count] = NULL;
-                    rt.embedded_types = arr;
-                }
-            }
+            rt.embedded_types = cbm_registry_split_pipe(arena, d->embedded_types, NULL);
 
-            // Field defs
-            if (d->field_defs) {
-                const char *fsrc = d->field_defs;
-                const char *fnames[64];
-                const CBMType *ftypes[64];
-                int fcount = 0;
-                while (*fsrc && fcount < 63) {
-                    const char *sep = strchr(fsrc, '|');
-                    const char *end = sep ? sep : fsrc + strlen(fsrc);
-                    char *pair = cbm_arena_strndup(arena, fsrc, end - fsrc);
-                    char *colon = strchr(pair, ':');
-                    if (colon) {
-                        *colon = '\0';
-                        fnames[fcount] = pair;
-                        ftypes[fcount] = c_parse_return_type_text(
-                            arena, colon + 1, d->def_module_qn ? d->def_module_qn : module_qn);
-                        fcount++;
-                    }
-                    if (!sep)
-                        break;
-                    fsrc = sep + 1;
-                }
-                if (fcount > 0) {
-                    const char **fnarr =
-                        (const char **)cbm_arena_alloc(arena, (fcount + 1) * sizeof(const char *));
-                    const CBMType **ftarr = (const CBMType **)cbm_arena_alloc(
-                        arena, (fcount + 1) * sizeof(const CBMType *));
-                    for (int j = 0; j < fcount; j++) {
-                        fnarr[j] = fnames[j];
-                        ftarr[j] = ftypes[j];
-                    }
-                    fnarr[fcount] = NULL;
-                    ftarr[fcount] = NULL;
-                    rt.field_names = fnarr;
-                    rt.field_types = ftarr;
-                }
-            }
+            cbm_registry_parse_field_defs(arena, d->field_defs, c_parse_return_type_text,
+                                          d->def_module_qn ? d->def_module_qn : module_qn,
+                                          &rt.field_names, &rt.field_types);
 
             cbm_registry_add_type(reg, rt);
         }
@@ -5928,32 +5870,9 @@ static void c_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const cha
 
             const char *def_module = d->def_module_qn ? d->def_module_qn : module_qn;
 
-            // Return types
-            if (d->return_types) {
-                // Parse "|"-separated
-                const char *rsrc = d->return_types;
-                const CBMType *rets[16];
-                int rcount = 0;
-                while (*rsrc && rcount < 15) {
-                    const char *sep = strchr(rsrc, '|');
-                    const char *end = sep ? sep : rsrc + strlen(rsrc);
-                    char *rt_text = cbm_arena_strndup(arena, rsrc, end - rsrc);
-                    rets[rcount++] = c_parse_return_type_text(arena, rt_text, def_module);
-                    if (!sep)
-                        break;
-                    rsrc = sep + 1;
-                }
-                if (rcount > 0) {
-                    const CBMType **rarr = (const CBMType **)cbm_arena_alloc(
-                        arena, (rcount + 1) * sizeof(const CBMType *));
-                    for (int j = 0; j < rcount; j++)
-                        rarr[j] = rets[j];
-                    rarr[rcount] = NULL;
-                    rf.signature = cbm_type_func(arena, NULL, NULL, rarr);
-                }
-            }
-            if (!rf.signature)
-                rf.signature = cbm_type_func(arena, NULL, NULL, NULL);
+            const CBMType **rets = cbm_registry_parse_pipe_types(
+                arena, d->return_types, c_parse_return_type_text, def_module);
+            rf.signature = cbm_type_func(arena, NULL, NULL, rets);
 
             if (d->receiver_type) {
                 rf.receiver_type = d->receiver_type; /* borrowed */
@@ -6107,56 +6026,4 @@ bool cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
     return cbm_run_c_lsp_cross_status(arena, source, source_len, module_qn, cpp_mode, defs,
                                       def_count, include_paths, include_ns_qns, include_count,
                                       cached_tree, out) == CBM_LSP_COMPLETE;
-}
-
-// --- Batch cross-file LSP ---
-
-bool cbm_batch_c_lsp_cross(CBMArena *arena, CBMBatchCLSPFile *files, int file_count,
-                           CBMResolvedCallArray *out) {
-    if (!files || file_count <= 0 || !out)
-        return true;
-
-    bool complete = true;
-
-    for (int f = 0; f < file_count; f++) {
-        CBMBatchCLSPFile *file = &files[f];
-        memset(&out[f], 0, sizeof(CBMResolvedCallArray));
-
-        if (!file->source || file->source_len <= 0 || file->def_count <= 0)
-            continue;
-
-        // Per-file arena: registry + temp data freed after each file
-        CBMArena file_arena;
-        cbm_arena_init(&file_arena);
-
-        CBMResolvedCallArray file_out;
-        memset(&file_out, 0, sizeof(file_out));
-
-        // Delegate to existing per-file function
-        bool file_complete = cbm_run_c_lsp_cross(
-            &file_arena, file->source, file->source_len, file->module_qn, file->cpp_mode,
-            file->defs, file->def_count, file->include_paths, file->include_ns_qns,
-            file->include_count, file->cached_tree, &file_out);
-
-        complete = complete && file_complete;
-
-        // Copy results to output arena (must outlive per-file arena)
-        if (file_out.count > 0) {
-            out[f].count = file_out.count;
-            out[f].items =
-                (CBMResolvedCall *)cbm_arena_alloc(arena, file_out.count * sizeof(CBMResolvedCall));
-            for (int j = 0; j < file_out.count; j++) {
-                CBMResolvedCall *src = &file_out.items[j];
-                CBMResolvedCall *dst = &out[f].items[j];
-                dst->caller_qn = src->caller_qn ? cbm_arena_strdup(arena, src->caller_qn) : NULL;
-                dst->callee_qn = src->callee_qn ? cbm_arena_strdup(arena, src->callee_qn) : NULL;
-                dst->strategy = src->strategy ? cbm_arena_strdup(arena, src->strategy) : NULL;
-                dst->confidence = src->confidence;
-                dst->reason = src->reason ? cbm_arena_strdup(arena, src->reason) : NULL;
-            }
-        }
-
-        cbm_arena_destroy(&file_arena);
-    }
-    return complete;
 }

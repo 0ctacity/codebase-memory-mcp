@@ -18,8 +18,6 @@
  *     `cbm_extract_file()`.
  *   - `cbm_run_rust_lsp_cross` — cross-file resolution given a list of
  *     `CBMLSPDef`s gathered by the pipeline.
- *   - `cbm_batch_rust_lsp_cross` — batch wrapper that processes several
- *     files in one CGo call (per-file arenas + result copy).
  */
 #ifndef CBM_LSP_RUST_LSP_H
 #define CBM_LSP_RUST_LSP_H
@@ -331,22 +329,5 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
                                           int import_count, TSTree *cached_tree,
                                           const struct CBMCargoManifest *manifest,
                                           CBMResolvedCallArray *out, CBMFileResult *result);
-
-/* Per-file input for batch cross-file Rust LSP processing. */
-typedef struct {
-    const char *source;
-    int source_len;
-    const char *module_qn;
-    TSTree *cached_tree;
-    CBMRustLSPDef *defs;
-    int def_count;
-    const char **import_names;
-    const char **import_qns;
-    int import_count;
-} CBMBatchRustLSPFile;
-
-/* Process several files in one CGo call (per-file arenas, result copy). */
-void cbm_batch_rust_lsp_cross(CBMArena *arena, CBMBatchRustLSPFile *files, int file_count,
-                              CBMResolvedCallArray *out);
 
 #endif /* CBM_LSP_RUST_LSP_H */

@@ -2721,25 +2721,6 @@ TEST(cov_cross_no_imports) {
     cbm_arena_destroy(&arena);
     PASS();
 }
-TEST(cov_cross_batch) {
-    const char *src1 = "package p; public class A { public int f() { return 1; } }";
-    const char *src2 = "package p; public class B { public int f() { return 2; } }";
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMBatchJavaLSPFile files[2];
-    memset(files, 0, sizeof(files));
-    files[0].source = src1;
-    files[0].source_len = (int)strlen(src1);
-    files[0].module_qn = "test.A";
-    files[1].source = src2;
-    files[1].source_len = (int)strlen(src2);
-    files[1].module_qn = "test.B";
-    CBMResolvedCallArray outs[2];
-    memset(outs, 0, sizeof(outs));
-    cbm_batch_java_lsp_cross(&arena, files, 2, outs);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
 TEST(cov_cross_inheritance) {
     const char *src =
         "package x;\n"
@@ -3213,7 +3194,6 @@ void suite_java_lsp_coverage(void) {
     /* 27. Cross-file */
     RUN_TEST(cov_cross_basic);
     RUN_TEST(cov_cross_no_imports);
-    RUN_TEST(cov_cross_batch);
     RUN_TEST(cov_cross_inheritance);
 
     /* 28. Stress / edge */

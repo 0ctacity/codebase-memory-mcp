@@ -703,68 +703,6 @@ TEST(pylsp_crossfile_inheritance) {
     PASS();
 }
 
-TEST(pylsp_batch_two_files) {
-    const char *src_a =
-        "def helper():\n"
-        "    return 1\n";
-    const char *src_b =
-        "from a import helper\n"
-        "def main():\n"
-        "    return helper()\n";
-
-    CBMLSPDef a_defs[1];
-    memset(a_defs, 0, sizeof(a_defs));
-    a_defs[0].qualified_name = "a.helper";
-    a_defs[0].short_name = "helper";
-    a_defs[0].label = "Function";
-    a_defs[0].def_module_qn = "a";
-
-    CBMLSPDef b_defs[1];
-    memset(b_defs, 0, sizeof(b_defs));
-    b_defs[0].qualified_name = "b.main";
-    b_defs[0].short_name = "main";
-    b_defs[0].label = "Function";
-    b_defs[0].def_module_qn = "b";
-
-    const char *b_imp_names[] = {"helper"};
-    const char *b_imp_qns[] = {"a.helper"};
-
-    CBMBatchPyLSPFile files[2];
-    memset(files, 0, sizeof(files));
-    files[0].source = src_a;
-    files[0].source_len = (int)strlen(src_a);
-    files[0].module_qn = "a";
-    files[0].defs = a_defs;
-    files[0].def_count = 1;
-
-    files[1].source = src_b;
-    files[1].source_len = (int)strlen(src_b);
-    files[1].module_qn = "b";
-    files[1].defs = b_defs;
-    files[1].def_count = 1;
-    /* b imports helper from a — also include a's def in b's reachable set. */
-    CBMLSPDef b_combined[2];
-    memcpy(&b_combined[0], &a_defs[0], sizeof(CBMLSPDef));
-    memcpy(&b_combined[1], &b_defs[0], sizeof(CBMLSPDef));
-    files[1].defs = b_combined;
-    files[1].def_count = 2;
-    files[1].import_names = b_imp_names;
-    files[1].import_qns = b_imp_qns;
-    files[1].import_count = 1;
-
-    CBMArena arena;
-    cbm_arena_init(&arena);
-    CBMResolvedCallArray outs[2];
-    memset(outs, 0, sizeof(outs));
-
-    cbm_batch_py_lsp_cross(&arena, files, 2, outs);
-
-    /* file b's main should have called helper. */
-    ASSERT_GTE(find_resolved_arr(&outs[1], "main", "helper"), 0);
-    cbm_arena_destroy(&arena);
-    PASS();
-}
-
 /* ── Phase 10 — stdlib resolution ─────────────────────────────── */
 
 TEST(pylsp_stdlib_os_getcwd) {
@@ -1690,9 +1628,9 @@ TEST(pylsp_issue54_long_receiver_chain_is_not_nesting) {
 
 /* A cross-file walk that fails after it has emitted keeps exactly what `out`
  * held before it: no new rows, and the resolved-call dedup has not raised
- * the confidence of an earlier row in its window. The batch starts each
- * file's output empty. The next walk completes. Rows are deduplicated per
- * (caller, callee), so each of the 200 calls names its own method. */
+ * the confidence of an earlier row in its window. The next walk completes.
+ * Rows are deduplicated per (caller, callee), so each of the 200 calls names
+ * its own method. */
 TEST(pylsp_issue54_cross_memo_failure_preserves_completed_rows) {
     enum { N_METHODS = 200, N_DEFS = N_METHODS + 2 };
     char src[4096];
@@ -1720,9 +1658,9 @@ TEST(pylsp_issue54_cross_memo_failure_preserves_completed_rows) {
                                   .return_types = "int",
                                   .lang = CBM_LANG_PYTHON};
     }
-    bool failed_clean[3] = {false, false, false};
-    bool recovered[3] = {false, false, false};
-    for (int mode = 0; mode < 3; mode++) {
+    bool failed_clean[2] = {false, false};
+    bool recovered[2] = {false, false};
+    for (int mode = 0; mode < 2; mode++) {
         CBMArena arena;
         CBMArena shared;
         cbm_arena_init(&arena);
@@ -1740,28 +1678,20 @@ TEST(pylsp_issue54_cross_memo_failure_preserves_completed_rows) {
         CBMTypeRegistry overlay;
         cbm_registry_init(&overlay, &arena);
         overlay.fallback = base;
-        CBMBatchPyLSPFile file = {.source = src,
-                                  .source_len = (int)strlen(src),
-                                  .module_qn = "test",
-                                  .defs = defs,
-                                  .def_count = N_DEFS};
         for (int pass = 0; pass < 2; pass++) {
             cbm_py_lsp_test_memo_fail_after(pass == 0 ? 1 : -1);
             bool complete =
                 mode == 0 ? cbm_run_py_lsp_cross(&arena, src, (int)strlen(src), "test", defs,
                                                  N_DEFS, NULL, NULL, 0, NULL, &out)
-                : mode == 1
-                    ? cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test",
-                                                         &overlay, NULL, NULL, 0, NULL, &out)
-                    : cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+                          : cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src),
+                                                               "test", &overlay, NULL, NULL, 0,
+                                                               NULL, &out);
             cbm_py_lsp_test_memo_fail_after(-1);
             if (pass == 0) {
-                failed_clean[mode] =
-                    !complete &&
-                    (mode == 2 ? out.count == 0
-                               : out.count == 1 && out.items[0].confidence == 0.1f &&
+                failed_clean[mode] = !complete && out.count == 1 &&
+                                     out.items[0].confidence == 0.1f &&
                                      strcmp(out.items[0].strategy, "prior.strategy") == 0 &&
-                                     strcmp(out.items[0].reason, "prior.reason") == 0);
+                                     strcmp(out.items[0].reason, "prior.reason") == 0;
             } else {
                 recovered[mode] = complete && out.count > N_METHODS;
             }
@@ -1769,7 +1699,7 @@ TEST(pylsp_issue54_cross_memo_failure_preserves_completed_rows) {
         cbm_arena_destroy(&arena);
         cbm_arena_destroy(&shared);
     }
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         ASSERT_TRUE(failed_clean[i]);
         ASSERT_TRUE(recovered[i]);
     }
@@ -1802,8 +1732,8 @@ TEST(pylsp_issue54_cross_memo_failure_fallback_reports_error) {
 }
 
 /* A depth failure is reported by every entry point: the single-file walk, the
- * cross-file walk with its own registry, with a shared registry, the batch,
- * and the pipeline's per-file fallback. None keeps the failed walk's calls. */
+ * cross-file walk with its own registry, with a shared registry, and the
+ * pipeline's per-file fallback. None keeps the failed walk's calls. */
 TEST(pylsp_issue54_depth_failure_reports_all_entry_points) {
     const char *src = "class S:\n    def m(self):\n        return 1\ndef run(s: S):\n    s.m()\n";
     CBMLSPDef defs[] = {
@@ -1822,7 +1752,7 @@ TEST(pylsp_issue54_depth_failure_reports_all_entry_points) {
                    raw->resolved_calls.count == 0;
     if (raw)
         cbm_free_result(raw);
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 2; mode++) {
         CBMArena arena;
         CBMArena shared;
         cbm_arena_init(&arena);
@@ -1832,22 +1762,13 @@ TEST(pylsp_issue54_depth_failure_reports_all_entry_points) {
         cbm_registry_init(&overlay, &arena);
         overlay.fallback = base;
         CBMResolvedCallArray out = {0};
-        CBMBatchPyLSPFile file = {.source = src,
-                                  .source_len = (int)strlen(src),
-                                  .module_qn = "test",
-                                  .defs = defs,
-                                  .def_count = 2};
-        if (mode == 2) {
-            correct = !cbm_batch_py_lsp_cross(&arena, &file, 1, &out) && correct;
-        } else {
-            CBMLSPStatus status =
-                mode == 0 ? cbm_run_py_lsp_cross_status(&arena, src, (int)strlen(src), "test", defs,
-                                                        2, NULL, NULL, 0, NULL, &out)
-                          : cbm_run_py_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
-                                                                      "test", &overlay, NULL, NULL,
-                                                                      0, NULL, &out);
-            correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
-        }
+        CBMLSPStatus status =
+            mode == 0 ? cbm_run_py_lsp_cross_status(&arena, src, (int)strlen(src), "test", defs, 2,
+                                                    NULL, NULL, 0, NULL, &out)
+                      : cbm_run_py_lsp_cross_with_registry_status(&arena, src, (int)strlen(src),
+                                                                  "test", &overlay, NULL, NULL, 0,
+                                                                  NULL, &out);
+        correct = correct && status == CBM_LSP_DEPTH_EXCEEDED;
         correct = correct && out.count == 0;
         cbm_arena_destroy(&arena);
         cbm_arena_destroy(&shared);
@@ -1904,12 +1825,11 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_super_call);
     RUN_TEST(pylsp_multi_inheritance_first_base);
     RUN_TEST(pylsp_pep695_generic_class);
-    /* Phase 9 — cross-file + batch */
+    /* Phase 9 — cross-file */
     RUN_TEST(pylsp_crossfile_method_dispatch);
     RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
-    RUN_TEST(pylsp_batch_two_files);
     /* Phase 10 — stdlib resolution */
     RUN_TEST(pylsp_stdlib_os_getcwd);
     RUN_TEST(pylsp_stdlib_collections_defaultdict);
